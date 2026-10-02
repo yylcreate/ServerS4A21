@@ -4,6 +4,7 @@ using DfoServer.Game.Characters;
 using DfoServer.Game.DailyReset;
 using DfoServer.Game.Dungeon;
 using DfoServer.Game.Events;
+using DfoServer.Game.Events.GuardianAltar;
 using DfoServer.Game.Events.DailyAttendanceAnytime;
 using DfoServer.Game.Events.Joust;
 using DfoServer.Game.Events.PcRoomTimePoint;
@@ -810,7 +811,9 @@ namespace DfoServer.Infrastructure
                 core.EventManager.GuardianAltarOpening,
                 world.Sessions,
                 world.CharacterTransitions,
-                ClockService.Instance);
+                ClockService.Instance,
+                progress: new GuardianAltarProgressService(core.Database,
+                    core.DailyResetService, GuardianAltarMenuDefinition.Load));
 
             var handlers = new GameProtocolFeatureHandlers(
                 lotteryItem,

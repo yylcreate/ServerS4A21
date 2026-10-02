@@ -14,6 +14,7 @@ namespace DfoServer.Game.Events.GuardianAltar
         LevelTooLow,
         ProgressAuthorityUnavailable,
         StateReadFailed,
+        MenuSnapshotExpired,
     }
 
     internal static class GuardianAltarEntryRules
@@ -42,8 +43,8 @@ namespace DfoServer.Game.Events.GuardianAltar
                 return GuardianAltarEntryRejection.LevelTooLow;
 
             // Entry visibility does not establish ticket/progression authority.
-            // Until that durable owner and the full snapshot are implemented,
-            // do not manufacture a successful menu or admit a dungeon run.
+            // The coordinator must obtain a durable menu snapshot separately;
+            // eligibility by itself cannot authorize a fabricated success.
             return GuardianAltarEntryRejection.ProgressAuthorityUnavailable;
         }
     }

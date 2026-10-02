@@ -41,6 +41,7 @@ namespace DfoServer.SelfTests
                 CheckQueuedIdentityAsync(Check).GetAwaiter().GetResult();
                 CheckPostReadStateAsync(Check).GetAwaiter().GetResult();
                 CheckReadFailureAndRetryAsync(Check).GetAwaiter().GetResult();
+                CheckSuccessfulMenuAsync(Check).GetAwaiter().GetResult();
             }
             catch (Exception exception)
             {
@@ -357,6 +358,132 @@ namespace DfoServer.SelfTests
             check("disposed request owner cannot reply using the retained registry callback", retryFixture.Packets.Count == 2);
         }
 
+        private static async Task CheckSuccessfulMenuAsync(Action<string, bool> check)
+        {
+            var definition = GuardianAltarMenuDefinition.Load();
+            using (var fixture = new RequestFixture(new ProgressStub(definition)))
+            {
+                var session = fixture.CreateSession(71000020);
+                var loader = (ProgressStub)fixture.Progress;
+                await fixture.DispatchAsync(session, Array.Empty<byte>());
+                fixture.Open();
+                session.Player.Level = 49;
+                await fixture.DispatchAsync(session, Array.Empty<byte>());
+                session.Player.Level = 50;
+                fixture.Trading = true;
+                await fixture.DispatchAsync(session, Array.Empty<byte>());
+                fixture.Trading = false;
+                fixture.Mercenary.Assigned = true;
+                await fixture.DispatchAsync(session, Array.Empty<byte>());
+                fixture.Mercenary.Assigned = false;
+                await fixture.DispatchAsync(session, new byte[] { 1 });
+                check("rejected requests never initialize/refill a Guardian role", loader.Reads == 0);
+                fixture.Packets.Clear();
+                var generation = session.Player.CurrentDungeonRunGeneration;
+                await fixture.DispatchAsync(session, Array.Empty<byte>());
+                await fixture.DispatchAsync(session, Array.Empty<byte>());
+                check("eligible registered requests return complete, identical menus, not empty success",
+                    loader.Reads == 2 && fixture.Packets.Count == 2
+                    && fixture.Packets.All(p => IsEnvelope(p) && p.Length == 285
+                        && p[15] == 1 && BitConverter.ToInt32(p, 16) == 0 && BitConverter.ToUInt32(p, 20) == 1)
+                    && fixture.Packets[0].SequenceEqual(fixture.Packets[1]));
+                check("snapshot authority runs outside the packet prepare callback", !loader.InPrepare);
+                check("menu projection does not create a run, alter generation or select a dungeon",
+                    session.Player.CurrentRun == null && session.Player.CurrentDungeonSelection == null
+                    && session.Player.CurrentDungeonRunGeneration == generation);
+                fixture.Packets.Clear();
+                fixture.FailNextWrite = true;
+                await fixture.DispatchAsync(session, Array.Empty<byte>());
+                await fixture.DispatchAsync(session, Array.Empty<byte>());
+                check("successful menu write failure is retryable without notification deduplication",
+                    fixture.Packets.Count == 1 && fixture.Packets[0].Length == 285);
+            }
+
+            var mutations = new (string Label, Action<RequestFixture, EnhancedClientSession> Change, int Result)[]
+            {
+                ("window closed", (f, _) => f.Service.Close(), 1),
+                ("level lowered", (_, s) => s.Player.Level = 49, 4),
+                ("trade started", (f, _) => f.Trading = true, 2),
+                ("mercenary assigned", (f, _) => f.Mercenary.Assigned = true, 3),
+                ("selection started", (_, s) => s.Player.DungeonSelectionPending = true, 0),
+                ("GameSession replaced", (_, s) => s.GameSession = CreateGameSessionIdentity(), -1),
+                ("UID changed", (_, s) => s.Player.UserId++, -1),
+                ("directory displaced", (f, s) => f.CreateSession(s.Player.CharacterId), -1),
+            };
+            foreach (var item in mutations)
+            {
+                var loader = new ProgressStub(definition);
+                using var fixture = new RequestFixture(loader);
+                var session = fixture.CreateSession(71000021);
+                fixture.Open();
+                fixture.BeforePrepare = () => item.Change(fixture, session);
+                await fixture.DispatchAsync(session, Array.Empty<byte>());
+                check("loaded menu cannot bypass prepared " + item.Label,
+                    loader.Reads == 1 && (item.Result < 0 ? fixture.Packets.Count == 0
+                        : fixture.Packets.Count == 1 && (item.Result == 0
+                            ? IsCommonFailure(fixture.Packets[0]) : IsDomainReply(fixture.Packets[0], item.Result))));
+            }
+            foreach (var mode in new[] { "load throws", "wrong character", "window revision", "day rollover" })
+            {
+                var loader = new ProgressStub(definition);
+                using var fixture = new RequestFixture(loader);
+                var session = fixture.CreateSession(71000022);
+                fixture.Service.SetWindow(fixture.Now, fixture.Now.AddDays(1));
+                if (mode == "load throws") loader.Error = new SqliteException("test Guardian owner failure", 5);
+                if (mode == "wrong character") loader.WrongCharacter = true;
+                if (mode == "window revision") fixture.BeforePrepare = () => fixture.Service.SetWindow(fixture.Now, fixture.Now.AddDays(2));
+                if (mode == "day rollover") fixture.BeforePrepare = () => fixture.Now = fixture.Now.AddHours(12);
+                await fixture.DispatchAsync(session, Array.Empty<byte>());
+                check("menu unavailable/expired failure is visible and does not fabricate success: " + mode,
+                    fixture.Packets.Count == 2 && IsCommonFailure(fixture.Packets[0])
+                    && fixture.Packets[1][0] == 0
+                    && BitConverter.ToUInt16(fixture.Packets[1], 1) == (ushort)NotiPacketTypeA21.SERVER_NOTICE_MESSAGE
+                    && fixture.Packets[1].AsSpan(15).SequenceEqual(ServerNoticeMessageBuilder.Build(
+                        "守护者祭坛状态暂不可用，请重新进入活动。")));
+            }
+            foreach (var throws in new[] { false, true })
+            {
+                var loader = new ProgressStub(definition);
+                using var fixture = new RequestFixture(loader);
+                var session = fixture.CreateSession(71000023);
+                fixture.Open();
+                loader.DuringLoad = () => session.GameSession = CreateGameSessionIdentity();
+                if (throws) loader.Error = new SqliteException("displaced owner read", 5);
+                await fixture.DispatchAsync(session, Array.Empty<byte>());
+                check("old identity cannot project owner return or exception; commit fence rejects: " + throws,
+                    loader.Reads == 1 && fixture.Packets.Count == 0 && (throws || loader.FenceRejected));
+            }
+        }
+
+        private sealed class ProgressStub : IGuardianAltarProgressService
+        {
+            private readonly GuardianAltarMenuDefinition _definition;
+            internal ProgressStub(GuardianAltarMenuDefinition definition) => _definition = definition;
+            internal int Reads;
+            internal bool InPrepare;
+            internal bool Preparing;
+            internal bool WrongCharacter;
+            internal bool FenceRejected;
+            internal Action DuringLoad;
+            internal Exception Error;
+            public GuardianAltarProgressSnapshot LoadMenu(int characterId, DateTime utcNow, Func<bool> isCurrent = null)
+            {
+                Reads++;
+                InPrepare |= Preparing;
+                DuringLoad?.Invoke();
+                if (Error != null) throw Error;
+                if (isCurrent != null && !isCurrent())
+                {
+                    FenceRejected = true;
+                    throw new InvalidOperationException("old Guardian menu identity");
+                }
+                return new GuardianAltarProgressSnapshot(characterId + (WrongCharacter ? 1 : 0),
+                    new GuardianAltarHeader(_definition.RidableId, _definition.DailyRefillTicket, 0, 0, 0, 0, 0, 0, 0, 0),
+                    new[] { new GuardianAltarStage(_definition.FirstDungeonId, -1) },
+                    _definition.InitialPurchases, _definition.InitialSlots, Array.Empty<GuardianAltarAchievement>());
+            }
+        }
+
         private static bool IsEnvelope(byte[] packet)
             => packet != null && packet.Length >= 15 && packet[0] == 1
                 && BitConverter.ToUInt16(packet, 1) == (ushort)CmdPacketTypeA21.ADVANCE_ALTAR_START_GAME
@@ -415,12 +542,14 @@ namespace DfoServer.SelfTests
             internal Action DuringTradeRead;
             internal Action BeforePrepare;
             internal bool FailNextWrite;
+            internal readonly IGuardianAltarProgressService Progress;
 
-            internal RequestFixture()
+            internal RequestFixture(IGuardianAltarProgressService progress = null)
             {
+                Progress = progress;
                 Transitions = new CharacterTransitionCoordinator(Sessions);
                 Coordinator = new GuardianAltarOpeningCoordinator(Service, Sessions, Transitions,
-                    clock: null, utcNow: () => Now, sendBatch: SendBatchAsync);
+                    clock: null, utcNow: () => Now, sendBatch: SendBatchAsync, progress: progress);
                 Registry.RegisterGroup("guardian-entry-request-test", group =>
                     Coordinator.RegisterEntryHandlers(group, HasActiveTrade, Mercenary));
             }
@@ -467,7 +596,11 @@ namespace DfoServer.SelfTests
                 var beforePrepare = BeforePrepare;
                 BeforePrepare = null;
                 beforePrepare?.Invoke();
-                var packets = prepare();
+                IReadOnlyList<byte[]> packets;
+                var progress = Progress as ProgressStub;
+                if (progress != null) progress.Preparing = true;
+                try { packets = prepare(); }
+                finally { if (progress != null) progress.Preparing = false; }
                 if (FailNextWrite)
                 {
                     FailNextWrite = false;

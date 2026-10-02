@@ -20,7 +20,8 @@ namespace DfoServer.Network.Builders
                 GuardianAltarEntryRejection.InvalidRequest
                     or GuardianAltarEntryRejection.InvalidPresence
                     or GuardianAltarEntryRejection.ProgressAuthorityUnavailable
-                    or GuardianAltarEntryRejection.StateReadFailed => 0,
+                    or GuardianAltarEntryRejection.StateReadFailed
+                    or GuardianAltarEntryRejection.MenuSnapshotExpired => 0,
                 _ => throw new ArgumentOutOfRangeException(nameof(reason)),
             };
             if (result == 0)

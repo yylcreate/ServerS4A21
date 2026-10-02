@@ -13,8 +13,8 @@ using Microsoft.Data.Sqlite;
 
 namespace DfoServer.Network.Handlers
 {
-    // Entry projection and proven request rejections only. This does not admit
-    // a player, deduct tickets or manufacture START_GAME's successful menu.
+    // Entry/menu projection only. Dungeon combat, ticket consumption and
+    // rewards are not owned by this coordinator.
     internal sealed class GuardianAltarOpeningCoordinator : IDisposable
     {
         private readonly GuardianAltarOpeningService _service;
@@ -22,6 +22,7 @@ namespace DfoServer.Network.Handlers
         private readonly CharacterTransitionCoordinator _transitions;
         private readonly ClockService _clock;
         private readonly Func<DateTimeOffset> _utcNow;
+        private readonly IGuardianAltarProgressService _progress;
         private readonly Func<EnhancedClientSession,
             Func<IReadOnlyList<byte[]>>, Task> _sendBatch;
         private readonly object _timerSync = new object();
@@ -38,13 +39,15 @@ namespace DfoServer.Network.Handlers
             CharacterTransitionCoordinator transitions,
             ClockService clock,
             Func<DateTimeOffset> utcNow = null,
-            Func<EnhancedClientSession, Func<IReadOnlyList<byte[]>>, Task> sendBatch = null)
+            Func<EnhancedClientSession, Func<IReadOnlyList<byte[]>>, Task> sendBatch = null,
+            IGuardianAltarProgressService progress = null)
         {
             _service = service ?? throw new ArgumentNullException(nameof(service));
             _sessions = sessions ?? throw new ArgumentNullException(nameof(sessions));
             _transitions = transitions ?? throw new ArgumentNullException(nameof(transitions));
             _clock = clock;
             _utcNow = utcNow ?? (() => DateTimeOffset.UtcNow);
+            _progress = progress;
             _sendBatch = sendBatch ?? ((session, prepare) =>
                 session.SendPreparedPacketBatchAsync(prepare));
             _sessions.SessionEnding += OnSessionEndingAsync;
@@ -125,6 +128,50 @@ namespace DfoServer.Network.Handlers
             await _transitions.RunIfCurrentAsync(session, async () =>
             {
                 GuardianAltarEntryRejection? preparedReason = null;
+                var preparedMenu = false;
+                GuardianAltarProgressSnapshot menu = null;
+                GuardianAltarEntryRejection? menuFailure = null;
+                var menuAnchor = _utcNow();
+                var menuRevision = _service.Revision;
+                if (_progress != null && validRequest
+                    && IsCurrentGeneration(session, characterId, generation)
+                    && session.Player.UserId == userId)
+                {
+                    try
+                    {
+                        var opening = _service.GetSnapshot(menuAnchor);
+                        var townReady = IsTownReady(session);
+                        var trading = opening.IsOpen && townReady && hasActiveTrade(session);
+                        var assigned = opening.IsOpen && townReady && !trading
+                            && mercenaryRestrictions.IsAssigned(characterId);
+                        if (GuardianAltarEntryRules.Evaluate(_service.GetSnapshot(_utcNow()),
+                                session.Player.Level, IsTownReady(session), trading, assigned)
+                                == GuardianAltarEntryRejection.ProgressAuthorityUnavailable)
+                        {
+                            // Database I/O and atomic first-use/refill happen before
+                            // acquiring the send lock. The transaction is fenced to
+                            // this identity/window and is rechecked by the owner.
+                            menu = _progress.LoadMenu(characterId, menuAnchor.UtcDateTime,
+                                () => IsCurrentGeneration(session, characterId, generation)
+                                    && session.Player.UserId == userId
+                                    && _service.Revision == menuRevision
+                                    && _service.GetSnapshot(_utcNow()).IsOpen
+                                    && Game.DailyReset.DailyResetService.TodayId(_utcNow().UtcDateTime)
+                                        == Game.DailyReset.DailyResetService.TodayId(menuAnchor.UtcDateTime)
+                                    && IsTownReady(session)
+                                    && session.Player.Level >= GuardianAltarEntryRules.MinimumLevel);
+                            if (menu.CharacterId != characterId)
+                                throw new InvalidOperationException("Guardian menu belongs to another character.");
+                            GuardianAltarProgressValidator.Validate(menu);
+                        }
+                    }
+                    catch (Exception ex) when (ex is SqliteException or InvalidOperationException
+                        or IOException or OverflowException)
+                    {
+                        menuFailure = GuardianAltarEntryRejection.StateReadFailed;
+                        FileLogger.Log($"[GuardianAltarEntry] menu load failed cid={characterId}: {ex}");
+                    }
+                }
                 try
                 {
                     await _sendBatch(session, () =>
@@ -169,13 +216,42 @@ namespace DfoServer.Network.Handlers
                         if (!IsCurrentGeneration(session, characterId, generation)
                             || session.Player.UserId != userId)
                             return Array.Empty<byte[]>();
-                        preparedReason = reason;
-                        return new[]
+                        if (reason == GuardianAltarEntryRejection.ProgressAuthorityUnavailable
+                            && menu != null && !menuFailure.HasValue
+                            && _service.Revision == menuRevision
+                            && Game.DailyReset.DailyResetService.TodayId(_utcNow().UtcDateTime)
+                                == Game.DailyReset.DailyResetService.TodayId(menuAnchor.UtcDateTime))
                         {
-                            GamePacketEnvelopeBuilder.Build(1,
+                            preparedMenu = true;
+                            return new[]
+                            {
+                                GamePacketEnvelopeBuilder.Build(1,
+                                    (ushort)CmdPacketTypeA21.ADVANCE_ALTAR_START_GAME,
+                                    GuardianAltarMenuBodyBuilder.Build(menu))
+                            };
+                        }
+                        if (reason == GuardianAltarEntryRejection.ProgressAuthorityUnavailable
+                            && menuFailure.HasValue)
+                            reason = menuFailure.Value;
+                        else if (reason == GuardianAltarEntryRejection.ProgressAuthorityUnavailable
+                            && menu != null)
+                            reason = GuardianAltarEntryRejection.MenuSnapshotExpired;
+                        preparedReason = reason;
+                        var ack = GamePacketEnvelopeBuilder.Build(1,
                                 (ushort)CmdPacketTypeA21.ADVANCE_ALTAR_START_GAME,
-                                GuardianAltarEntryAckBodyBuilder.BuildRejection(reason))
-                        };
+                                GuardianAltarEntryAckBodyBuilder.BuildRejection(reason));
+                        if (_progress != null && (reason is GuardianAltarEntryRejection.StateReadFailed
+                            or GuardianAltarEntryRejection.MenuSnapshotExpired
+                            or GuardianAltarEntryRejection.ProgressAuthorityUnavailable))
+                        {
+                            // The generic error ACK has no Guardian UI text. Reuse
+                            // the established notice projection, not a guessed
+                            // SHOW_DIALOG or a false activity-closed result.
+                            return new[] { ack, GamePacketEnvelopeBuilder.Build(0,
+                                (ushort)NotiPacketTypeA21.SERVER_NOTICE_MESSAGE,
+                                ServerNoticeMessageBuilder.Build("守护者祭坛状态暂不可用，请重新进入活动。")) };
+                        }
+                        return new[] { ack };
                     });
                 }
                 catch (Exception ex) when (ex is IOException or SocketException or ObjectDisposedException)
@@ -188,8 +264,18 @@ namespace DfoServer.Network.Handlers
                     && session.Player.UserId == userId)
                     FileLogger.Log($"[GuardianAltarEntry] START_GAME rejected cid={characterId} "
                         + $"reason={preparedReason.Value} entryOnly=true");
+                else if (preparedMenu && menu != null && IsCurrentGeneration(session, characterId, generation)
+                    && session.Player.UserId == userId)
+                    FileLogger.Log($"[GuardianAltarEntry] START_GAME menu projected cid={characterId} "
+                        + $"ridable={menu.Header.RidableId} stages={menu.Stages.Count} "
+                        + $"tickets={menu.Header.FreeTickets}+{menu.Header.SecondaryTickets} combatAdmission=false");
             });
         }
+
+        private static bool IsTownReady(EnhancedClientSession session)
+            => SessionDirectory.IsTownPresence(session?.Player)
+                && !session.Player.DungeonSelectionPending
+                && session.Player.CurrentDungeonSelection == null;
 
         // SELECT_CHARACTER already owns the character transition gate here.
         // Acquiring that same SemaphoreSlim again would deadlock the login chain.
