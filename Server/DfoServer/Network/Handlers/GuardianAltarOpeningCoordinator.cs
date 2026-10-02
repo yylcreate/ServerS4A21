@@ -4,13 +4,17 @@ using System.IO;
 using System.Net.Sockets;
 using System.Threading.Tasks;
 using DfoServer.Game.Events.GuardianAltar;
+using DfoServer.Game.Mercenary;
 using DfoServer.Game.Session;
 using DfoServer.Infrastructure;
 using DfoServer.Network.Builders;
+using DfoServer.Network.Parsers.Events;
+using Microsoft.Data.Sqlite;
 
 namespace DfoServer.Network.Handlers
 {
-    // Entry-only projection. This does not admit a player, deduct tickets or ACK START_GAME.
+    // Entry projection and proven request rejections only. This does not admit
+    // a player, deduct tickets or manufacture START_GAME's successful menu.
     internal sealed class GuardianAltarOpeningCoordinator : IDisposable
     {
         private readonly GuardianAltarOpeningService _service;
@@ -88,6 +92,104 @@ namespace DfoServer.Network.Handlers
         }
 
         internal Task RefreshAsync() => PublishRevisionAsync(_service.Revision);
+
+        internal void RegisterEntryHandlers(
+            GameCommandRegistry.GameCommandRegistrationGroup handlers,
+            Func<EnhancedClientSession, bool> hasActiveTrade,
+            IMercenaryRestrictionService mercenaryRestrictions)
+        {
+            ArgumentNullException.ThrowIfNull(handlers);
+            ArgumentNullException.ThrowIfNull(hasActiveTrade);
+            ArgumentNullException.ThrowIfNull(mercenaryRestrictions);
+            handlers[(ushort)CmdPacketTypeA21.ADVANCE_ALTAR_START_GAME] =
+                (session, header, body) => HandleStartGameAsync(
+                    session, header, body, hasActiveTrade, mercenaryRestrictions);
+        }
+
+        private async Task HandleStartGameAsync(
+            EnhancedClientSession session,
+            GamePacketHeader header,
+            byte[] body,
+            Func<EnhancedClientSession, bool> hasActiveTrade,
+            IMercenaryRestrictionService mercenaryRestrictions)
+        {
+            if (header.cmd != 1 || header.type != (ushort)CmdPacketTypeA21.ADVANCE_ALTAR_START_GAME)
+                return;
+            var characterId = session?.Player?.CharacterId ?? 0;
+            var userId = session?.Player?.UserId ?? 0;
+            var generation = session?.GameSession;
+            if (userId == 0 || !IsCurrentGeneration(session, characterId, generation))
+                return;
+            var validRequest = GuardianAltarStartGameRequestParser.TryParse(body, out _);
+
+            await _transitions.RunIfCurrentAsync(session, async () =>
+            {
+                GuardianAltarEntryRejection? preparedReason = null;
+                try
+                {
+                    await _sendBatch(session, () =>
+                    {
+                        if (!IsCurrentGeneration(session, characterId, generation)
+                            || session.Player.UserId != userId)
+                            return Array.Empty<byte[]>();
+
+                        var reason = GuardianAltarEntryRejection.InvalidRequest;
+                        if (validRequest)
+                        {
+                            var opening = _service.GetSnapshot(_utcNow());
+                            var player = session.Player;
+                            var townReady = SessionDirectory.IsTownPresence(player)
+                                && !player.DungeonSelectionPending
+                                && player.CurrentDungeonSelection == null;
+                            try
+                            {
+                                var trading = opening.IsOpen && townReady && hasActiveTrade(session);
+                                var assigned = opening.IsOpen && townReady && !trading
+                                    && mercenaryRestrictions.IsAssigned(characterId);
+                                // A repository read may outlive the window or a displaced
+                                // session. Recheck immediately before projecting the reply.
+                                if (!IsCurrentGeneration(session, characterId, generation)
+                                    || session.Player.UserId != userId)
+                                    return Array.Empty<byte[]>();
+                                opening = _service.GetSnapshot(_utcNow());
+                                townReady = SessionDirectory.IsTownPresence(player)
+                                    && !player.DungeonSelectionPending
+                                    && player.CurrentDungeonSelection == null;
+                                reason = GuardianAltarEntryRules.Evaluate(opening, player.Level,
+                                    townReady, trading, assigned);
+                            }
+                            catch (SqliteException ex)
+                            {
+                                reason = GuardianAltarEntryRejection.StateReadFailed;
+                                FileLogger.Log($"[GuardianAltarEntry] state read failed cid={characterId}: {ex}");
+                            }
+                        }
+                        // Also cover a state reader that displaced this session
+                        // before throwing, and the malformed-request path.
+                        if (!IsCurrentGeneration(session, characterId, generation)
+                            || session.Player.UserId != userId)
+                            return Array.Empty<byte[]>();
+                        preparedReason = reason;
+                        return new[]
+                        {
+                            GamePacketEnvelopeBuilder.Build(1,
+                                (ushort)CmdPacketTypeA21.ADVANCE_ALTAR_START_GAME,
+                                GuardianAltarEntryAckBodyBuilder.BuildRejection(reason))
+                        };
+                    });
+                }
+                catch (Exception ex) when (ex is IOException or SocketException or ObjectDisposedException)
+                {
+                    FileLogger.Log($"[GuardianAltarEntry] request reply failed cid={characterId}: {ex.Message}");
+                    return;
+                }
+                if (preparedReason.HasValue
+                    && IsCurrentGeneration(session, characterId, generation)
+                    && session.Player.UserId == userId)
+                    FileLogger.Log($"[GuardianAltarEntry] START_GAME rejected cid={characterId} "
+                        + $"reason={preparedReason.Value} entryOnly=true");
+            });
+        }
 
         // SELECT_CHARACTER already owns the character transition gate here.
         // Acquiring that same SemaphoreSlim again would deadlock the login chain.

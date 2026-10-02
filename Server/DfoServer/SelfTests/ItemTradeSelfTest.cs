@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Reflection;
@@ -376,6 +377,9 @@ namespace DfoServer.SelfTests
                 var w = new GamePacketWriter(); w.WriteUInt16(uid); w.WriteByte(1); w.WriteInt32(123);
                 if (refuse) w.WriteUInt16(0x85); return w.ToArray();
             }
+            check("active trade query rejects null and unbound peers without packets", !handler.HasActiveTrade(null)
+                && !handler.HasActiveTrade(a.Session) && !handler.HasActiveTrade(b.Session)
+                && a.Drain().Count == 0 && b.Drain().Count == 0);
             await handler.Respond(b.Session, default, PeerBody(a.Session.Player.UserId));
             check("unsolicited acceptance emits nothing", a.Drain().Count == 0 && b.Drain().Count == 0);
             // Exercise the complete real command path with peers in different areas.
@@ -383,12 +387,67 @@ namespace DfoServer.SelfTests
             await protocol.OnPacketReceived_86JP(a.Session, new GamePacketHeader { cmd = 1, type = (ushort)CmdPacketTypeA21.REQUEST_PEER }, PeerBody(b.Session.Player.UserId));
             check("real dispatch emits request ACK and invite separately", a.Drain().Single().SequenceEqual(ItemTradePacketBuilder.PeerAck(CmdPacketTypeA21.REQUEST_PEER))
                 && b.Drain().Single().SequenceEqual(ItemTradePacketBuilder.Invite(a.Session.Player.UserId, 123)));
+            check("pending trade invitations are not active trades for either peer", !handler.HasActiveTrade(a.Session)
+                && !handler.HasActiveTrade(b.Session) && a.Drain().Count == 0 && b.Drain().Count == 0);
             await handler.Respond(b.Session, default, PeerBody(a.Session.Player.UserId, true));
             check("refusal reaches inviter only", a.Drain().Single().SequenceEqual(ItemTradePacketBuilder.PeerAck(CmdPacketTypeA21.RESPONSE_PEER, 0x85)) && b.Drain().Count == 0);
+            check("refused trade bindings are no longer active", !handler.HasActiveTrade(a.Session) && !handler.HasActiveTrade(b.Session));
             await handler.Request(a.Session, default, PeerBody(b.Session.Player.UserId)); a.Drain(); b.Drain();
             await protocol.OnPacketReceived_86JP(b.Session, new GamePacketHeader { cmd = 1, type = (ushort)CmdPacketTypeA21.RESPONSE_PEER }, PeerBody(a.Session.Player.UserId));
             check("accept opens both trade windows with distinct layouts", a.Drain().Single().SequenceEqual(ItemTradePacketBuilder.Accepted(b.Session.Player.UserId, 123, false))
                 && b.Drain().Single().SequenceEqual(ItemTradePacketBuilder.Accepted(a.Session.Player.UserId, 0, true)));
+            check("accepted trade is visible through the existing owner for both peers", handler.HasActiveTrade(a.Session)
+                && handler.HasActiveTrade(b.Session));
+            await handler.CancelBeforeTransition(a.Session, (ushort)CmdPacketTypeA21.ADVANCE_ALTAR_START_GAME);
+            check("Guardian entry query does not cancel an active trade before dispatch", handler.HasActiveTrade(a.Session)
+                && handler.HasActiveTrade(b.Session) && a.Drain().Count == 0 && b.Drain().Count == 0);
+
+            var originalPeerUid = b.Session.Player.UserId;
+            try
+            {
+                b.Session.Player.UserId = 0;
+                check("active trade query rejects a stale peer UID on both sides without sending", !handler.HasActiveTrade(a.Session)
+                    && !handler.HasActiveTrade(b.Session) && a.Drain().Count == 0 && b.Drain().Count == 0);
+            }
+            finally { b.Session.Player.UserId = originalPeerUid; }
+            check("restoring the peer UID preserves the original active trade", handler.HasActiveTrade(a.Session)
+                && handler.HasActiveTrade(b.Session));
+
+            var originalPeerCharacterId = b.Session.Player.CharacterId;
+            try
+            {
+                // Replace only the directory reference, without lifecycle teardown.
+                // The read-only query must reject it rather than cancel the binding.
+                sessions.Register(originalPeerCharacterId, a.Session);
+                check("active trade query rejects a displaced peer directory entry without sending", !handler.HasActiveTrade(a.Session)
+                    && !handler.HasActiveTrade(b.Session) && a.Drain().Count == 0 && b.Drain().Count == 0);
+            }
+            finally { sessions.Register(originalPeerCharacterId, b.Session); }
+            check("restoring the directory preserves the original active trade", handler.HasActiveTrade(a.Session)
+                && handler.HasActiveTrade(b.Session));
+
+            var inventoryContextSync = typeof(InventoryContext).GetField("SyncRoot", BindingFlags.NonPublic | BindingFlags.Static).GetValue(null);
+            var characterLeases = (Dictionary<int, InventoryLease>)typeof(InventoryContext)
+                .GetField("CharacterLeases", BindingFlags.NonPublic | BindingFlags.Static).GetValue(null);
+            InventoryLease originalPeerLease;
+            lock (inventoryContextSync) originalPeerLease = characterLeases[originalPeerCharacterId];
+            try
+            {
+                // Keep this synchronous fixture reversible: normal Register creates
+                // a new lease permanently, which would invalidate the original trade.
+                lock (inventoryContextSync)
+                    characterLeases[originalPeerCharacterId] = new InventoryLease(originalPeerLease.SessionId,
+                        originalPeerLease.CharacterId, originalPeerLease.Inventory, checked(originalPeerLease.Version + 1));
+                check("active trade query rejects a stale peer lease without canceling or sending", !handler.HasActiveTrade(a.Session)
+                    && !handler.HasActiveTrade(b.Session) && a.Drain().Count == 0 && b.Drain().Count == 0);
+            }
+            finally
+            {
+                lock (inventoryContextSync) characterLeases[originalPeerCharacterId] = originalPeerLease;
+            }
+            check("restoring the original lease preserves the accepted trade and fixture identity", handler.HasActiveTrade(a.Session)
+                && handler.HasActiveTrade(b.Session) && InventoryContext.IsCurrentLease(originalPeerLease,
+                    b.Session.SessionId, originalPeerCharacterId));
             left.Inventory.SetMainVirtualCount(357, 26218);
             var crystalMove = Convert.FromHexString("246501DC0B00006A6600000400000000000000000000FFFFFFFF0000");
             await protocol.OnPacketReceived_86JP(a.Session, new GamePacketHeader { cmd = 1, type = (ushort)CmdPacketTypeA21.MOVE_ITEMSPACE }, crystalMove);
@@ -443,6 +502,7 @@ namespace DfoServer.SelfTests
                 && BitConverter.ToUInt16(ap[^2], 1) == (ushort)NotiPacketTypeA21.FINISH_ITEMTRADE
                 && BitConverter.ToUInt16(ap[^1], 1) == (ushort)NotiPacketTypeA21.ITEM_LIST
                 && left.Inventory.CountMainItem(3030) == 11 && right.Inventory.CountMainItem(3030) == 8);
+            check("committed trade bindings are no longer active", !handler.HasActiveTrade(a.Session) && !handler.HasActiveTrade(b.Session));
             await handler.State(b.Session, default, new byte[] { 3 });
             check("wire duplicate confirmation is silent", a.Drain().Count == 0 && b.Drain().Count == 0);
             check("cross-area settlement kept both original locations", a.Session.Player.CurAreaId == 1 && b.Session.Player.CurAreaId == 2);
