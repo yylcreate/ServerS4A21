@@ -111,10 +111,10 @@ namespace DfoServer.SelfTests
         {
             using var fixture = new RequestFixture();
             var session = fixture.CreateSession(71000001);
-            check("real command registry registers only the A21 Guardian START_GAME command",
-                fixture.Registry.Count == 1
+            check("real command registry registers the A21 Guardian menu and purchase commands",
+                fixture.Registry.Count == 2
                 && fixture.Registry.TryGetValue((ushort)CmdPacketTypeA21.ADVANCE_ALTAR_START_GAME, out _)
-                && !fixture.Registry.TryGetValue((ushort)CmdPacketTypeA21.ADVANCE_ALTAR_BUY_ITEM, out _)
+                && fixture.Registry.TryGetValue((ushort)CmdPacketTypeA21.ADVANCE_ALTAR_BUY_ITEM, out _)
                 && (ushort)CmdPacketTypeA21.ADVANCE_ALTAR_START_GAME == 914);
 
             await fixture.DispatchAsync(session, null);

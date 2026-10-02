@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Net.Sockets;
 using System.Threading.Tasks;
 using DfoServer.Game.Events.GuardianAltar;
@@ -109,6 +110,9 @@ namespace DfoServer.Network.Handlers
             ArgumentNullException.ThrowIfNull(mercenaryRestrictions);
             handlers[(ushort)CmdPacketTypeA21.ADVANCE_ALTAR_START_GAME] =
                 (session, header, body) => HandleStartGameAsync(
+                    session, header, body, hasActiveTrade, mercenaryRestrictions);
+            handlers[(ushort)CmdPacketTypeA21.ADVANCE_ALTAR_BUY_ITEM] =
+                (session, header, body) => HandleBuyItemAsync(
                     session, header, body, hasActiveTrade, mercenaryRestrictions);
         }
 
@@ -287,6 +291,132 @@ namespace DfoServer.Network.Handlers
             => SessionDirectory.IsTownPresence(session?.Player)
                 && !session.Player.DungeonSelectionPending
                 && session.Player.CurrentDungeonSelection == null;
+
+        private async Task HandleBuyItemAsync(EnhancedClientSession session,
+            GamePacketHeader header, byte[] body, Func<EnhancedClientSession, bool> hasActiveTrade,
+            IMercenaryRestrictionService mercenaryRestrictions)
+        {
+            if (header.cmd != 1 || header.type != (ushort)CmdPacketTypeA21.ADVANCE_ALTAR_BUY_ITEM)
+                return;
+            var characterId = session?.Player?.CharacterId ?? 0;
+            var userId = session?.Player?.UserId ?? 0;
+            var accountId = session?.Account?.AccountId ?? 0;
+            var generation = session?.GameSession;
+            bool IsIdentityCurrent() => IsCurrentGeneration(session, characterId, generation)
+                && session.Player.UserId == userId && session.Account?.AccountId == accountId;
+            if (userId == 0 || accountId <= 0 || !IsIdentityCurrent())
+                return;
+            var validRequest = GuardianAltarPurchaseRequestParser.TryParse(body, out var request);
+            await _transitions.RunIfCurrentAsync(session, async () =>
+            {
+                var revision = _service.Revision;
+                GuardianAltarPurchaseResult committed = null;
+                GuardianAltarPurchaseOutcome? rejection = null;
+                var unavailable = false;
+                if (validRequest && IsIdentityCurrent())
+                {
+                    try
+                    {
+                        var opening = _service.GetSnapshot(_utcNow());
+                        if (!opening.IsOpen)
+                            rejection = GuardianAltarPurchaseOutcome.Closed;
+                        else if (!IsTownReady(session)
+                            || session.Player.Level < GuardianAltarEntryRules.MinimumLevel
+                            || hasActiveTrade(session) || mercenaryRestrictions.IsAssigned(characterId))
+                            rejection = GuardianAltarPurchaseOutcome.CannotPurchase;
+                        else if (_progress is IGuardianAltarPurchaseService purchases)
+                        {
+                            // This is the existing progress owner's single role
+                            // transaction, outside the packet send lock. No ticket
+                            // refill, Inventory mutation or combat-plan mutation.
+                            committed = purchases.Buy(characterId, accountId, request,
+                                () => !hasActiveTrade(session) && IsIdentityCurrent() && _service.Revision == revision
+                                    && _service.GetSnapshot(_utcNow()).IsOpen && IsTownReady(session)
+                                    && session.Player.Level >= GuardianAltarEntryRules.MinimumLevel);
+                            if (committed?.Progress?.CharacterId != characterId)
+                                throw new InvalidOperationException("Guardian purchase result has no current character owner.");
+                            GuardianAltarProgressValidator.Validate(committed.Progress);
+                            var learned = committed.Progress.Purchases.SingleOrDefault(x =>
+                                x.ShopType == request.ShopType && x.ResourceId == request.ResourceId);
+                            if (committed.NewLevel != (learned?.Level ?? 0)
+                                || (committed.Outcome == GuardianAltarPurchaseOutcome.Success
+                                    && (committed.Progress.Header.RidableId != request.RidableId
+                                        || committed.NewLevel != request.TargetLevel)))
+                                throw new InvalidOperationException("Guardian purchase result disagrees with its durable snapshot.");
+                        }
+                        else
+                            unavailable = true;
+                    }
+                    catch (Exception ex) when (ex is SqliteException or InvalidOperationException
+                        or InvalidDataException or IOException or OverflowException)
+                    {
+                        unavailable = true;
+                        FileLogger.Log($"[GuardianAltarPurchase] state/commit failed cid={characterId}: {ex}");
+                    }
+                }
+                try
+                {
+                    await _sendBatch(session, () =>
+                    {
+                        if (!IsIdentityCurrent())
+                            return Array.Empty<byte[]>();
+                        var expired = validRequest && _service.Revision != revision;
+                        var invalidPresence = validRequest && !IsTownReady(session);
+                        if (!unavailable && !expired && !invalidPresence && validRequest)
+                        {
+                            try
+                            {
+                                // Sending cannot open another purchase transaction.
+                                // A state change after commit requires a fresh menu
+                                // projection; it never refunds or repeats the debit.
+                                if (committed != null && (!_service.GetSnapshot(_utcNow()).IsOpen
+                                    || session.Player.Level < GuardianAltarEntryRules.MinimumLevel
+                                    || hasActiveTrade(session) || mercenaryRestrictions.IsAssigned(characterId)))
+                                    expired = true;
+                                if (!IsIdentityCurrent())
+                                    return Array.Empty<byte[]>();
+                                expired |= _service.Revision != revision
+                                    || (committed != null && (!_service.GetSnapshot(_utcNow()).IsOpen
+                                        || !IsTownReady(session)));
+                                if (!expired && (committed != null || rejection.HasValue))
+                                {
+                                    var ack = GuardianAltarPurchaseAckBodyBuilder.Build(request,
+                                        committed?.Outcome ?? rejection.Value,
+                                        committed?.NewLevel ?? 0,
+                                        committed?.Progress.Header.AvailableStars ?? 0);
+                                    return new[] { GamePacketEnvelopeBuilder.Build(1,
+                                        (ushort)CmdPacketTypeA21.ADVANCE_ALTAR_BUY_ITEM, ack) };
+                                }
+                            }
+                            catch (SqliteException ex)
+                            {
+                                unavailable = true;
+                                FileLogger.Log($"[GuardianAltarPurchase] reply state read failed cid={characterId}: {ex}");
+                            }
+                        }
+                        if (!IsIdentityCurrent())
+                            return Array.Empty<byte[]>();
+                        var failure = GamePacketEnvelopeBuilder.Build(1,
+                            (ushort)CmdPacketTypeA21.ADVANCE_ALTAR_BUY_ITEM,
+                            GuardianAltarPurchaseAckBodyBuilder.BuildRejected());
+                        if (unavailable || expired)
+                            return new[] { failure, GamePacketEnvelopeBuilder.Build(0,
+                                (ushort)NotiPacketTypeA21.SERVER_NOTICE_MESSAGE,
+                                ServerNoticeMessageBuilder.Build("守护者祭坛购买状态暂不可用，请重新进入活动。")) };
+                        return new[] { failure };
+                    });
+                }
+                catch (Exception ex) when (ex is IOException or SocketException or ObjectDisposedException)
+                {
+                    FileLogger.Log($"[GuardianAltarPurchase] reply failed cid={characterId}: {ex.Message}");
+                }
+                if (committed != null)
+                    FileLogger.Log($"[GuardianAltarPurchase] BUY_ITEM cid={characterId} type={request.ShopType} "
+                        + $"resource={request.ResourceId} levels={request.StartLevel}..{request.TargetLevel} "
+                        + $"result={committed.Outcome} changed={committed.Changed} "
+                        + $"stars={committed.Progress.Header.AvailableStars} reason={committed.RejectionReason}");
+            });
+        }
 
         // SELECT_CHARACTER already owns the character transition gate here.
         // Acquiring that same SemaphoreSlim again would deadlock the login chain.

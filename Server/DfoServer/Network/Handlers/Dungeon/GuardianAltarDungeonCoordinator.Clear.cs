@@ -228,9 +228,9 @@ namespace DfoServer.Network.Handlers.Dungeon
             combat.Timers.Attach(ticket, handle);
         }
 
-        // Guardian exit never enters ordinary card/retry preparation. Until
-        // its dedicated retry exchange is verified, the common return option
-        // uses the existing expected-run town return owner.
+        // A21 sub_10C3060 writes event, then button index. Event 2 selects a
+        // button; sub_10C3E00 applies exit actions only for event 1. Guardian
+        // never enters ordinary card/retry preparation.
         internal async Task<bool> TryHandleEplpCommandAsync(EnhancedClientSession session, GamePacketHeader header, byte[] body)
         {
             var run = session?.Player?.CurrentRun;
@@ -238,7 +238,7 @@ namespace DfoServer.Network.Handlers.Dungeon
             if (combat == null) return false;
             var fact = combat.TerminalFact;
             if (header.cmd != 1 || header.type != (ushort)CmdPacketTypeA21.EPLP_COMMAND
-                || body == null || body.Length < 2 || body[0] != 1 || body[1] != 2
+                || body == null || body.Length != 2 || body[0] is not (1 or 2) || body[1] is not (1 or 2)
                 || fact == null || !combat.Presentation.EplpProjectionSent)
                 return true;
             var fence = DungeonLoadingCoordinator.CaptureContinuationFence(session, _sessions, run, fact.Identity.Room);
@@ -257,7 +257,11 @@ namespace DfoServer.Network.Handlers.Dungeon
                 prepared = true;
                 return new[] { packet };
             }, Current);
-            if (prepared && Current()) await _returnToTown(session, fact.Identity.Run);
+            if (body[0] == 1 && prepared && Current())
+                // sub_E10700 reads the accepted option after the town fade:
+                // option 1 sends START_GAME itself; option 2 enters town.
+                // End only this run and let the existing menu owner respond.
+                await _returnToTown(session, fact.Identity.Run);
             return true;
         }
     }

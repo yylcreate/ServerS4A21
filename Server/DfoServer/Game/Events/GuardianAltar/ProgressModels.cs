@@ -13,6 +13,33 @@ namespace DfoServer.Game.Events.GuardianAltar
     internal sealed record GuardianAltarStage(int DungeonId, int Progress);
     internal sealed record GuardianAltarPurchase(int ShopType, int ResourceId,
         short Level, short Price);
+
+    internal readonly record struct GuardianAltarPurchaseRequest(
+        int RidableId, int ShopType, int ResourceId, short StartLevel, short TargetLevel)
+    {
+        internal GuardianAltarPurchaseRequest(int ridableId, int shopType, int resourceId, short targetLevel)
+            : this(ridableId, shopType, resourceId, targetLevel, targetLevel)
+        {
+        }
+    }
+
+    internal enum GuardianAltarPurchaseOutcome
+    {
+        Success,
+        Closed,
+        InsufficientStars,
+        CannotPurchase,
+    }
+
+    internal sealed record GuardianAltarPurchasePlan(
+        GuardianAltarPurchase Previous, GuardianAltarPurchase Updated, int Cost)
+    {
+        internal bool IsReplay => Previous == Updated;
+    }
+
+    internal sealed record GuardianAltarPurchaseResult(
+        GuardianAltarPurchaseOutcome Outcome, GuardianAltarProgressSnapshot Progress,
+        short PreviousLevel, short NewLevel, bool Changed, string RejectionReason = null);
     internal sealed record GuardianAltarSlot(byte Locked, int SlotType,
         byte SlotIndex, int ResourceId);
     internal sealed record GuardianAltarAchievement(int AchievementId, byte Claimed);
@@ -46,6 +73,14 @@ namespace DfoServer.Game.Events.GuardianAltar
     {
         GuardianAltarProgressSnapshot LoadMenu(int characterId, DateTime utcNow,
             Func<bool> isCurrent = null);
+    }
+
+    // The same progress owner supplies this capability. Keeping the interface
+    // narrow does not make menu-only test/adaptation providers authorize buys.
+    internal interface IGuardianAltarPurchaseService
+    {
+        GuardianAltarPurchaseResult Buy(int characterId, int accountId,
+            GuardianAltarPurchaseRequest request, Func<bool> isCurrent = null);
     }
 
     internal static class GuardianAltarProgressValidator

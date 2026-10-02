@@ -73,6 +73,64 @@ namespace DfoServer.Game.Events.GuardianAltar
 
         internal bool ContainsDungeon(int dungeonId) => _knownDungeonIds.Contains(dungeonId);
 
+        internal bool TryCreatePurchasePlan(GuardianAltarProgressSnapshot progress,
+            GuardianAltarPurchaseRequest request, out GuardianAltarPurchasePlan plan,
+            out string rejectionReason)
+        {
+            plan = null;
+            rejectionReason = null;
+            ValidateProgress(progress);
+            if (request.RidableId != RidableId || request.ShopType < 0 || request.ShopType > 2
+                || request.ResourceId <= 0 || request.StartLevel <= 0
+                || request.TargetLevel < request.StartLevel)
+            {
+                rejectionReason = "invalid resource or target";
+                return false;
+            }
+            var previous = progress.Purchases.SingleOrDefault(x => x.ShopType == request.ShopType
+                && x.ResourceId == request.ResourceId);
+            var shop = _shopEntries.SingleOrDefault(x => x.ShopType == request.ShopType
+                && x.ResourceId == request.ResourceId);
+            if (previous == null || shop == null)
+            {
+                rejectionReason = "resource is locked or absent from catalog";
+                return false;
+            }
+            if (shop.Levels.Count(x => x.Level == previous.Level && x.Price == previous.Price) != 1)
+            {
+                rejectionReason = "current purchase row is ambiguous";
+                return false;
+            }
+            var replay = request.TargetLevel == previous.Level;
+            if (!replay && (request.StartLevel != (int)previous.Level + 1
+                || request.TargetLevel < previous.Level))
+            {
+                rejectionReason = "purchase must begin at the next owned level";
+                return false;
+            }
+            // PvfLib preserves repeated higher-level source rows. A duplicate
+            // cannot authorize picking the first row or guessing an index.
+            var rows = shop.Levels.Where(x => x.Level >= request.StartLevel
+                && x.Level <= request.TargetLevel).ToArray();
+            if (rows.Length != (int)request.TargetLevel - request.StartLevel + 1
+                || rows.Select(x => x.Level).Distinct().Count() != rows.Length)
+            {
+                rejectionReason = "purchase interval contains missing or ambiguous levels";
+                return false;
+            }
+            if (replay)
+            {
+                plan = new GuardianAltarPurchasePlan(previous, previous, 0);
+                return true;
+            }
+            var target = rows.Single(x => x.Level == request.TargetLevel);
+            var cost = rows.Aggregate(0, (sum, row) => checked(sum + row.Price));
+            plan = new GuardianAltarPurchasePlan(previous,
+                new GuardianAltarPurchase(request.ShopType, request.ResourceId,
+                    target.Level, target.Price), cost);
+            return true;
+        }
+
         internal GuardianAltarDungeonStartPlan CreateStartPlan(int dungeonId, byte difficulty,
             GuardianAltarProgressSnapshot progress)
         {

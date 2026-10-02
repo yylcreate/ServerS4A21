@@ -60,6 +60,7 @@ namespace DfoServer.SelfTests
                 Section("Guardian energy coordinator", () => CheckEnergyAsync(Check, definition).GetAwaiter().GetResult());
                 Section("Guardian formal clear resource plans", () => CheckClearPlans(Check, definition));
                 Section("Guardian dedicated failed settlement", () => CheckFailedClearAsync(Check, definition).GetAwaiter().GetResult());
+                Section("Guardian result-button selection and exit", () => CheckEplpSelectionAsync(Check, definition).GetAwaiter().GetResult());
             }
             Console.WriteLine($"GUARDIAN_ALTAR_DUNGEON_ENTRY assertions={assertions} failures={failures}");
             return failures;
@@ -1177,6 +1178,62 @@ namespace DfoServer.SelfTests
             await fixture.Coordinator.HandlePauseAsync(session, new GamePacketHeader
                 { cmd = 1, type = (ushort)CmdPacketTypeA21.ADVANCE_ALTAR_PAUSE }, new byte[15])
                 .WaitAsync(TimeSpan.FromSeconds(5));
+        }
+
+        private static async Task CheckEplpSelectionAsync(Action<string, bool> check, GuardianAltarMenuDefinition definition)
+        {
+            foreach (var option in new byte[] { 1, 2 })
+            {
+                using var fixture = new Fixture(definition);
+                fixture.Open();
+                var session = await fixture.CreateConnectedSessionAsync(410 + option);
+                await ReadyGuardianAsync(fixture, session, definition);
+                var run = fixture.LastRun;
+                var header = new GamePacketHeader { cmd = 1, type = (ushort)CmdPacketTypeA21.EPLP_COMMAND };
+                await fixture.Coordinator.TryHandleCenterDeathAsync(session, run, 0).WaitAsync(TimeSpan.FromSeconds(5));
+                var fact = run.Instance.Mechanisms.GuardianAltarCombat.TerminalFact;
+                var before = fixture.Packets.Count;
+                foreach (var selection in new byte[] { 2, 1, 2 })
+                {
+                    var consumed = await fixture.Coordinator.TryHandleEplpCommandAsync(session, header,
+                        new byte[] { 2, selection }).WaitAsync(TimeSpan.FromSeconds(5));
+                    check("Guardian button hover receives its matching ACK without leaving the run",
+                        consumed && fixture.Packets[^1][0] == 1
+                        && Type(fixture.Packets[^1]) == (ushort)CmdPacketTypeA21.EPLP_COMMAND
+                        && fixture.Packets[^1].AsSpan(15).SequenceEqual(new byte[] { 1, 2, selection })
+                        && fixture.ReturnAttempts == 0 && ReferenceEquals(session.Player.CurrentRun, run)
+                        && ReferenceEquals(run.Instance.Mechanisms.GuardianAltarCombat.TerminalFact, fact));
+                }
+                check("hover selection cannot create a reward or ordinary-card projection",
+                    fixture.Packets.Count == before + 3
+                    && run.Instance.Mechanisms.GuardianAltarCombat.Presentation.CommitResult == null
+                    && fixture.Progress.Reads == 1);
+                before = fixture.Packets.Count;
+                foreach (var invalid in new[]
+                {
+                    Array.Empty<byte>(), new byte[] { 1 }, new byte[] { 1, 1, 0 },
+                    new byte[] { 0, 1 }, new byte[] { 3, 2 }, new byte[] { 1, 0 }, new byte[] { 2, 3 },
+                })
+                    await fixture.Coordinator.TryHandleEplpCommandAsync(session, header, invalid)
+                        .WaitAsync(TimeSpan.FromSeconds(5));
+                check("unproven result events, retry option and lengths cannot acknowledge or end Guardian",
+                    fixture.Packets.Count == before && fixture.ReturnAttempts == 0
+                    && ReferenceEquals(session.Player.CurrentRun, run));
+                var acknowledged = false;
+                fixture.BeforeReturn = () => acknowledged = fixture.Packets.Count == before + 1
+                    && fixture.Packets[^1].AsSpan(15).SequenceEqual(new byte[] { 1, 1, option })
+                    && ReferenceEquals(session.Player.CurrentRun, run);
+                await fixture.Coordinator.TryHandleEplpCommandAsync(session, header, new byte[] { 1, option })
+                    .WaitAsync(TimeSpan.FromSeconds(5));
+                check("committed selection " + option + " acknowledges before ending only the captured Guardian run",
+                    acknowledged && fixture.ReturnAttempts == 1 && fixture.ReturnApplied == 1
+                    && session.Player.CurrentRun == null && run.RunState == DungeonRunState.Ended);
+                var count = fixture.Packets.Count;
+                check("replayed result command after exit is no longer handled by the ended Guardian owner",
+                    !await fixture.Coordinator.TryHandleEplpCommandAsync(session, header, new byte[] { 1, option })
+                        .WaitAsync(TimeSpan.FromSeconds(5))
+                    && fixture.Packets.Count == count && fixture.ReturnAttempts == 1);
+            }
         }
 
         private static GuardianAltarProgressSnapshot Fresh(GuardianAltarMenuDefinition definition, int characterId) =>

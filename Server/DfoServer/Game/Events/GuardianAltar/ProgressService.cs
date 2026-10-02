@@ -10,7 +10,8 @@ namespace DfoServer.Game.Events.GuardianAltar
     // Durable role progress is the only menu-state authority. Ordinary clears
     // use the caller's inventory/outbox transaction; socket projections and
     // combat state remain with the Guardian coordinator/runtime.
-    internal sealed class GuardianAltarProgressService : IGuardianAltarProgressService
+    internal sealed class GuardianAltarProgressService : IGuardianAltarProgressService,
+        IGuardianAltarPurchaseService
     {
         private readonly IGameDatabase _database;
         private readonly DailyResetService _dailyReset;
@@ -78,6 +79,48 @@ namespace DfoServer.Game.Events.GuardianAltar
         }
 
         internal string DatabaseConnectionString => _database.ConnectionString;
+
+        public GuardianAltarPurchaseResult Buy(int characterId, int accountId,
+            GuardianAltarPurchaseRequest request, Func<bool> isCurrent = null)
+        {
+            if (characterId <= 0 || accountId <= 0)
+                throw new ArgumentOutOfRangeException(nameof(characterId));
+            // Prepare the immutable resource owner before entering SQLite.
+            // Buying does not initialize/refill tickets or normalize progress.
+            var definition = _definition.Value;
+            return _database.Write((connection, transaction) =>
+            {
+                RequireCurrentGeneration(isCurrent);
+                _repository.RequireCharacterOwnership(connection, transaction, characterId, accountId);
+                var before = _repository.Read(connection, transaction, characterId, definition.RidableId);
+                ValidateComplete(before, definition);
+                var previous = before.Purchases.SingleOrDefault(x => x.ShopType == request.ShopType
+                    && x.ResourceId == request.ResourceId);
+                if (!definition.TryCreatePurchasePlan(before, request, out var plan, out var reason))
+                {
+                    RequireCurrentGeneration(isCurrent);
+                    return new GuardianAltarPurchaseResult(GuardianAltarPurchaseOutcome.CannotPurchase,
+                        before, previous?.Level ?? 0, previous?.Level ?? 0, false, reason);
+                }
+                if (before.Header.AvailableStars < plan.Cost)
+                {
+                    RequireCurrentGeneration(isCurrent);
+                    return new GuardianAltarPurchaseResult(GuardianAltarPurchaseOutcome.InsufficientStars,
+                        before, plan.Previous.Level, plan.Previous.Level, false, "insufficient stars");
+                }
+                if (!plan.IsReplay)
+                {
+                    _repository.UpdatePurchase(connection, transaction, characterId, definition.RidableId, plan);
+                    _repository.SpendAvailableStars(connection, transaction, characterId, definition.RidableId,
+                        before.Header.AvailableStars, plan.Cost);
+                }
+                var after = _repository.Read(connection, transaction, characterId, definition.RidableId);
+                ValidateComplete(after, definition);
+                RequireCurrentGeneration(isCurrent);
+                return new GuardianAltarPurchaseResult(GuardianAltarPurchaseOutcome.Success,
+                    after, plan.Previous.Level, plan.Updated.Level, !plan.IsReplay);
+            });
+        }
 
         // Call before the inventory lock/SQLite transaction. Recovery may be
         // this owner's first operation and must not perform lazy PVF I/O there.

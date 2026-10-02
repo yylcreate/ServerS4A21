@@ -137,6 +137,33 @@ WHERE character_id=@cid AND ridable_id=@ridable;",
                 throw new InvalidOperationException("Guardian clear has no current character progress header.");
         }
 
+        internal void UpdatePurchase(SqliteConnection connection, SqliteTransaction transaction,
+            int characterId, int ridableId, GuardianAltarPurchasePlan plan)
+        {
+            if (Execute(connection, transaction, @"
+UPDATE character_guardian_altar_purchases SET level=@newLevel,price=@newPrice
+WHERE character_id=@cid AND ridable_id=@ridable AND shop_type=@type AND resource_id=@resource
+    AND level=@previousLevel AND price=@previousPrice;",
+                    ("@cid", characterId), ("@ridable", ridableId),
+                    ("@type", plan.Previous.ShopType), ("@resource", plan.Previous.ResourceId),
+                    ("@previousLevel", plan.Previous.Level), ("@previousPrice", plan.Previous.Price),
+                    ("@newLevel", plan.Updated.Level), ("@newPrice", plan.Updated.Price)) != 1)
+                throw new InvalidOperationException("Guardian purchase changed before commit.");
+        }
+
+        internal void SpendAvailableStars(SqliteConnection connection, SqliteTransaction transaction,
+            int characterId, int ridableId, int previousAvailable, int cost)
+        {
+            if (cost < 0 || previousAvailable < cost)
+                throw new ArgumentOutOfRangeException(nameof(cost));
+            if (Execute(connection, transaction, @"
+UPDATE character_guardian_altar SET available_stars=@remaining,updated_at=CURRENT_TIMESTAMP
+WHERE character_id=@cid AND ridable_id=@ridable AND available_stars=@previous;",
+                    ("@cid", characterId), ("@ridable", ridableId),
+                    ("@previous", previousAvailable), ("@remaining", previousAvailable - cost)) != 1)
+                throw new InvalidOperationException("Guardian available stars changed before purchase commit.");
+        }
+
         internal GuardianAltarProgressSnapshot Read(SqliteConnection connection,
             SqliteTransaction transaction, int characterId, int ridableId)
         {

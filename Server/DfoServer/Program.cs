@@ -19,6 +19,7 @@ namespace DfoServer
             ("--selftest-a21-startup-protocol", SelfTests.A21StartupProtocolSelfTest.Run),
             ("--selftest-guardian-altar-menu", SelfTests.GuardianAltarMenuSelfTest.Run),
             ("--selftest-guardian-altar-progress", SelfTests.GuardianAltarProgressSelfTest.Run),
+            ("--selftest-guardian-altar-purchase", SelfTests.GuardianAltarPurchaseSelfTest.Run),
             ("--selftest-guardian-altar-dungeon-definition", SelfTests.GuardianAltarDungeonDefinitionSelfTest.Run),
             ("--selftest-guardian-altar-dungeon-entry", SelfTests.GuardianAltarDungeonEntrySelfTest.Run),
             ("--selftest-guardian-altar-energy-protocol", SelfTests.GuardianAltarEnergyProtocolSelfTest.Run),
