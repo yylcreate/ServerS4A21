@@ -4,18 +4,52 @@ using System.Linq;
 
 namespace PvfLib
 {
+    public sealed class GuardianAltarActionSelection
+    {
+        public int ActionId { get; }
+        public int MinimumAlive { get; }
+        public int MaximumAlive { get; }
+        public bool IsDefault => MinimumAlive == -1 && MaximumAlive == -1;
+
+        internal GuardianAltarActionSelection(int actionId, int minimumAlive, int maximumAlive)
+        {
+            ActionId = actionId;
+            MinimumAlive = minimumAlive;
+            MaximumAlive = maximumAlive;
+        }
+    }
+
+    public sealed class GuardianAltarSummonStartArea
+    {
+        public int X { get; }
+        public int Y { get; }
+        public int Width { get; }
+        public int Height { get; }
+
+        internal GuardianAltarSummonStartArea(int x, int y, int width, int height)
+        {
+            X = x;
+            Y = y;
+            Width = width;
+            Height = height;
+        }
+    }
+
     public sealed class GuardianAltarTimelinePhase
     {
         public int DurationMilliseconds { get; }
         public string Type { get; }
         public IReadOnlyList<int> ActionAssignments { get; }
+        public IReadOnlyList<GuardianAltarActionSelection> ActionSelections { get; }
 
         internal GuardianAltarTimelinePhase(
-            int durationMilliseconds, string type, List<int> actionAssignments)
+            int durationMilliseconds, string type, List<int> actionAssignments,
+            List<GuardianAltarActionSelection> actionSelections)
         {
             DurationMilliseconds = durationMilliseconds;
             Type = type;
             ActionAssignments = actionAssignments.AsReadOnly();
+            ActionSelections = actionSelections.AsReadOnly();
         }
     }
 
@@ -32,6 +66,7 @@ namespace PvfLib
         public IReadOnlyList<GuardianAltarTimelinePhase> Phases
             { get; private set; } = Array.Empty<GuardianAltarTimelinePhase>();
         public int TotalDurationMilliseconds { get; private set; }
+        public GuardianAltarSummonStartArea SummonStartArea { get; private set; }
 
         public static GuardianAltarMapFile Parse(string content)
         {
@@ -116,9 +151,28 @@ namespace PvfLib
                 phases.Add(phase);
             }
 
+            var areaNode = GuardianAltarScriptReader.SingleChild(Root, "summon start area", required: false);
+            GuardianAltarSummonStartArea summonStartArea = null;
+            if (areaNode != null)
+            {
+                // This is an ordinary scalar MAP tag in the current PVF; its
+                // next sibling bounds the data and no closing tag is required.
+                GuardianAltarScriptReader.RequireLeaf(areaNode);
+                var areaTokens = GuardianAltarScriptReader.Tokens(areaNode, Content);
+                if (areaTokens.Count != 4)
+                    throw new InvalidOperationException("Guardian Altar summon start area requires four integers");
+                var area = areaTokens.Select(GuardianAltarScriptReader.Integer).ToArray();
+                if (area[2] <= 0 || area[3] <= 0)
+                    throw new InvalidOperationException("Guardian Altar summon start area dimensions must be positive");
+                _ = checked(area[0] + area[2]);
+                _ = checked(area[1] + area[3]);
+                summonStartArea = new GuardianAltarSummonStartArea(area[0], area[1], area[2], area[3]);
+            }
+
             CenterIndices = centers.AsReadOnly();
             Phases = phases.AsReadOnly();
             TotalDurationMilliseconds = totalDuration;
+            SummonStartArea = summonStartArea;
             InvalidReason = string.Empty;
         }
 
@@ -152,14 +206,26 @@ namespace PvfLib
 
             var actionNode = RequiredPhaseField(node, "action assign");
             var actionTokens = GuardianAltarScriptReader.Tokens(actionNode, Content);
-            if (actionTokens.Count != 3)
+            if (actionTokens.Count == 0 || actionTokens.Count % 3 != 0)
                 throw new InvalidOperationException(
-                    "Guardian Altar phase action assign requires three integers");
+                    "Guardian Altar phase action assign requires non-empty three-field selections");
             var assignments = actionTokens.Select(GuardianAltarScriptReader.Integer).ToList();
-            // Keep all three resource positions, including -1 sentinels. The
-            // projection does not choose a spawn action or schedule a phase.
+            var selections = new List<GuardianAltarActionSelection>();
+            for (var offset = 0; offset < assignments.Count; offset += 3)
+            {
+                var id = assignments[offset];
+                var minimumAlive = assignments[offset + 1];
+                var maximumAlive = assignments[offset + 2];
+                if (id <= 0 || minimumAlive < -1 || minimumAlive > short.MaxValue
+                    || maximumAlive < -1 || maximumAlive > short.MaxValue || minimumAlive > maximumAlive)
+                    throw new InvalidOperationException("Guardian Altar action selection has an invalid ID or alive range");
+                selections.Add(new GuardianAltarActionSelection(id, minimumAlive, maximumAlive));
+            }
+            // Keep source integers and ordered range selections. The runtime
+            // chooses the last matching range or last -1/-1 default; these are
+            // not three difficulty positions and no choice happens here.
             return new GuardianAltarTimelinePhase(
-                duration, type.ToLowerInvariant(), assignments);
+                duration, type.ToLowerInvariant(), assignments, selections);
         }
 
         private static ScriptNode RequiredPhaseField(ScriptNode phase, string tag)

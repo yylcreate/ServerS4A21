@@ -16,6 +16,8 @@ namespace DfoServer.Network.Handlers.Dungeon
         {
             ArgumentNullException.ThrowIfNull(handlers);
             handlers[(ushort)CmdPacketTypeA21.ADVANCE_ALTAR_PAUSE] = HandlePauseAsync;
+            handlers[(ushort)CmdPacketTypeA21.ADVANCE_ALTAR_UPGRADE_GAGE] = HandleUpgradeAsync;
+            handlers[(ushort)CmdPacketTypeA21.ADVANCE_ALTAR_SUMMON_UNIT] = HandleSummonAsync;
         }
 
         internal static void OnLoadingReleased(DungeonRun run, DungeonRoomIdentity roomIdentity,
@@ -29,7 +31,10 @@ namespace DfoServer.Network.Handlers.Dungeon
                 return;
             var source = new DungeonParticipantRoomIdentity(run.CaptureIdentity(), roomIdentity);
             if (run.Matches(source))
+            {
                 energy.BindLoadingRelease(source, loadingGeneration);
+                run.Instance.Mechanisms.GuardianAltarCombat?.BindLoadingRelease(source, loadingGeneration);
+            }
             // Binding records successful release only. The first client
             // PAUSE(false), not loading time, starts natural regeneration.
         }
@@ -74,6 +79,8 @@ namespace DfoServer.Network.Handlers.Dungeon
                     if (parsed && energy != null && GuardianCurrent())
                         accepted = energy.TrySetPaused(sourceRoom, generation, request.Paused,
                             _monotonicMilliseconds(), out snapshot);
+                    if (accepted)
+                        ScheduleCombat(session, run, snapshot);
                     bool ReplyCurrent() => accepted
                         ? GuardianCurrent() && energy.IsCurrent(snapshot)
                         : Current();
@@ -96,7 +103,7 @@ namespace DfoServer.Network.Handlers.Dungeon
                     FileLogger.Log($"[GuardianAltarEnergy] pause parsed={parsed} accepted={accepted} "
                         + $"cid={session.Player.CharacterId} run={run?.RunId ?? 0}/{run?.RunGeneration ?? 0} "
                         + $"generation={generation} paused={snapshot.Paused} energy={snapshot.EnergyFixed}/{snapshot.Scale} "
-                        + "level=0 clientClock=true wavesEnabled=false");
+                        + $"level={snapshot.Level} clientClock=true wavesEnabled=true");
                 });
             }
             finally { gate.Release(); }

@@ -13,6 +13,9 @@ namespace DfoServer.Game.Events.GuardianAltar
     internal sealed record GuardianAltarCenterSpawn(
         ushort MonsterCode, byte Level, byte MonsterType);
 
+    internal sealed record GuardianAltarUnitDefinition(byte Slot, int PrototypeId,
+        int EnergyCostFixed, int CooldownMilliseconds, string CooldownGroup);
+
     internal sealed class GuardianAltarDungeonStartPlan
     {
         internal GuardianAltarDungeonStartPlan(int dungeonId, byte difficulty,
@@ -20,7 +23,10 @@ namespace DfoServer.Game.Events.GuardianAltar
             IEnumerable<GuardianAltarPhaseSummary> phases,
             IEnumerable<GuardianAltarCenterSpawn> centers,
             GuardianAltarProgressSnapshot progress,
-            PvfLib.GuardianAltarEnergyConfigFile energy = null)
+            PvfLib.GuardianAltarEnergyConfigFile energy = null,
+            PvfLib.GuardianAltarMapFile combatMap = null,
+            PvfLib.GuardianAltarSummonDataFile summonData = null,
+            IEnumerable<GuardianAltarUnitDefinition> units = null)
         {
             if (dungeonId <= 0 || dungeonId > short.MaxValue || difficulty > 2
                 || mapId <= 0 || mapBasisLevel < 0 || durationMilliseconds <= 0)
@@ -32,6 +38,9 @@ namespace DfoServer.Game.Events.GuardianAltar
             DurationMilliseconds = durationMilliseconds;
             Progress = progress ?? throw new ArgumentNullException(nameof(progress));
             Energy = energy;
+            CombatMap = combatMap;
+            SummonData = summonData;
+            Units = Array.AsReadOnly((units ?? Array.Empty<GuardianAltarUnitDefinition>()).ToArray());
             Phases = Array.AsReadOnly(phases.ToArray());
             Centers = Array.AsReadOnly(centers.ToArray());
             if (Phases.Count == 0 || Centers.Count == 0 || Centers.Count > ushort.MaxValue
@@ -60,5 +69,8 @@ namespace DfoServer.Game.Events.GuardianAltar
         internal IReadOnlyList<GuardianAltarCenterSpawn> Centers { get; }
         internal GuardianAltarProgressSnapshot Progress { get; }
         internal PvfLib.GuardianAltarEnergyConfigFile Energy { get; }
+        internal PvfLib.GuardianAltarMapFile CombatMap { get; }
+        internal PvfLib.GuardianAltarSummonDataFile SummonData { get; }
+        internal IReadOnlyList<GuardianAltarUnitDefinition> Units { get; }
     }
 }

@@ -50,6 +50,8 @@ namespace DfoServer.SelfTests
             });
             if (definition != null)
             {
+                Section("Guardian combat continuation", () => CheckCombatAsync(Check, definition).GetAwaiter().GetResult());
+                Section("Guardian wave loading-generation fence", () => CheckCombatGenerationAsync(Check, definition).GetAwaiter().GetResult());
                 Section("authorized town lifecycle", () => CheckLifecycle(Check, definition));
                 Section("Guardian shared lock ordering", () => CheckLockOrderAsync(Check, definition).GetAwaiter().GetResult());
                 Section("Guardian entry and rejection", () => CheckEntryAsync(Check, definition).GetAwaiter().GetResult());
@@ -573,7 +575,9 @@ namespace DfoServer.SelfTests
             var registry = new GameCommandRegistry();
             registry.RegisterGroup("guardian-altar-runtime", fixture.Coordinator.RegisterRuntimeHandlers);
             check("the real Guardian runtime registration resolves the current A21 pause command",
-                registry.Count == 1 && registry.TryGetValue((ushort)CmdPacketTypeA21.ADVANCE_ALTAR_PAUSE, out _));
+                registry.Count == 3 && registry.TryGetValue((ushort)CmdPacketTypeA21.ADVANCE_ALTAR_PAUSE, out _)
+                && registry.TryGetValue((ushort)CmdPacketTypeA21.ADVANCE_ALTAR_UPGRADE_GAGE, out _)
+                && registry.TryGetValue((ushort)CmdPacketTypeA21.ADVANCE_ALTAR_SUMMON_UNIT, out _));
             registry.TryGetValue((ushort)CmdPacketTypeA21.ADVANCE_ALTAR_PAUSE, out var pauseHandler);
             check("duplicate Guardian runtime registration fails instead of silently replacing a handler",
                 Throws<InvalidOperationException>(() => registry.RegisterGroup("duplicate", fixture.Coordinator.RegisterRuntimeHandlers)));
@@ -683,6 +687,205 @@ namespace DfoServer.SelfTests
                 && energy.ReadSnapshot(22000) == closed);
         }
 
+        private static async Task CheckCombatAsync(Action<string, bool> check, GuardianAltarMenuDefinition definition)
+        {
+            using var fixture = new Fixture(definition);
+            fixture.Open();
+            var session = await fixture.CreateConnectedSessionAsync(302);
+            await fixture.DispatchAsync(session, Request(definition.FirstDungeonId));
+            var run = fixture.LastRun;
+            var room = fixture.LastRoom;
+            var identity = run.CaptureParticipantRoomIdentity();
+            var energy = run.Instance.Mechanisms.GuardianAltarEnergy;
+            var combat = run.Instance.Mechanisms.GuardianAltarCombat;
+            var plan = run.Instance.Mechanisms.GuardianAltar;
+            check("current PVF freezes two learned unit templates and their actual item costs/cooldowns",
+                plan.Units.Count == 2 && plan.Units[0] is { Slot: 0, PrototypeId: 2749171,
+                    EnergyCostFixed: 5000, CooldownMilliseconds: 3500, CooldownGroup: "100" }
+                && plan.Units[1] is { Slot: 1, PrototypeId: 2749176,
+                    EnergyCostFixed: 8000, CooldownMilliseconds: 4500, CooldownGroup: "101" });
+            var release = room.MarkLoadingReady(run.CaptureIdentity(), new[] { run.CaptureIdentity() });
+            GuardianAltarDungeonCoordinator.OnLoadingReleased(run, room.Identity, release.Generation);
+            var pauseHeader = new GamePacketHeader { cmd = 1, type = (ushort)CmdPacketTypeA21.ADVANCE_ALTAR_PAUSE };
+            Task Pause(bool paused)
+            {
+                var body = new byte[15]; body[14] = paused ? (byte)1 : (byte)0;
+                return fixture.Coordinator.HandlePauseAsync(session, pauseHeader, body);
+            }
+            Task Upgrade(int level, int claimedEnergy = int.MaxValue)
+            {
+                var body = new byte[22];
+                BinaryPrimitives.WriteInt32LittleEndian(body.AsSpan(14), level);
+                BinaryPrimitives.WriteInt32LittleEndian(body.AsSpan(18), claimedEnergy);
+                return fixture.Coordinator.HandleUpgradeAsync(session, new GamePacketHeader {
+                    cmd = 1, type = (ushort)CmdPacketTypeA21.ADVANCE_ALTAR_UPGRADE_GAGE }, body);
+            }
+            Task Summon(byte slot, int prototype, int level)
+            {
+                var body = new byte[23]; body[14] = slot;
+                BinaryPrimitives.WriteInt32LittleEndian(body.AsSpan(15), prototype);
+                BinaryPrimitives.WriteInt32LittleEndian(body.AsSpan(19), level);
+                return fixture.Coordinator.HandleSummonAsync(session, new GamePacketHeader {
+                    cmd = 1, type = (ushort)CmdPacketTypeA21.ADVANCE_ALTAR_SUMMON_UNIT }, body);
+            }
+            byte[] LastBody() => fixture.Packets[^1].AsSpan(15).ToArray();
+            await Pause(false);
+            await Upgrade(0);
+            check("client energy claims cannot authorize a zero-balance upgrade",
+                LastBody().SequenceEqual(GuardianAltarCombatBodyBuilder.BuildUpgradeAcknowledgement(true, 3, 0, 0, 0))
+                && energy.ReadSnapshot(0).Level == 0);
+            fixture.MonotonicMilliseconds = 5000;
+            await Summon(0, 2749171, 0);
+            check("registered summon dispatch spends PVF energy and returns the real full-width template",
+                LastBody().SequenceEqual(GuardianAltarCombatBodyBuilder.BuildSummonAcknowledgement(true, 0, 0, 2749171, 0))
+                && energy.ReadSnapshot(5000).EnergyFixed == 0);
+            var spent = energy.ReadSnapshot(5000);
+            await Summon(0, 2749171, 0);
+            await Summon(1, 2749171, 0);
+            await Summon(5, 2749171, 0);
+            check("duplicate cooldown, prototype mismatch and undeployed slots do not spend or project a summon",
+                LastBody().SequenceEqual(new byte[] { 0 }) && energy.ReadSnapshot(5000) == spent
+                && !fixture.Packets.Any(x => Type(x) == (ushort)NotiPacketTypeA21.ADVANCE_ALTAR_SPAWN_UNIT));
+            fixture.MonotonicMilliseconds = 15000;
+            fixture.PauseSendError = new IOException("upgrade ACK transport failure");
+            await Upgrade(0);
+            fixture.PauseSendError = null;
+            await Upgrade(0);
+            check("upgrade preserves the remainder after the configured 80 percent cost",
+                LastBody().SequenceEqual(GuardianAltarCombatBodyBuilder.BuildUpgradeAcknowledgement(true, 0, 0, 1, 2000)));
+            await Upgrade(0);
+            check("repeated stale-level upgrade cannot advance or charge the next level",
+                LastBody().SequenceEqual(GuardianAltarCombatBodyBuilder.BuildUpgradeAcknowledgement(true, 0, 0, 1, 2000))
+                && energy.ReadSnapshot(15000) is { Level: 1, EnergyFixed: 2000 });
+            fixture.MonotonicMilliseconds = 18000;
+            await Summon(0, 2749171, 1);
+            check("summon after upgrade uses the new rate without repricing prior seconds",
+                LastBody().SequenceEqual(GuardianAltarCombatBodyBuilder.BuildSummonAcknowledgement(true, 0, 0, 2749171, 300)));
+            combat.Timers.TryGetCurrentTicket(DungeonRunTimerKeys.GuardianAltarWaveSchedule, out var ticket);
+            var fence = DungeonLoadingCoordinator.CaptureContinuationFence(session, fixture.Sessions, run, room.Identity);
+            await fixture.Coordinator.OnCombatTimerAsync(session, run, identity, release.Generation, ticket, fence);
+            check("a spend or upgrade does not invalidate the scheduled enemy callback",
+                combat.AliveCount == 1 && combat.NextDueActiveMilliseconds == 25000
+                && Type(fixture.Packets[^1]) == (ushort)NotiPacketTypeA21.ADVANCE_ALTAR_SPAWN_UNIT
+                && LastBody().Length == 38 && U16(LastBody(), 0) == 1);
+            var actors = run.Instance.Mechanisms.DynamicActors.Capture(room.Identity,
+                GuardianAltarCombatRuntime.DynamicActorProvider, release.Generation);
+            check("enemy actor has the isolated policy and current instance generation",
+                actors.Count == 1 && ReferenceEquals(actors[0].Policy, DungeonDynamicActorPolicy.GuardianAltar)
+                && !actors[0].Policy.GrantsMonsterExperience && !actors[0].Policy.GeneratesMonsterDrops
+                && !actors[0].Policy.GeneratesQuestDrops && !actors[0].Policy.AdvancesQuestObjectives
+                && !actors[0].Policy.CountsTowardRoomClear && !actors[0].Policy.AppliesGeneralMechanisms
+                && !actors[0].Policy.TracksKillStatistics);
+            var packetCount = fixture.Packets.Count;
+            await fixture.Coordinator.OnCombatTimerAsync(session, run, identity, release.Generation, ticket, fence);
+            check("old timer ticket cannot spawn a duplicate enemy", fixture.Packets.Count == packetCount && combat.AliveCount == 1);
+            combat.Timers.TryGetCurrentTicket(DungeonRunTimerKeys.GuardianAltarWaveSchedule, out var beforePause);
+            await Pause(true);
+            var pausedBalance = energy.ReadSnapshot(18000);
+            fixture.MonotonicMilliseconds = 25000;
+            await Summon(0, 2749171, 1);
+            await Upgrade(1);
+            await fixture.Coordinator.OnCombatTimerAsync(session, run, identity, release.Generation, beforePause, fence);
+            check("pause rejects spends and cancels the pending wave without advancing active time",
+                energy.ReadSnapshot(25000).EnergyFixed == pausedBalance.EnergyFixed
+                && energy.ReadSnapshot(25000).ActiveMilliseconds == 18000 && combat.AliveCount == 1);
+            await Pause(false);
+            fixture.MonotonicMilliseconds = 32000;
+            combat.Timers.TryGetCurrentTicket(DungeonRunTimerKeys.GuardianAltarWaveSchedule, out var retryTicket);
+            fixture.PauseSendError = new IOException("wave transport failure");
+            await fixture.Coordinator.OnCombatTimerAsync(session, run, identity, release.Generation, retryTicket, fence);
+            check("failed enemy projection retains one registered actor and a stable retry batch", combat.AliveCount == 2);
+            fixture.PauseSendError = null;
+            combat.Timers.TryGetCurrentTicket(DungeonRunTimerKeys.GuardianAltarWaveSchedule, out retryTicket);
+            await fixture.Coordinator.OnCombatTimerAsync(session, run, identity, release.Generation, retryTicket, fence);
+            check("enemy retry reuses its original sequence and does not register another actor",
+                combat.AliveCount == 2 && U16(LastBody(), 0) == 2 && combat.NextDueActiveMilliseconds == 40000);
+            fixture.MonotonicMilliseconds = 132000; // active125s after the 7s pause
+            fixture.AfterPauseWrite = () => fixture.PauseSendError = new IOException("second spawn frame failed");
+            combat.Timers.TryGetCurrentTicket(DungeonRunTimerKeys.GuardianAltarWaveSchedule, out var partialTicket);
+            await fixture.Coordinator.OnCombatTimerAsync(session, run, identity, release.Generation, partialTicket, fence);
+            check("two-actor batch checkpoints the completed first frame before a second-frame failure",
+                combat.AliveCount == 4 && U16(LastBody(), 0) == 3);
+            fixture.PauseSendError = null;
+            combat.Timers.TryGetCurrentTicket(DungeonRunTimerKeys.GuardianAltarWaveSchedule, out partialTicket);
+            await fixture.Coordinator.OnCombatTimerAsync(session, run, identity, release.Generation, partialTicket, fence);
+            var projectedSequences = fixture.Packets.Where(x => Type(x) == (ushort)NotiPacketTypeA21.ADVANCE_ALTAR_SPAWN_UNIT)
+                .Select(x => U16(x.AsSpan(15).ToArray(), 0)).ToArray();
+            check("partial transport retry continues the missing frame without replaying the completed actor",
+                combat.AliveCount == 4 && projectedSequences.SequenceEqual(new ushort[] { 1, 2, 3, 4 })
+                && combat.NextDueActiveMilliseconds == 126000);
+            var actor = actors[0];
+            var deathSource = new DungeonEventEnvelope(Guid.NewGuid(), run.CaptureIdentity(), room.Identity.RoomInstanceId,
+                session.Player.CharacterId, session.Player.CharacterId, actor.SequenceId, actor.ActorCode,
+                "guardian-selftest-death", fixture.MonotonicMilliseconds);
+            check("canonical death admission resolves the Guardian provider and its actual spawn",
+                DungeonKillApplicationService.CanAcceptGuardianActorDeath(run, actor));
+            var death = room.TryRecordActorDeath(deathSource, actor.SequenceId, actor.ActorCode, actor.ActorType);
+            check("the shared Room ledger commits once before the Guardian death callback",
+                death.Accepted && death.Created && DungeonKillApplicationService.TryApplyGuardianActorDeath(run, actor, death.Fact.Source)
+                && combat.AliveCount == 3 && !DungeonKillApplicationService.CanAcceptGuardianActorDeath(run, actor));
+            var repeat = room.TryRecordActorDeath(deathSource, actor.SequenceId, actor.ActorCode, actor.ActorType);
+            check("canonical death replay preserves its fact and cannot decrement alive again",
+                repeat.Accepted && !repeat.Created && ReferenceEquals(repeat.Fact, death.Fact)
+                && DungeonKillApplicationService.TryApplyGuardianActorDeath(run, actor, repeat.Fact.Source)
+                && combat.AliveCount == 3 && run.RoomKilledSeqIds.Count == 0);
+            var wrongGeneration = new DungeonDynamicActorDefinition(actor.SequenceId, actor.ActorCode, actor.ActorType,
+                actor.ActorLevel, actor.RoomIdentity, actor.Provider, actor.ProviderGeneration + 1,
+                actor.WaveIdentity, actor.Policy);
+            var wrongPolicy = new DungeonDynamicActorDefinition(actor.SequenceId, actor.ActorCode, actor.ActorType,
+                actor.ActorLevel, actor.RoomIdentity, actor.Provider, actor.ProviderGeneration,
+                actor.WaveIdentity, DungeonDynamicActorPolicy.BloodAltar);
+            check("forged generation and another mechanism policy cannot pass Guardian death admission",
+                !DungeonKillApplicationService.CanAcceptGuardianActorDeath(run, wrongGeneration)
+                && !DungeonKillApplicationService.CanAcceptGuardianActorDeath(run, wrongPolicy));
+            combat.Timers.TryGetCurrentTicket(DungeonRunTimerKeys.GuardianAltarWaveSchedule, out var oldSessionTicket);
+            packetCount = fixture.Packets.Count;
+            session.GameSession = GameSessionIdentity();
+            fixture.MonotonicMilliseconds = 140000;
+            await fixture.Coordinator.OnCombatTimerAsync(session, run, identity, release.Generation, oldSessionTicket, fence);
+            check("captured old GameSession cannot project any newer wave", fixture.Packets.Count == packetCount && combat.AliveCount == 3);
+            fixture.EndMemoryRun(session, run.CaptureIdentity());
+            check("physical ending closes both clocks and cancels the instance wave ticket",
+                combat.IsClosed && energy.ReadSnapshot(140000).IsClosed && !combat.Timers.IsCurrent(oldSessionTicket));
+        }
+
+        private static async Task CheckCombatGenerationAsync(Action<string, bool> check, GuardianAltarMenuDefinition definition)
+        {
+            using var fixture = new Fixture(definition);
+            fixture.Open();
+            var session = await fixture.CreateConnectedSessionAsync(303);
+            await fixture.DispatchAsync(session, Request(definition.FirstDungeonId));
+            var run = fixture.LastRun;
+            var room = fixture.LastRoom;
+            var identity = run.CaptureParticipantRoomIdentity();
+            var released = room.MarkLoadingReady(run.CaptureIdentity(), new[] { run.CaptureIdentity() });
+            GuardianAltarDungeonCoordinator.OnLoadingReleased(run, room.Identity, released.Generation);
+            await fixture.Coordinator.HandlePauseAsync(session, new GamePacketHeader {
+                cmd = 1, type = (ushort)CmdPacketTypeA21.ADVANCE_ALTAR_PAUSE }, new byte[15]);
+            var combat = run.Instance.Mechanisms.GuardianAltarCombat;
+            combat.Timers.TryGetCurrentTicket(DungeonRunTimerKeys.GuardianAltarWaveSchedule, out var ticket);
+            var fence = DungeonLoadingCoordinator.CaptureContinuationFence(session, fixture.Sessions, run, room.Identity);
+            fixture.MonotonicMilliseconds = 10000;
+            var packetCount = fixture.Packets.Count;
+            var gate = session.Player.DungeonRunTransitionGate;
+            await gate.WaitAsync();
+            Task callback;
+            long replacementGeneration;
+            try
+            {
+                callback = fixture.Coordinator.OnCombatTimerAsync(session, run, identity, released.Generation, ticket, fence);
+                check("old wave callback waits for the shared run gate", !callback.IsCompleted);
+                replacementGeneration = room.RegisterLoadingProjection(run.CaptureIdentity(),
+                    DungeonMapHandler.CreateLoadingProjectionId(), new[] { run.CaptureIdentity() }, out _);
+            }
+            finally { gate.Release(); }
+            await callback.WaitAsync(TimeSpan.FromSeconds(5));
+            check("a new loading generation in the same room invalidates the waiting old wave",
+                replacementGeneration > released.Generation && fixture.Packets.Count == packetCount
+                && combat.AliveCount == 0 && run.Instance.Mechanisms.DynamicActors.Capture(room.Identity,
+                    GuardianAltarCombatRuntime.DynamicActorProvider, released.Generation).Count == 0);
+        }
+
         private static GuardianAltarProgressSnapshot Fresh(GuardianAltarMenuDefinition definition, int characterId) =>
             new GuardianAltarProgressSnapshot(characterId,
                 new GuardianAltarHeader(definition.RidableId, definition.DailyRefillTicket, 0, 0, 0, 0, 0, 0, 0, 0),
@@ -787,6 +990,7 @@ namespace DfoServer.SelfTests
             internal Exception SendError;
             internal Exception PauseSendError;
             internal Action BeforePausePrepare;
+            internal Action AfterPauseWrite;
             internal long MonotonicMilliseconds;
             internal int FailAfterPackets = -1;
             internal int ReturnAttempts;
@@ -806,7 +1010,8 @@ namespace DfoServer.SelfTests
                     Sessions, Transitions, Instances,
                     _ => Trading, Mercenary, _ => InParty, RegisterLoading, ReturnAsync,
                     utcNow: () => Now, send: SendAsync, isGuardianDungeon: definition.ContainsDungeon,
-                    monotonicMilliseconds: () => MonotonicMilliseconds, sendPause: SendPauseAsync);
+                    monotonicMilliseconds: () => MonotonicMilliseconds, sendPause: SendPauseAsync,
+                    combatClock: new DfoServer.Infrastructure.ClockService());
             }
             internal void Open() => Opening.SetWindow(Now, Now.AddMinutes(5));
             internal EnhancedClientSession CreateSession(int characterId, TcpClient tcp = null)
@@ -847,6 +1052,7 @@ namespace DfoServer.SelfTests
                 {
                     if (PauseSendError != null) throw PauseSendError;
                     Packets.Add(packet.ToArray());
+                    var after = AfterPauseWrite; AfterPauseWrite = null; after?.Invoke();
                     return Task.CompletedTask;
                 }, current);
             internal Task<bool> DispatchAsync(EnhancedClientSession session, byte[] body, byte cmd = 1, ushort? type = null) =>

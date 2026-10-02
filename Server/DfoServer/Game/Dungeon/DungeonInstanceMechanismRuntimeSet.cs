@@ -11,6 +11,7 @@ namespace DfoServer.Game.Dungeon
         private BloodAltarDungeonRuntime _bloodAltar;
         private Events.GuardianAltar.GuardianAltarDungeonStartPlan _guardianAltar;
         private Events.GuardianAltar.GuardianAltarEnergyRuntime _guardianAltarEnergy;
+        private Events.GuardianAltar.GuardianAltarCombatRuntime _guardianAltarCombat;
         private DungeonBossRouteRuntime _bossRoute;
         private AntonAwakeningRewardRuntime _antonAwakeningReward;
         private bool _conditionalBossSpawned;
@@ -34,8 +35,11 @@ namespace DfoServer.Game.Dungeon
                 if (_guardianAltar == null)
                 {
                     var energy = new Events.GuardianAltar.GuardianAltarEnergyRuntime(plan.Energy);
+                    var combat = new Events.GuardianAltar.GuardianAltarCombatRuntime(
+                        plan.CombatMap, plan.SummonData, Math.Max(1, plan.Centers.Count));
                     _guardianAltar = plan;
                     _guardianAltarEnergy = energy;
+                    _guardianAltarCombat = combat;
                     return true;
                 }
                 return ReferenceEquals(_guardianAltar, plan);
@@ -45,6 +49,11 @@ namespace DfoServer.Game.Dungeon
         internal Events.GuardianAltar.GuardianAltarEnergyRuntime GuardianAltarEnergy
         {
             get { lock (_syncRoot) return _guardianAltarEnergy; }
+        }
+
+        internal Events.GuardianAltar.GuardianAltarCombatRuntime GuardianAltarCombat
+        {
+            get { lock (_syncRoot) return _guardianAltarCombat; }
         }
 
         internal bool ConditionalBossSpawned
@@ -195,14 +204,17 @@ namespace DfoServer.Game.Dungeon
         {
             BloodAltarDungeonRuntime bloodAltar;
             Events.GuardianAltar.GuardianAltarEnergyRuntime guardianEnergy;
+            Events.GuardianAltar.GuardianAltarCombatRuntime guardianCombat;
             lock (_syncRoot)
             {
                 bloodAltar = _bloodAltar;
                 guardianEnergy = _guardianAltarEnergy;
+                guardianCombat = _guardianAltarCombat;
             }
 
             bloodAltar?.Timers.CancelAll();
             guardianEnergy?.Close();
+            guardianCombat?.Close();
         }
     }
 }

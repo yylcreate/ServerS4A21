@@ -1,8 +1,10 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Globalization;
 using System.Linq;
 using DfoServer.GameWorld;
+using DfoServer.Game.Inventory;
 using PvfLib;
 
 namespace DfoServer.Game.Events.GuardianAltar
@@ -19,6 +21,7 @@ namespace DfoServer.Game.Events.GuardianAltar
         private readonly Func<int, GuardianAltarDungeonFile> _dungeonLoader;
         private readonly Func<int, MapFile> _mapLoader;
         private readonly GuardianAltarEnergyConfigFile _energy;
+        private readonly GuardianAltarSummonDataFile _summonData;
 
         internal GuardianAltarMenuDefinition(int dailyRefillTicket, int ridableId,
             int firstDungeonId, IEnumerable<GuardianAltarPurchase> initialPurchases,
@@ -29,7 +32,8 @@ namespace DfoServer.Game.Events.GuardianAltar
             IEnumerable<GuardianAltarShopEntry> shopEntries = null,
             Func<int, GuardianAltarDungeonFile> dungeonLoader = null,
             Func<int, MapFile> mapLoader = null,
-            GuardianAltarEnergyConfigFile energy = null)
+            GuardianAltarEnergyConfigFile energy = null,
+            GuardianAltarSummonDataFile summonData = null)
         {
             if (dailyRefillTicket < 0 || ridableId <= 0 || firstDungeonId <= 0)
                 throw new ArgumentOutOfRangeException(nameof(dailyRefillTicket));
@@ -46,6 +50,7 @@ namespace DfoServer.Game.Events.GuardianAltar
             _dungeonLoader = dungeonLoader;
             _mapLoader = mapLoader;
             _energy = energy;
+            _summonData = summonData;
             ValidateProgress(new GuardianAltarProgressSnapshot(1,
                 new GuardianAltarHeader(ridableId, dailyRefillTicket, 0, 0, 0, 0, 0, 0, 0, 0),
                 new[] { new GuardianAltarStage(firstDungeonId, -1) },
@@ -73,6 +78,8 @@ namespace DfoServer.Game.Events.GuardianAltar
                 throw new InvalidOperationException("Guardian combat resource definitions are unavailable.");
             if (_energy == null || !_energy.IsValid)
                 throw new InvalidDataException("Guardian energy resource is unavailable: " + _energy?.InvalidReason);
+            if (_summonData == null || !_summonData.IsValid)
+                throw new InvalidDataException("Guardian summon resource is unavailable: " + _summonData?.InvalidReason);
             var dungeon = _dungeonLoader(dungeonId);
             if (dungeon == null || !dungeon.IsValid)
                 throw new InvalidDataException(dungeon?.InvalidReason ?? "Guardian DGN is missing.");
@@ -119,8 +126,30 @@ namespace DfoServer.Game.Events.GuardianAltar
             }
             if (guardianMap.CenterIndices.Any(x => !learnedCenters.Contains(x)))
                 throw new InvalidDataException("Guardian MAP has no learned entry for a required center.");
+            if (guardianMap.SummonStartArea == null
+                || guardianMap.Phases.SelectMany(x => x.ActionSelections)
+                    .Any(x => !_summonData.Actions.Any(a => a.Id == x.ActionId)))
+                throw new InvalidDataException("Guardian combat MAP or actor references are invalid.");
+            var units = new List<GuardianAltarUnitDefinition>();
+            foreach (var slot in progress.Slots.Where(x => x.SlotType == 1 && x.Locked == 0 && x.ResourceId > 0))
+            {
+                var learned = progress.Purchases.Single(x => x.ShopType == 0 && x.ResourceId == slot.ResourceId);
+                var shop = _shopEntries.Single(x => x.ShopType == 0 && x.ResourceId == slot.ResourceId);
+                var row = shop.Levels.Single(x => x.Level == learned.Level && x.Price == learned.Price);
+                var item = StackableItemProvider.Load(row.Index);
+                var cooldownGroup = StackableItemProvider.ResolveCooltimeGroup(row.Index);
+                if (learned.Level <= 0 || !shop.IsSettableSlot
+                    || item == null
+                    || !item.AdvanceAltarNeedGage.HasValue || item.CoolTime <= 0
+                    || cooldownGroup <= 0)
+                    throw new InvalidDataException("Guardian slotted unit has no valid summon item definition.");
+                units.Add(new GuardianAltarUnitDefinition(slot.SlotIndex, row.Index,
+                    checked(item.AdvanceAltarNeedGage.Value * _energy.Scale),
+                    item.CoolTime, cooldownGroup.ToString(CultureInfo.InvariantCulture)));
+            }
             return new GuardianAltarDungeonStartPlan(dungeonId, difficulty, selected.MapId,
-                selected.MapBasisLevel, guardianMap.TotalDurationMilliseconds, summaries, centers, progress, _energy);
+                selected.MapBasisLevel, guardianMap.TotalDurationMilliseconds, summaries, centers, progress,
+                _energy, guardianMap, _summonData, units);
         }
 
         internal void ValidateProgress(GuardianAltarProgressSnapshot snapshot)
@@ -150,7 +179,9 @@ namespace DfoServer.Game.Events.GuardianAltar
                 && !string.IsNullOrWhiteSpace(DungeonCatalog.GetDungeonFile(id)?.AdvanceAltarType),
                 achievementIds,
                 id => GuardianAltarDungeonFile.Parse(DungeonCatalog.GetDungeonFile(id)),
-                LoadRegisteredMap);
+                LoadRegisteredMap,
+                GuardianAltarSummonDataFile.Parse(PvfArchiveAccessor.ReadText(
+                    "etc/advancealtar/advancealtarsummondata.etc")));
         }
 
         internal static MapFile LoadRegisteredMap(int mapId)
@@ -164,7 +195,8 @@ namespace DfoServer.Game.Events.GuardianAltar
             GuardianAltarStageMapFile stageMap, Func<int, bool> isRegisteredGuardianDungeon,
             IEnumerable<int> knownAchievementIds = null,
             Func<int, GuardianAltarDungeonFile> dungeonLoader = null,
-            Func<int, MapFile> mapLoader = null)
+            Func<int, MapFile> mapLoader = null,
+            GuardianAltarSummonDataFile summonData = null)
         {
             ArgumentNullException.ThrowIfNull(config);
             ArgumentNullException.ThrowIfNull(stageMap);
@@ -213,7 +245,7 @@ namespace DfoServer.Game.Events.GuardianAltar
                 ridable.Entries.SelectMany(x => x.Levels.Select(level =>
                     new GuardianAltarPurchase(x.ShopType, x.ResourceId, level.Level, level.Price))),
                 knownAchievementIds, ridable.Entries, dungeonLoader, mapLoader,
-                GuardianAltarEnergyConfigFile.Parse(config));
+                GuardianAltarEnergyConfigFile.Parse(config), summonData);
         }
     }
 }

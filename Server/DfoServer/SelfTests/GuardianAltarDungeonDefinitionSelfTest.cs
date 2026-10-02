@@ -226,7 +226,7 @@ namespace DfoServer.SelfTests
                 GuardianAltarDungeonFile.Parse(SurvivalDungeon("100001")
                     + "[advance altar map]\n[/advance altar map]\n").IsValid);
 
-            var twoPhases = Timeline(Phase(1000, "normal", "7 -1 -1") + Phase(250, "named", "8 9 -1"));
+            var twoPhases = Timeline(Phase(1000, "normal", "7 -1 -1") + Phase(250, "named", "8 9 12"));
             var sharedMap = MapFile.Parse(twoPhases);
             var mapRoot = sharedMap.Root;
             var mapChildren = mapRoot.Children.ToArray();
@@ -237,7 +237,7 @@ namespace DfoServer.SelfTests
                 && map.Phases.Count == 2 && map.TotalDurationMilliseconds == 1250);
             check("two-phase typed projection preserves action assignment positions including -1 sentinels",
                 map.IsValid && map.Phases[0].ActionAssignments.SequenceEqual(new[] { 7, -1, -1 })
-                && map.Phases[1].ActionAssignments.SequenceEqual(new[] { 8, 9, -1 }));
+                && map.Phases[1].ActionAssignments.SequenceEqual(new[] { 8, 9, 12 }));
             var three = GuardianAltarMapFile.Parse(Timeline(Phase(100, "normal")
                 + Phase(200, "normal") + Phase(300, "boss")));
             check("three phases permit repeated phase types and retain checked total 600",

@@ -459,11 +459,14 @@ namespace DfoServer.Network.Handlers.Dungeon
                 && worldDeath.Accepted
                 && worldDeath.Fact != null)
             {
-                await _bloodAltar.OnDynamicActorDeathAsync(
-                    session,
-                    run,
-                    dynamicActor,
-                    worldDeath.Fact.Source);
+                if (IsGuardianDynamicActor(run, dynamicActor))
+                    TryApplyGuardianActorDeath(run, dynamicActor, worldDeath.Fact.Source);
+                else
+                    await _bloodAltar.OnDynamicActorDeathAsync(
+                        session,
+                        run,
+                        dynamicActor,
+                        worldDeath.Fact.Source);
                 if (!IsCurrent(run, context.Envelope))
                     return false;
             }
@@ -1261,9 +1264,9 @@ namespace DfoServer.Network.Handlers.Dungeon
                 if (!roomSnapshot.RoomState.InstanceRoom.TryGetActorDeathFact(
                         context.SequenceId,
                         out _)
-                    && !_bloodAltar.CanAcceptDynamicActorDeath(
-                        run,
-                        dynamicActor))
+                    && !(IsGuardianDynamicActor(run, dynamicActor)
+                        ? CanAcceptGuardianActorDeath(run, dynamicActor)
+                        : _bloodAltar.CanAcceptDynamicActorDeath(run, dynamicActor)))
                 {
                     FileLogger.Log(
                         $"[DungeonKill] dynamic actor death rejected before " +
@@ -1313,6 +1316,26 @@ namespace DfoServer.Network.Handlers.Dungeon
                 worldDeath.Fact.DeathKind);
             return true;
         }
+
+        private static bool IsGuardianDynamicActor(DungeonRun run, DungeonDynamicActorDefinition actor)
+            => run?.Instance?.Mechanisms.GuardianAltarCombat != null && actor != null
+                && string.Equals(actor.Provider,
+                    Game.Events.GuardianAltar.GuardianAltarCombatRuntime.DynamicActorProvider,
+                    StringComparison.Ordinal)
+                && ReferenceEquals(actor.Policy, DungeonDynamicActorPolicy.GuardianAltar)
+                && actor.RoomIdentity.Equals(run.CaptureParticipantRoomIdentity().Room);
+
+        internal static bool CanAcceptGuardianActorDeath(DungeonRun run, DungeonDynamicActorDefinition actor)
+            => IsGuardianDynamicActor(run, actor)
+                && run.Instance.Mechanisms.GuardianAltarCombat.CanAcceptActorDeath(
+                    run.CaptureParticipantRoomIdentity(), actor.ProviderGeneration, actor.SequenceId);
+
+        internal static bool TryApplyGuardianActorDeath(DungeonRun run, DungeonDynamicActorDefinition actor,
+            DungeonEventEnvelope source)
+            => IsGuardianDynamicActor(run, actor) && source != null
+                && source.RoomIdentity.Equals(actor.RoomIdentity) && run.Matches(source.RunIdentity)
+                && run.Instance.Mechanisms.GuardianAltarCombat.TryApplyDeath(
+                    run.CaptureParticipantRoomIdentity(), actor.ProviderGeneration, actor.SequenceId, out _);
 
         private IReadOnlyList<DungeonParticipantRosterEntry> CaptureEligibleRoster(
             KillContext source,

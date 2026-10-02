@@ -13,12 +13,14 @@ using DfoServer.GameWorld;
 using DfoServer.Network.Builders;
 using DfoServer.Network.Parsers.Events;
 using Microsoft.Data.Sqlite;
+using DfoServer.Infrastructure;
 
 namespace DfoServer.Network.Handlers.Dungeon
 {
     // Resource-classified special entry, not a replacement SELECT handler or
-    // another run/loading state machine. This batch does not execute waves or
-    // settle Guardian rewards. It must never enter ordinary maze/hell/card paths.
+    // another run/loading state machine. Dedicated combat shares its energy
+    // clock; Guardian rewards still have no settlement path in this batch.
+    // It must never enter ordinary maze/hell/card paths.
     internal sealed partial class GuardianAltarDungeonCoordinator
     {
         private readonly GuardianAltarOpeningService _opening;
@@ -49,7 +51,8 @@ namespace DfoServer.Network.Handlers.Dungeon
             Func<int, bool> isGuardianDungeon = null,
             Func<EnhancedClientSession, DungeonRunIdentity, Task> onEntered = null,
             Func<long> monotonicMilliseconds = null,
-            Func<EnhancedClientSession, Func<IReadOnlyList<byte[]>>, Func<bool>, Task> sendPause = null)
+            Func<EnhancedClientSession, Func<IReadOnlyList<byte[]>>, Func<bool>, Task> sendPause = null,
+            ClockService combatClock = null)
         {
             _opening = opening ?? throw new ArgumentNullException(nameof(opening));
             _progress = progress ?? throw new ArgumentNullException(nameof(progress));
@@ -74,6 +77,7 @@ namespace DfoServer.Network.Handlers.Dungeon
             _monotonicMilliseconds = monotonicMilliseconds ?? (() => Environment.TickCount64);
             _sendPause = sendPause ?? ((session, prepare, current) =>
                 session.SendPreparedPacketBatchAsync(prepare, current));
+            _combatClock = combatClock ?? ClockService.Instance;
         }
 
         internal async Task<bool> TryHandleSelectDungeonAsync(EnhancedClientSession session,
@@ -242,7 +246,7 @@ namespace DfoServer.Network.Handlers.Dungeon
                         }
                         FileLogger.Log($"[GuardianAltarDungeon] start projected cid={cid} dungeon={plan.DungeonId} "
                             + $"difficulty={plan.Difficulty} map={plan.MapId} phases={plan.Phases.Count} centers={plan.Centers.Count} "
-                            + $"run={identity.RunId}/{identity.RunGeneration} ticketsUnchanged=true wavesEnabled=false");
+                            + $"run={identity.RunId}/{identity.RunGeneration} ticketsUnchanged=true wavesEnabled=true");
                     }
                 }
                 catch (Exception ex) when (ex is InvalidDataException or IOException or SocketException or ObjectDisposedException

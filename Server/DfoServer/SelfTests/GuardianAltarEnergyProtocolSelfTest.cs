@@ -31,6 +31,8 @@ namespace DfoServer.SelfTests
             Section("current PVF energy and shared projection", () => CheckRealResources(Check));
             Section("resource-owned row count and fixed units", () => CheckValidEnergy(Check));
             Section("energy fail-closed validation", () => CheckInvalidEnergy(Check));
+            Section("upgrade fraction validation", () => CheckUpgradeFractions(Check));
+            Section("stackable summon energy scalar", () => CheckSummonEnergyScalar(Check));
             Section("A21 pause request validation", () => CheckPauseRequests(Check));
             Section("A21 pause acknowledgement consumption", () => CheckPauseAcknowledgements(Check));
             Console.WriteLine($"GUARDIAN_ALTAR_ENERGY_PROTOCOL assertions={assertions} failures={failures}");
@@ -90,6 +92,83 @@ namespace DfoServer.SelfTests
             check("energy validation leaves the PVF archive read-only", !archive.HasModifications);
         }
 
+        private static void CheckUpgradeFractions(Action<string, bool> check)
+        {
+            foreach (var fixture in new (string Text, float Expected)[]
+            {
+                ("0", 0f), ("1", 1f), ("0.8", 0.8f), ("0.99999994", 0.99999994f),
+                ("1e-4", 0.0001f), ("0.8 # resource comment", 0.8f)
+            })
+            {
+                var parsed = GuardianAltarEnergyConfigFile.Parse(FractionTable(fixture.Text));
+                check("upgrade fraction " + fixture.Text + " retains the finite source value and energy definition",
+                    parsed.IsValid && parsed.UpgradeCostPercent == fixture.Expected && parsed.Scale == 7
+                    && EnergyRows(parsed).SequenceEqual(new[] { (0, 3, 21, 7) }));
+            }
+            foreach (var value in new[]
+            {
+                "", "-0.1", "1.0000001", "2", "NaN", "Infinity", "-Infinity", "1e100",
+                "bad", "`0.8`", "0.8 0.9", "0,8", "0.8%"
+            })
+                CheckFailedEnergy(check, "invalid upgrade fraction " + value,
+                    GuardianAltarEnergyConfigFile.Parse(FractionTable(value)));
+            var missing = "[gage up rate]\n0 3 7\n[/gage up rate]\n";
+            foreach (var fixture in new (string Label, string Text)[]
+            {
+                ("missing cost tag", missing),
+                ("duplicate cost tag", FractionTable("0.8")
+                    + "[gage upgrade cost percent]\n0.8\n[/gage upgrade cost percent]\n"),
+                ("unclosed cost tag", FractionTable("0.8").Replace("[/gage upgrade cost percent]\n", "")),
+                ("wrong cost closing tag", FractionTable("0.8").Replace("[/gage upgrade cost percent]", "[/other]")),
+                ("nested cost tag", FractionTable("[nested]\n0.8\n[/nested]")),
+                ("stray cost closing tag", FractionTable("0.8\n[/other]"))
+            })
+                CheckFailedEnergy(check, fixture.Label, GuardianAltarEnergyConfigFile.Parse(fixture.Text));
+            var shared = GuardianAltarConfigFile.Parse(FractionTable("NaN"), "[unsupported]\n0\n");
+            var originalTree = CaptureTree(shared.Root);
+            var projected = GuardianAltarEnergyConfigFile.Parse(shared);
+            CheckFailedEnergy(check, "invalid shared upgrade fraction", projected);
+            check("failed upgrade projection preserves the exact shared Root, Content and tree",
+                ReferenceEquals(projected.Root, shared.Root) && ReferenceEquals(projected.Content, shared.Content)
+                && originalTree.All(x => x.IsUnchanged()) && projected.UpgradeCostPercent == 0f);
+        }
+
+        private static void CheckSummonEnergyScalar(Action<string, bool> check)
+        {
+            var absent = StackableItemFile.Parse("[name]\n`ordinary consumable`\n[cool time]\n3500\n");
+            check("an ordinary stackable without the Guardian scalar preserves absence",
+                absent.AdvanceAltarNeedGage == null && absent.CoolTime == 3500);
+            foreach (var value in new[] { 0, 5, 8, int.MaxValue })
+            {
+                var parsed = StackableItemFile.Parse("[advance altar need gage]\n" + value + "\n[cool time]\n4500\n");
+                check($"summon need-gage scalar {value} is typed without consuming the next sibling",
+                    parsed.AdvanceAltarNeedGage == value && parsed.CoolTime == 4500
+                    && parsed.Root.GetChildren("advance altar need gage").Count == 1);
+            }
+            var commented = StackableItemFile.Parse("[advance altar need gage]\n5 # cost\n[cool time]\n3500\n");
+            check("summon need-gage scalar accepts source comments with the ordinary PVF scalar layout",
+                commented.AdvanceAltarNeedGage == 5 && commented.CoolTime == 3500);
+            foreach (var value in new[] { "", "-1", "1.5", "bad", "`5`", "2147483648", "5 8", "5\n8" })
+                CheckRejectedScalar(check, "invalid summon scalar " + value,
+                    "[advance altar need gage]\n" + value + "\n[cool time]\n3500\n");
+            CheckRejectedScalar(check, "duplicate summon scalar",
+                "[advance altar need gage]\n5\n[advance altar need gage]\n8\n");
+            CheckRejectedScalar(check, "nested summon scalar",
+                "[advance altar need gage]\n[nested]\n5\n[/nested]\n[/advance altar need gage]\n");
+        }
+
+        private static void CheckRejectedScalar(Action<string, bool> check, string label, string content)
+        {
+            var rejected = false;
+            try { StackableItemFile.Parse(content); }
+            catch (InvalidOperationException) { rejected = true; }
+            check(label + " rejects rather than publishing a default zero cost", rejected);
+        }
+
+        private static string FractionTable(string fraction) =>
+            "[gage upgrade cost percent]\n" + fraction + "\n[/gage upgrade cost percent]\n"
+            + "[gage up rate]\n0 3 7\n[/gage up rate]\n";
+
         private static void CheckValidEnergy(Action<string, bool> check)
         {
             var cases = new[]
@@ -120,9 +199,9 @@ namespace DfoServer.SelfTests
                     new[] { (0, 3, 21, 7), (1, 9, 63, 11) }));
             var unrelated = GuardianAltarEnergyConfigFile.Parse(
                 "[gage upgrade cost percent]\n0.8\n[/gage upgrade cost percent]\n"
-                + EnergyTable("0 3 7"));
-            check("energy projection does not interpret the separate upgrade percentage",
-                unrelated.IsValid && unrelated.Scale == 7
+                + "[gage up rate]\n0 3 7\n[/gage up rate]\n");
+            check("energy projection retains the resource-owned upgrade percentage",
+                unrelated.IsValid && unrelated.Scale == 7 && unrelated.UpgradeCostPercent == 0.8f
                 && EnergyRows(unrelated).SequenceEqual(new[] { (0, 3, 21, 7) }));
             var unrelatedInvalidConfig = GuardianAltarConfigFile.Parse(
                 EnergyTable("0 3 7"), "[unsupported]\n0\n");
@@ -255,7 +334,8 @@ namespace DfoServer.SelfTests
         }
 
         private static string EnergyTable(string rows) =>
-            "[gage up rate]\n" + rows + "\n[/gage up rate]\n";
+            "[gage up rate]\n" + rows + "\n[/gage up rate]\n"
+            + "[gage upgrade cost percent]\n0.8\n[/gage upgrade cost percent]\n";
 
         private static IEnumerable<(int Level, int Capacity, int CapacityFixed, int Regeneration)>
             EnergyRows(GuardianAltarEnergyConfigFile parsed) =>
