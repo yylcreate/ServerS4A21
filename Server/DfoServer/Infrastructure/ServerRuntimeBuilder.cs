@@ -806,7 +806,13 @@ namespace DfoServer.Infrastructure
                 new EventTotalAttendanceHandler(
                     inventory.TotalAttendance);
 
-            return new GameProtocolFeatureHandlers(
+            var guardianAltarOpening = new GuardianAltarOpeningCoordinator(
+                core.EventManager.GuardianAltarOpening,
+                world.Sessions,
+                world.CharacterTransitions,
+                ClockService.Instance);
+
+            var handlers = new GameProtocolFeatureHandlers(
                 lotteryItem,
                 new PetCreatureHandler(
                     core.SelectCharacterDataSource,
@@ -866,7 +872,10 @@ namespace DfoServer.Infrastructure
                 eventTotalAttendanceHandler,
                 new NpcFavorHandler(
                     core.Database,
-                    inventory.InventoryRefreshSender));
+                    inventory.InventoryRefreshSender),
+                guardianAltarOpening);
+            guardianAltarOpening.Start();
+            return handlers;
         }
 
         internal CharacterSessionLifecycleCoordinator
@@ -982,7 +991,8 @@ namespace DfoServer.Infrastructure
                 socialHandlers.PvpRoom,
                 inventory.InventoryRefreshSender,
                 core.Database,
-                core.DailyResetService);
+                core.DailyResetService,
+                featureHandlers.GuardianAltarOpening);
         }
 
         public void Dispose()
@@ -991,6 +1001,7 @@ namespace DfoServer.Infrastructure
                 return;
 
             _disposed = true;
+            _gameProtocolFeatureHandlers?.GuardianAltarOpening?.Dispose();
             _gameProtocolSocialHandlers?.Dispose();
             _gameProtocolWorld?.Dispose();
         }

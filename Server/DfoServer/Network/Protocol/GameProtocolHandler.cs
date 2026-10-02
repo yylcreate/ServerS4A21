@@ -77,6 +77,8 @@ namespace DfoServer.Network
         private readonly IGameDatabase _database;
         private readonly GameProtocolWorldDependencies _worldDependencies;
         private readonly bool _ownsWorldDependencies;
+        private readonly GuardianAltarOpeningCoordinator _guardianAltarOpening;
+        private readonly bool _ownsGuardianAltarOpening;
         private readonly GameProtocolSocialHandlers _socialHandlers;
         private readonly GameCommandRegistry _cmdDispatch;
 
@@ -147,6 +149,7 @@ namespace DfoServer.Network
                     udpRelay,
                     pvpUdpRelay,
                     inventory.InventoryRefreshSender);
+            _ownsGuardianAltarOpening = featureHandlers == null;
             featureHandlers ??= ServerRuntimeBuilder
                 .CreateGameProtocolFeatureHandlers(
                     core,
@@ -220,6 +223,7 @@ namespace DfoServer.Network
                 featureHandlers.EventDailyAttendanceAnytime;
             _eventTotalAttendanceHandler = featureHandlers.EventTotalAttendance;
             _npcFavorHandler = featureHandlers.NpcFavor;
+            _guardianAltarOpening = featureHandlers.GuardianAltarOpening;
             _pvpChannelInfoHandler = socialHandlers.PvpChannelInfo;
             _pvpRoomHandler = socialHandlers.PvpRoom;
             _characterSessionLifecycle = characterSessionLifecycle;
@@ -287,6 +291,8 @@ namespace DfoServer.Network
 
         public void Dispose()
         {
+            if (_ownsGuardianAltarOpening)
+                _guardianAltarOpening?.Dispose();
             _socialHandlers.Dispose();
             if (_ownsWorldDependencies)
                 _worldDependencies.Dispose();

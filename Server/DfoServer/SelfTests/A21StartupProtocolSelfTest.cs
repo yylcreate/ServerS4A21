@@ -18,6 +18,7 @@ namespace DfoServer.SelfTests
         {
             Console.WriteLine("=== A21_STARTUP_PROTOCOL selftest ===");
             var failures = 0;
+            failures += GuardianAltarOpeningSelfTest.Run();
             CheckPvpGradeProjection(ref failures);
 
             Check(
