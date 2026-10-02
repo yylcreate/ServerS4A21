@@ -10,11 +10,13 @@ namespace PvfLib
     {
         public short Level { get; }
         public short Price { get; }
+        public int Index { get; }
 
-        internal GuardianAltarShopLevel(short level, short price)
+        internal GuardianAltarShopLevel(short level, short price, int index)
         {
             Level = level;
             Price = price;
+            Index = index;
         }
     }
 
@@ -387,7 +389,8 @@ namespace PvfLib
                     tokens[row + levelColumn]);
                 var price = GuardianAltarScriptReader.NonNegativeShort(
                     tokens[row + priceColumn]);
-                if (GuardianAltarScriptReader.Integer(tokens[row + indexColumn]) < 0)
+                var resourceIndex = GuardianAltarScriptReader.Integer(tokens[row + indexColumn]);
+                if (resourceIndex < 0)
                     throw new InvalidOperationException(
                         $"Guardian Altar entry {resourceId} index must be non-negative");
                 if (!seenLevels.Add(level))
@@ -400,7 +403,7 @@ namespace PvfLib
                     diagnostics.Add(
                         $"Guardian Altar entry {resourceId} repeats catalog level {level}");
                 }
-                levels.Add(new GuardianAltarShopLevel(level, price));
+                levels.Add(new GuardianAltarShopLevel(level, price, resourceIndex));
             }
             if (!seenLevels.Contains(0) && !seenLevels.Contains(1))
                 throw new InvalidOperationException(

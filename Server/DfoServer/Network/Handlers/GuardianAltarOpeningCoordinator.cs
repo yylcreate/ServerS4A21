@@ -23,6 +23,7 @@ namespace DfoServer.Network.Handlers
         private readonly ClockService _clock;
         private readonly Func<DateTimeOffset> _utcNow;
         private readonly IGuardianAltarProgressService _progress;
+        private readonly Func<GuardianAltarMenuDefinition> _definition;
         private readonly Func<EnhancedClientSession,
             Func<IReadOnlyList<byte[]>>, Task> _sendBatch;
         private readonly object _timerSync = new object();
@@ -40,7 +41,8 @@ namespace DfoServer.Network.Handlers
             ClockService clock,
             Func<DateTimeOffset> utcNow = null,
             Func<EnhancedClientSession, Func<IReadOnlyList<byte[]>>, Task> sendBatch = null,
-            IGuardianAltarProgressService progress = null)
+            IGuardianAltarProgressService progress = null,
+            Func<GuardianAltarMenuDefinition> definition = null)
         {
             _service = service ?? throw new ArgumentNullException(nameof(service));
             _sessions = sessions ?? throw new ArgumentNullException(nameof(sessions));
@@ -48,6 +50,7 @@ namespace DfoServer.Network.Handlers
             _clock = clock;
             _utcNow = utcNow ?? (() => DateTimeOffset.UtcNow);
             _progress = progress;
+            _definition = definition;
             _sendBatch = sendBatch ?? ((session, prepare) =>
                 session.SendPreparedPacketBatchAsync(prepare));
             _sessions.SessionEnding += OnSessionEndingAsync;
@@ -109,6 +112,14 @@ namespace DfoServer.Network.Handlers
                     session, header, body, hasActiveTrade, mercenaryRestrictions);
         }
 
+        internal void ConfigureDungeonEntry(DungeonHandler dungeon,
+            Func<EnhancedClientSession, bool> hasTrade, IMercenaryRestrictionService mercenaries)
+        {
+            if (_progress != null && _definition != null)
+                dungeon.ConfigureGuardianAltarEntry(_service, _progress, _definition,
+                    _transitions, hasTrade, mercenaries);
+        }
+
         private async Task HandleStartGameAsync(
             EnhancedClientSession session,
             GamePacketHeader header,
@@ -166,7 +177,7 @@ namespace DfoServer.Network.Handlers
                         }
                     }
                     catch (Exception ex) when (ex is SqliteException or InvalidOperationException
-                        or IOException or OverflowException)
+                        or InvalidDataException or IOException or OverflowException)
                     {
                         menuFailure = GuardianAltarEntryRejection.StateReadFailed;
                         FileLogger.Log($"[GuardianAltarEntry] menu load failed cid={characterId}: {ex}");

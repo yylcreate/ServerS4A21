@@ -807,13 +807,15 @@ namespace DfoServer.Infrastructure
                 new EventTotalAttendanceHandler(
                     inventory.TotalAttendance);
 
+            var guardianDefinition = new Lazy<GuardianAltarMenuDefinition>(GuardianAltarMenuDefinition.Load);
+            var guardianProgress = new GuardianAltarProgressService(core.Database,
+                core.DailyResetService, () => guardianDefinition.Value);
             var guardianAltarOpening = new GuardianAltarOpeningCoordinator(
                 core.EventManager.GuardianAltarOpening,
                 world.Sessions,
                 world.CharacterTransitions,
                 ClockService.Instance,
-                progress: new GuardianAltarProgressService(core.Database,
-                    core.DailyResetService, GuardianAltarMenuDefinition.Load));
+                progress: guardianProgress, definition: () => guardianDefinition.Value);
 
             var handlers = new GameProtocolFeatureHandlers(
                 lotteryItem,

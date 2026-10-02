@@ -423,13 +423,14 @@ namespace DfoServer.SelfTests
                         : fixture.Packets.Count == 1 && (item.Result == 0
                             ? IsCommonFailure(fixture.Packets[0]) : IsDomainReply(fixture.Packets[0], item.Result))));
             }
-            foreach (var mode in new[] { "load throws", "wrong character", "window revision", "day rollover" })
+            foreach (var mode in new[] { "load throws", "invalid PVF data", "wrong character", "window revision", "day rollover" })
             {
                 var loader = new ProgressStub(definition);
                 using var fixture = new RequestFixture(loader);
                 var session = fixture.CreateSession(71000022);
                 fixture.Service.SetWindow(fixture.Now, fixture.Now.AddDays(1));
                 if (mode == "load throws") loader.Error = new SqliteException("test Guardian owner failure", 5);
+                if (mode == "invalid PVF data") loader.Error = new InvalidDataException("test Guardian PVF definition failure");
                 if (mode == "wrong character") loader.WrongCharacter = true;
                 if (mode == "window revision") fixture.BeforePrepare = () => fixture.Service.SetWindow(fixture.Now, fixture.Now.AddDays(2));
                 if (mode == "day rollover") fixture.BeforePrepare = () => fixture.Now = fixture.Now.AddHours(12);

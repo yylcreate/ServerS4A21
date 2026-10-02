@@ -224,6 +224,8 @@ namespace DfoServer.Network
             _eventTotalAttendanceHandler = featureHandlers.EventTotalAttendance;
             _npcFavorHandler = featureHandlers.NpcFavor;
             _guardianAltarOpening = featureHandlers.GuardianAltarOpening;
+            _guardianAltarOpening?.ConfigureDungeonEntry(_dungeonHandler,
+                _socialHandlers.Trade.HasActiveTrade, _worldDependencies.MercenaryRestrictions);
             _pvpChannelInfoHandler = socialHandlers.PvpChannelInfo;
             _pvpRoomHandler = socialHandlers.PvpRoom;
             _characterSessionLifecycle = characterSessionLifecycle;
@@ -714,7 +716,7 @@ namespace DfoServer.Network
         private void RegisterDungeonHandlers(GameCommandRegistry.GameCommandRegistrationGroup d)
         {
             d[0x000F] = _dungeonHandler.Handle_ENUM_CMDPACKET_ENTER_SELECT_DUNGEON;
-            d[0x0010] = _dungeonHandler.Handle_ENUM_CMDPACKET_SELECT_DUNGEON;
+            d[(ushort)CmdPacketTypeA21.SELECT_DUNGEON] = _dungeonHandler.Handle_ENUM_CMDPACKET_SELECT_DUNGEON;
             d[(ushort)CmdPacketTypeA21.CRACK_OF_DIMENSION] =
                 _dungeonHandler.Handle_ENUM_CMDPACKET_CRACK_OF_DIMENSION;
             d[(ushort)CmdPacketTypeA21.REQUEST_CIRCLE_ENTER] =

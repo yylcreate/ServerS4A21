@@ -15,13 +15,19 @@ namespace DfoServer.Game.Events.GuardianAltar
         private readonly HashSet<int> _knownDungeonIds;
         private readonly HashSet<(int Type, int Id, short Level, short Price)> _knownPurchases;
         private readonly HashSet<int> _knownAchievementIds;
+        private readonly IReadOnlyList<GuardianAltarShopEntry> _shopEntries;
+        private readonly Func<int, GuardianAltarDungeonFile> _dungeonLoader;
+        private readonly Func<int, MapFile> _mapLoader;
 
         internal GuardianAltarMenuDefinition(int dailyRefillTicket, int ridableId,
             int firstDungeonId, IEnumerable<GuardianAltarPurchase> initialPurchases,
             IEnumerable<GuardianAltarSlot> initialSlots,
             IEnumerable<int> knownDungeonIds = null,
             IEnumerable<GuardianAltarPurchase> knownPurchases = null,
-            IEnumerable<int> knownAchievementIds = null)
+            IEnumerable<int> knownAchievementIds = null,
+            IEnumerable<GuardianAltarShopEntry> shopEntries = null,
+            Func<int, GuardianAltarDungeonFile> dungeonLoader = null,
+            Func<int, MapFile> mapLoader = null)
         {
             if (dailyRefillTicket < 0 || ridableId <= 0 || firstDungeonId <= 0)
                 throw new ArgumentOutOfRangeException(nameof(dailyRefillTicket));
@@ -34,6 +40,9 @@ namespace DfoServer.Game.Events.GuardianAltar
             _knownPurchases = new HashSet<(int, int, short, short)>(
                 (knownPurchases ?? InitialPurchases).Select(x => (x.ShopType, x.ResourceId, x.Level, x.Price)));
             _knownAchievementIds = new HashSet<int>(knownAchievementIds ?? Array.Empty<int>());
+            _shopEntries = Array.AsReadOnly((shopEntries ?? Array.Empty<GuardianAltarShopEntry>()).ToArray());
+            _dungeonLoader = dungeonLoader;
+            _mapLoader = mapLoader;
             ValidateProgress(new GuardianAltarProgressSnapshot(1,
                 new GuardianAltarHeader(ridableId, dailyRefillTicket, 0, 0, 0, 0, 0, 0, 0, 0),
                 new[] { new GuardianAltarStage(firstDungeonId, -1) },
@@ -45,6 +54,69 @@ namespace DfoServer.Game.Events.GuardianAltar
         internal int FirstDungeonId { get; }
         internal IReadOnlyList<GuardianAltarPurchase> InitialPurchases { get; }
         internal IReadOnlyList<GuardianAltarSlot> InitialSlots { get; }
+
+        internal bool ContainsDungeon(int dungeonId) => _knownDungeonIds.Contains(dungeonId);
+
+        internal GuardianAltarDungeonStartPlan CreateStartPlan(int dungeonId, byte difficulty,
+            GuardianAltarProgressSnapshot progress)
+        {
+            ValidateProgress(progress);
+            if (!ContainsDungeon(dungeonId) || difficulty > 2
+                || !progress.Stages.Any(x => x.DungeonId == dungeonId))
+                throw new InvalidOperationException("Guardian stage is not unlocked or difficulty is invalid.");
+            if ((long)progress.Header.FreeTickets + progress.Header.SecondaryTickets <= 0)
+                throw new InvalidOperationException("Guardian stage requires an available ticket.");
+            if (_dungeonLoader == null || _mapLoader == null)
+                throw new InvalidOperationException("Guardian combat resource definitions are unavailable.");
+            var dungeon = _dungeonLoader(dungeonId);
+            if (dungeon == null || !dungeon.IsValid)
+                throw new InvalidDataException(dungeon?.InvalidReason ?? "Guardian DGN is missing.");
+            if (dungeon.IsSurvival)
+                throw new InvalidOperationException("Guardian survival combat is not enabled by the start/loading batch.");
+            var difficultyName = new[] { "easy", "medium", "hard" }[difficulty];
+            var selected = dungeon.Maps.Single(x => x.DifficultyName == difficultyName);
+            var map = _mapLoader(selected.MapId)
+                ?? throw new InvalidDataException("Guardian MAP is missing.");
+            var guardianMap = GuardianAltarMapFile.Parse(map);
+            if (!guardianMap.IsValid || map.MonsterCount != map.Monsters.Count
+                || map.MonsterConditionMonsters.Count != 0 || map.ConditionalSummonMonsters.Count != 0)
+                throw new InvalidDataException("Guardian MAP is invalid or has unsupported conditional centers: "
+                    + guardianMap.InvalidReason);
+            var summaries = new List<GuardianAltarPhaseSummary>();
+            var startsAt = 0;
+            foreach (var phase in guardianMap.Phases)
+            {
+                var phaseType = phase.Type switch { "normal" => 0, "named" => 1, "boss" => 2,
+                    _ => throw new InvalidDataException("Unknown Guardian phase type.") };
+                summaries.Add(new GuardianAltarPhaseSummary(summaries.Count, startsAt, phaseType));
+                startsAt = checked(startsAt + phase.DurationMilliseconds);
+            }
+            var centers = new List<GuardianAltarCenterSpawn>();
+            var learnedCenters = new HashSet<int>();
+            foreach (var monster in map.Monsters)
+            {
+                if (!monster.MonsterId.HasValue || monster.NpcId.HasValue)
+                    throw new InvalidDataException("Guardian center MAP contains an unsupported NPC record.");
+                var purchased = progress.Purchases.SingleOrDefault(x => x.ShopType == 2
+                    && x.ResourceId == monster.MonsterId.Value);
+                if (purchased == null || purchased.Level == 0)
+                    continue;
+                var shop = _shopEntries.SingleOrDefault(x => x.ShopType == 2
+                    && x.ResourceId == purchased.ResourceId)
+                    ?? throw new InvalidDataException("Guardian learned tower is not in the current shop.");
+                var rows = shop.Levels.Where(x => x.Level == purchased.Level && x.Price == purchased.Price).ToArray();
+                if (rows.Length != 1 || rows[0].Index <= 0 || rows[0].Index > ushort.MaxValue
+                    || purchased.Level > byte.MaxValue || (int)monster.Type > 3)
+                    throw new InvalidDataException("Guardian center upgrade cannot be represented by the current protocol.");
+                centers.Add(new GuardianAltarCenterSpawn((ushort)rows[0].Index,
+                    (byte)purchased.Level, (byte)monster.Type));
+                learnedCenters.Add(purchased.ResourceId);
+            }
+            if (guardianMap.CenterIndices.Any(x => !learnedCenters.Contains(x)))
+                throw new InvalidDataException("Guardian MAP has no learned entry for a required center.");
+            return new GuardianAltarDungeonStartPlan(dungeonId, difficulty, selected.MapId,
+                selected.MapBasisLevel, guardianMap.TotalDurationMilliseconds, summaries, centers, progress);
+        }
 
         internal void ValidateProgress(GuardianAltarProgressSnapshot snapshot)
         {
@@ -71,12 +143,23 @@ namespace DfoServer.Game.Events.GuardianAltar
             return Create(config, stages, id =>
                 DungeonCatalog.LoadDungeonList().GetById(id) != null
                 && !string.IsNullOrWhiteSpace(DungeonCatalog.GetDungeonFile(id)?.AdvanceAltarType),
-                achievementIds);
+                achievementIds,
+                id => GuardianAltarDungeonFile.Parse(DungeonCatalog.GetDungeonFile(id)),
+                LoadRegisteredMap);
+        }
+
+        internal static MapFile LoadRegisteredMap(int mapId)
+        {
+            if (DungeonMapCatalog.LoadMapList().GetById(mapId) == null)
+                throw new InvalidDataException("Guardian MAP is absent from the current registered MAP list.");
+            return DungeonMapCatalog.GetMapFile(mapId);
         }
 
         internal static GuardianAltarMenuDefinition Create(GuardianAltarConfigFile config,
             GuardianAltarStageMapFile stageMap, Func<int, bool> isRegisteredGuardianDungeon,
-            IEnumerable<int> knownAchievementIds = null)
+            IEnumerable<int> knownAchievementIds = null,
+            Func<int, GuardianAltarDungeonFile> dungeonLoader = null,
+            Func<int, MapFile> mapLoader = null)
         {
             ArgumentNullException.ThrowIfNull(config);
             ArgumentNullException.ThrowIfNull(stageMap);
@@ -123,7 +206,8 @@ namespace DfoServer.Game.Events.GuardianAltar
             return new GuardianAltarMenuDefinition(config.DailyRefillTicket, ridable.RidableId,
                 first.DungeonId, purchases, slots, knownDungeons,
                 ridable.Entries.SelectMany(x => x.Levels.Select(level =>
-                    new GuardianAltarPurchase(x.ShopType, x.ResourceId, level.Level, level.Price))), knownAchievementIds);
+                    new GuardianAltarPurchase(x.ShopType, x.ResourceId, level.Level, level.Price))),
+                knownAchievementIds, ridable.Entries, dungeonLoader, mapLoader);
         }
     }
 }

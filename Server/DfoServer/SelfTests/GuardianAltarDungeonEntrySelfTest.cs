@@ -1,0 +1,794 @@
+using System;
+using System.Buffers.Binary;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Net.Sockets;
+using System.Runtime.CompilerServices;
+using System.Threading;
+using System.Threading.Tasks;
+using DfoServer.Game.Accounts;
+using DfoServer.Game.Dungeon;
+using DfoServer.Game.Events.GuardianAltar;
+using DfoServer.Game.Mercenary;
+using DfoServer.Game.Quests;
+using DfoServer.Game.Session;
+using DfoServer.Network;
+using DfoServer.Network.Builders;
+using DfoServer.Network.Handlers.Dungeon;
+using DfoServer.Network.Parsers.Events;
+
+namespace DfoServer.SelfTests
+{
+    internal static class GuardianAltarDungeonEntrySelfTest
+    {
+        internal static int Run()
+        {
+            Console.WriteLine("=== GUARDIAN_ALTAR_DUNGEON_ENTRY selftest ===");
+            var assertions = 0;
+            var failures = 0;
+            void Check(string label, bool success)
+            {
+                assertions++;
+                Console.WriteLine($"[{(success ? "PASS" : "FAIL")}] {label}");
+                if (!success) failures++;
+            }
+            void Section(string name, Action action)
+            {
+                try { action(); }
+                catch (Exception exception) { Check(name + " exception: " + exception, false); }
+            }
+
+            Section("strict Guardian selector", () => CheckParser(Check));
+            Section("prepared batch per-packet fence", () => CheckPreparedBatchAsync(Check).GetAwaiter().GetResult());
+            GuardianAltarMenuDefinition definition = null;
+            Section("real PVF start plans", () =>
+            {
+                definition = GuardianAltarMenuDefinition.Load();
+                CheckPlans(Check, definition);
+            });
+            if (definition != null)
+            {
+                Section("authorized town lifecycle", () => CheckLifecycle(Check, definition));
+                Section("Guardian shared lock ordering", () => CheckLockOrderAsync(Check, definition).GetAwaiter().GetResult());
+                Section("Guardian entry and rejection", () => CheckEntryAsync(Check, definition).GetAwaiter().GetResult());
+                Section("Guardian source fencing", () => CheckFencesAsync(Check, definition).GetAwaiter().GetResult());
+                Section("Guardian failure cleanup", () => CheckFailuresAsync(Check, definition).GetAwaiter().GetResult());
+            }
+            Console.WriteLine($"GUARDIAN_ALTAR_DUNGEON_ENTRY assertions={assertions} failures={failures}");
+            return failures;
+        }
+
+        private static void CheckParser(Action<string, bool> check)
+        {
+            var good = Request(3511);
+            check("observed 15B selector preserves stage and difficulty without hell semantics",
+                GuardianAltarSelectDungeonRequestParser.TryParse(good, out var command)
+                && command.DungeonId == 3511 && command.Difficulty == 0);
+            foreach (var difficulty in new byte[] { 0, 1, 2 })
+                check($"ordinary Guardian difficulty {difficulty} is representable",
+                    GuardianAltarSelectDungeonRequestParser.TryParse(Request(3511, difficulty), out var parsed)
+                    && parsed.Difficulty == difficulty);
+            check("null selector is rejected", !GuardianAltarSelectDungeonRequestParser.TryParse(null, out _));
+            foreach (var length in new[] { 0, 3, 4, 9, 14, 16, 1024 })
+                check($"unproven {length}B selector is rejected",
+                    !GuardianAltarSelectDungeonRequestParser.TryParse(new byte[length], out _));
+            foreach (var id in new uint[] { 0, (uint)short.MaxValue + 1U, uint.MaxValue })
+            {
+                var body = good.ToArray();
+                BinaryPrimitives.WriteUInt32LittleEndian(body, id);
+                check($"invalid Guardian stage id {id} is rejected",
+                    !GuardianAltarSelectDungeonRequestParser.TryParse(body, out _));
+            }
+            foreach (var change in new (int Offset, byte Value)[]
+            {
+                (4, 3), (5, 0), (5, 1), (6, 1), (7, 0), (8, 0),
+                (9, 1), (10, 1), (11, 1), (12, 1), (13, 1), (14, 1)
+            })
+            {
+                var body = good.ToArray();
+                body[change.Offset] = change.Value;
+                check($"selector rejects unproven byte {change.Offset}={change.Value}",
+                    !GuardianAltarSelectDungeonRequestParser.TryParse(body, out _));
+            }
+        }
+
+        private static void CheckPlans(Action<string, bool> check, GuardianAltarMenuDefinition definition)
+        {
+            // These assertions bind the test to the current real resource,
+            // rather than silently replacing a missing PVF with fake maps.
+            check("current PVF first registered Guardian stage is 3511", definition.FirstDungeonId == 3511);
+            foreach (var unknownMapId in new[] { 0, int.MaxValue })
+                check($"unregistered MAP {unknownMapId} raises the typed resource failure before a raw map loader",
+                    Throws<InvalidDataException>(() => GuardianAltarMenuDefinition.LoadRegisteredMap(unknownMapId)));
+            var progress = Fresh(definition, 1);
+            var expectedMaps = new[] { 25081, 25082, 25083 };
+            for (byte difficulty = 0; difficulty < 3; difficulty++)
+            {
+                var plan = definition.CreateStartPlan(definition.FirstDungeonId, difficulty, progress);
+                check($"real difficulty {difficulty} selects its own Guardian MAP",
+                    plan.DungeonId == definition.FirstDungeonId && plan.Difficulty == difficulty
+                    && plan.MapId == expectedMaps[difficulty] && ReferenceEquals(plan.Progress, progress));
+            }
+            var fresh = definition.CreateStartPlan(definition.FirstDungeonId, 0, progress);
+            var stage = GuardianAltarDungeonPacketBuilder.BuildStageInfo(fresh);
+            var map = GuardianAltarDungeonPacketBuilder.BuildStartMap(fresh);
+            check("dedicated stage body has exactly two Int32 fields, not ordinary DUNGEON_INFO",
+                stage.Length == 8 && I32(stage, 0) == fresh.DungeonId && I32(stage, 4) == fresh.Difficulty);
+            check("fresh start body is 65B: 20B header, two 12B phases and one 13B center",
+                fresh.Phases.Count == 2 && fresh.Centers.Count == 1 && map.Length == 65
+                && I32(map, 0) == 0 && I32(map, 4) == 0 && I32(map, 8) == fresh.MapId
+                && I32(map, 12) == fresh.DurationMilliseconds && I32(map, 16) == fresh.MapBasisLevel
+                && U32(map, 20) == 2 && U32(map, 48) == 1);
+            for (var index = 0; index < fresh.Phases.Count; index++)
+            {
+                var offset = 24 + index * 12;
+                var phase = fresh.Phases[index];
+                check($"phase {index} preserves typed index/start/type widths and ordering",
+                    I32(map, offset) == phase.PhaseIndex && I32(map, offset + 4) == phase.StartsAtMilliseconds
+                    && I32(map, offset + 8) == phase.PhaseType);
+            }
+            var center = fresh.Centers.Single();
+            check("center fields preserve ushort code and zero native source extensions",
+                I32(map, 52) == 0 && U16(map, 56) == 0 && U16(map, 58) == center.MonsterCode
+                && map[60] == center.Level && map[61] == center.MonsterType
+                && map.AsSpan(62, 3).SequenceEqual(new byte[3]));
+
+            // Serialization fixture only: current real fresh PVF has one center.
+            // Copy its valid plan/center and vary the second row deliberately;
+            // this does not claim that these two rows are a registered MAP.
+            var syntheticCenters = new[]
+            {
+                center,
+                center with
+                {
+                    MonsterCode = center.MonsterCode == ushort.MaxValue
+                        ? (ushort)1 : (ushort)(center.MonsterCode + 1),
+                    Level = center.Level == byte.MaxValue ? (byte)1 : (byte)(center.Level + 1),
+                    MonsterType = center.MonsterType == 0 ? (byte)1 : (byte)0
+                }
+            };
+            var twoCenterPlan = new GuardianAltarDungeonStartPlan(fresh.DungeonId, fresh.Difficulty,
+                fresh.MapId, fresh.MapBasisLevel, fresh.DurationMilliseconds,
+                fresh.Phases, syntheticCenters, fresh.Progress);
+            var twoCenterBody = GuardianAltarDungeonPacketBuilder.BuildStartMap(twoCenterPlan);
+            check("synthetic two-center serialization adds exactly one 13B row, with count two and 78B total",
+                twoCenterBody.Length == map.Length + 13 && twoCenterBody.Length == 78 && U32(twoCenterBody, 48) == 2);
+            for (var index = 0; index < syntheticCenters.Length; index++)
+            {
+                var rowOffset = 52 + index * 13;
+                var expected = syntheticCenters[index];
+                check($"synthetic center {index} preserves sequential ushort id, code, level and type",
+                    I32(twoCenterBody, rowOffset) == 0 && U16(twoCenterBody, rowOffset + 4) == index
+                    && U16(twoCenterBody, rowOffset + 6) == expected.MonsterCode
+                    && twoCenterBody[rowOffset + 8] == expected.Level
+                    && twoCenterBody[rowOffset + 9] == expected.MonsterType
+                    && twoCenterBody.AsSpan(rowOffset + 10, 3).SequenceEqual(new byte[3]));
+            }
+            check("an unregistered or still-locked stage cannot create a start plan",
+                Throws<InvalidOperationException>(() => definition.CreateStartPlan(1, 0, progress))
+                && Throws<InvalidOperationException>(() => definition.CreateStartPlan(3512, 0, progress)));
+            check("zero remaining tickets denies start without consuming or fabricating a ticket",
+                Throws<InvalidOperationException>(() => definition.CreateStartPlan(3511, 0,
+                    Copy(progress, header: progress.Header with { FreeTickets = 0, SecondaryTickets = 0 })))
+                && progress.Header.FreeTickets == definition.DailyRefillTicket);
+            check("survival cannot accidentally enter the ordinary three-difficulty start path",
+                definition.ContainsDungeon(3523)
+                && Throws<InvalidOperationException>(() => definition.CreateStartPlan(3523, 0,
+                    Copy(progress, stages: new[] { new GuardianAltarStage(3511, -1), new GuardianAltarStage(3523, -1) }))));
+            check("unknown Guardian difficulty fails closed",
+                Throws<InvalidOperationException>(() => definition.CreateStartPlan(3511, 3, progress)));
+
+            var maximumPhases = new GuardianAltarDungeonStartPlan(fresh.DungeonId, fresh.Difficulty,
+                fresh.MapId, fresh.MapBasisLevel, 256,
+                Enumerable.Range(0, 256).Select(i => new GuardianAltarPhaseSummary(i, i, 0)),
+                fresh.Centers, fresh.Progress);
+            var maximumBody = GuardianAltarDungeonPacketBuilder.BuildStartMap(maximumPhases);
+            check("256 phases remain representable by the A21 low-byte phase-index consumer",
+                maximumPhases.Phases.Count == 256 && U32(maximumBody, 20) == 256
+                && maximumBody.Length == 20 + 4 + 256 * 12 + 4 + 13 * fresh.Centers.Count
+                && I32(maximumBody, 24 + 255 * 12) == 255);
+            check("257 phases are rejected instead of wrapping phase index 256 to client index zero",
+                Throws<InvalidOperationException>(() => new GuardianAltarDungeonStartPlan(
+                    fresh.DungeonId, fresh.Difficulty, fresh.MapId, fresh.MapBasisLevel, 257,
+                    Enumerable.Range(0, 257).Select(i => new GuardianAltarPhaseSummary(i, i, 0)),
+                    fresh.Centers, fresh.Progress)));
+        }
+
+        private static async Task CheckLockOrderAsync(Action<string, bool> check,
+            GuardianAltarMenuDefinition definition)
+        {
+            using var fixture = new Fixture(definition);
+            fixture.Open();
+            var session = fixture.CreateSession(1);
+            var runGate = session.Player.DungeonRunTransitionGate;
+            using var leaseTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+            IDisposable characterLease = null;
+            Task<bool> entry = null;
+            var runGateHeld = false;
+            var characterAcquired = false;
+            try
+            {
+                await runGate.WaitAsync();
+                runGateHeld = true;
+                // Start synchronously until its first unavailable gate. If
+                // Guardian takes the character gate before the run gate, this
+                // controlled Party-shaped owner would deadlock without timeout.
+                entry = fixture.DispatchAsync(session, Request(definition.FirstDungeonId));
+                try
+                {
+                    characterLease = await fixture.Transitions.AcquireAsync(
+                        session.Player.CharacterId, leaseTimeout.Token);
+                    characterAcquired = characterLease != null && fixture.Transitions.IsCurrent(session);
+                }
+                catch (OperationCanceledException) when (leaseTimeout.IsCancellationRequested)
+                {
+                    // Expected failure on the inverted implementation: release
+                    // the controlled owner below so the request can still drain.
+                }
+            }
+            finally
+            {
+                characterLease?.Dispose();
+                leaseTimeout.Cancel();
+                if (runGateHeld) runGate.Release();
+            }
+            check("a Party-shaped run-gate holder can acquire the shared character lease while Guardian waits",
+                characterAcquired);
+            Exception completionError = null;
+            if (entry != null)
+            {
+                try { await entry.WaitAsync(TimeSpan.FromSeconds(3)); }
+                catch (Exception exception) { completionError = exception; }
+            }
+            check("lock-order regression drains the Guardian request after releasing controlled gates, including timeout failure",
+                entry != null && entry.IsCompleted && completionError == null
+                && session.Player.CurrentRun?.RunState == DungeonRunState.Active
+                && HasStartMap(fixture.Packets) && runGate.CurrentCount == 1);
+        }
+
+        private static void CheckLifecycle(Action<string, bool> check, GuardianAltarMenuDefinition definition)
+        {
+            using var fixture = new Fixture(definition);
+            var session = fixture.CreateSession(1);
+            var anchor = Anchor(session);
+            var generation = session.Player.CurrentDungeonRunGeneration;
+            var policy = DungeonRewardPolicy.GuardianAltar;
+            check("Guardian start policy disables every ordinary reward, quest and settlement path",
+                policy.Kind == DungeonRewardPolicyKind.GuardianAltar
+                && !policy.AllowsMonsterExperience && !policy.AllowsMonsterDrops && !policy.AllowsQuestDrops
+                && !policy.AllowsQuestProgress && !policy.AllowsPetExperience
+                && !policy.AllowsClearCommit && !policy.AllowsSettlement);
+            DungeonInstance Instance() => new DungeonInstance((short)definition.FirstDungeonId, 0, policy);
+            check("false source fence cannot create or advance a participant run",
+                !DungeonRunLifecycle.BeginRunFromAuthorizedTown(session, Instance(), anchor, generation, () => false, out _)
+                && session.Player.CurrentRun == null && session.Player.CurrentDungeonRunGeneration == generation);
+            check("stale generation cannot create a participant run",
+                !DungeonRunLifecycle.BeginRunFromAuthorizedTown(session, Instance(), anchor, generation + 1, () => true, out _));
+            var ending = Instance();
+            ending.TryBeginEnding();
+            check("ending physical instance cannot accept an authorized town start",
+                !DungeonRunLifecycle.BeginRunFromAuthorizedTown(session, ending, anchor, generation, () => true, out _));
+            var existingRun = new DungeonRun((short)definition.FirstDungeonId, 0);
+            session.Player.CurrentRun = existingRun;
+            check("authorized town start cannot replace an existing run",
+                !DungeonRunLifecycle.BeginRunFromAuthorizedTown(session, Instance(), anchor, generation, () => true, out _)
+                && ReferenceEquals(session.Player.CurrentRun, existingRun));
+            session.Player.CurrentRun = null;
+            var selection = session.Player.BeginDungeonSelection(anchor, false);
+            check("authorized town start cannot steal an ordinary selection",
+                !DungeonRunLifecycle.BeginRunFromAuthorizedTown(session, Instance(), anchor, generation, () => true, out _)
+                && ReferenceEquals(session.Player.CurrentDungeonSelection, selection));
+            session.Player.TryInvalidateDungeonSelection(selection);
+            var accepted = DungeonRunLifecycle.BeginRunFromAuthorizedTown(session, Instance(), anchor, generation, () => true, out var run);
+            check("authorized start creates exactly one Selecting run with a new generation and real return anchor",
+                accepted && ReferenceEquals(session.Player.CurrentRun, run)
+                && run.RunState == DungeonRunState.Selecting && run.RunGeneration == generation + 1
+                && session.Player.CurrentDungeonSelection == null && run.TownReturnAnchor.Equals(anchor)
+                && ReferenceEquals(run.QuestSnapshot, QuestRunSnapshot.Empty)
+                && run.CaptureExperienceBonusSnapshot().Equals(DungeonParticipantExperienceBonusSnapshot.None));
+            check("lifecycle helper does not prematurely activate, leave town or project packets",
+                session.Player.UserState == 0 && session.Player.TownPresenceReady && fixture.Packets.Count == 0);
+            fixture.EndMemoryRun(session, run.CaptureIdentity());
+        }
+
+        private static async Task CheckEntryAsync(Action<string, bool> check, GuardianAltarMenuDefinition definition)
+        {
+            using (var fixture = new Fixture(definition))
+            {
+                fixture.Open();
+                var session = fixture.CreateSession(1);
+                var before = Fresh(definition, 1);
+                var handled = await fixture.DispatchAsync(session, Request(definition.FirstDungeonId));
+                var run = session.Player.CurrentRun;
+                check("resource-classified selector creates the single authoritative active Guardian run",
+                    handled && run?.RunState == DungeonRunState.Active
+                    && run.Instance.Mechanisms.GuardianAltar?.DungeonId == definition.FirstDungeonId
+                    && run.RewardPolicy.Kind == DungeonRewardPolicyKind.GuardianAltar
+                    && run.QuestSnapshot == QuestRunSnapshot.Empty && session.Player.CurrentDungeonSelection == null);
+                check("full entry projection is USER_STATE then dedicated STAGE_INFO then dedicated START_MAP",
+                    fixture.Packets.Select(Type).SequenceEqual(new[] {
+                        (ushort)NotiPacketTypeA21.USER_STATE, (ushort)NotiPacketTypeA21.ADVANCE_ALTAR_STAGE_INFO,
+                        (ushort)NotiPacketTypeA21.ADVANCE_ALTAR_START_MAP })
+                    && fixture.Packets.All(x => x[0] == 0 && x.Length == I32(x, 3))
+                    && fixture.Packets[1].Length == 15 + 8 && fixture.Packets[2].Length == 15 + 65);
+                check("start freezes typed menu facts without spending tickets or executing waves",
+                    fixture.Progress.Reads == 1 && !fixture.Progress.ReadInPrepare
+                    && SameProgress(run.Instance.Mechanisms.GuardianAltar.Progress, before)
+                    && run.Instance.Mechanisms.GuardianAltar.Progress.Header.FreeTickets == definition.DailyRefillTicket);
+                check("entry registers a real shared loading room and one participant before projection",
+                    fixture.LoadingRegistrations == 1 && fixture.LoadingGeneration > 0
+                    && fixture.Instances.CaptureInstanceParticipantRoster(run.Instance.Identity).Count == 1
+                    && run.CaptureParticipantRoomIdentity().IsValid
+                    && session.Player.UserState == 1 && session.Player.TownPresenceReady
+                    && !SessionDirectory.IsTownPresence(session.Player));
+                var originalId = run.RunId;
+                var originalGeneration = run.RunGeneration;
+                var packetCount = fixture.Packets.Count;
+                await fixture.DispatchAsync(session, Request(definition.FirstDungeonId));
+                check("duplicate starts do not reset loading, allocate another run or resend the stage/map clock",
+                    ReferenceEquals(session.Player.CurrentRun, run) && run.RunId == originalId
+                    && run.RunGeneration == originalGeneration && fixture.Packets.Count == packetCount
+                    && fixture.Progress.Reads == 1 && fixture.LoadingRegistrations == 1);
+                var ready = fixture.LastRoom.MarkLoadingReady(run.CaptureIdentity(), new[] { run.CaptureIdentity() });
+                var duplicateReady = fixture.LastRoom.MarkLoadingReady(run.CaptureIdentity(), new[] { run.CaptureIdentity() });
+                check("dedicated room reuses common loading barrier and consumes ready only once",
+                    ready.Accepted && ready.Released && !duplicateReady.Accepted);
+                fixture.EndMemoryRun(session, run.CaptureIdentity());
+            }
+
+            foreach (var item in new (string Name, Action<Fixture, EnhancedClientSession> Change)[]
+            {
+                ("closed", (f, s) => f.Opening.Close()),
+                ("non-town state", (f, s) => s.Player.UserState = 1),
+                ("town presence not ready", (f, s) => s.Player.TownPresenceReady = false),
+                ("ordinary selection pending", (f, s) => s.Player.DungeonSelectionPending = true),
+                ("ordinary selection exists", (f, s) => s.Player.BeginDungeonSelection(Anchor(s), false)),
+                ("party", (f, s) => f.InParty = true), ("trade", (f, s) => f.Trading = true),
+                ("mercenary assigned", (f, s) => f.Mercenary.Assigned = true),
+                ("level 49", (f, s) => s.Player.Level = 49)
+            })
+            {
+                using var fixture = new Fixture(definition);
+                fixture.Open();
+                var session = fixture.CreateSession(1);
+                item.Change(fixture, session);
+                check(item.Name + " is consumed by Guardian with a proven failure ACK and no new run",
+                    await fixture.DispatchAsync(session, Request(definition.FirstDungeonId))
+                    && IsRejection(fixture.Packets) && session.Player.CurrentRun == null
+                    && fixture.Progress.Reads == 0 && fixture.LoadingRegistrations == 0);
+            }
+            using (var fixture = new Fixture(definition))
+            {
+                fixture.Open();
+                var session = fixture.CreateSession(1);
+                var malformed = Request(definition.FirstDungeonId);
+                malformed[5] = 1;
+                check("malformed Guardian selector cannot fall through into ordinary hell selection",
+                    await fixture.DispatchAsync(session, malformed) && IsRejection(fixture.Packets)
+                    && fixture.Progress.Reads == 0 && session.Player.CurrentRun == null);
+            }
+            using (var fixture = new Fixture(definition))
+            {
+                fixture.Open();
+                var session = fixture.CreateSession(1);
+                check("ordinary/unregistered resources remain with the unchanged ordinary handler",
+                    !await fixture.DispatchAsync(session, Request(17)) && fixture.Packets.Count == 0
+                    && fixture.Progress.Reads == 0 && session.Player.CurrentRun == null);
+                check("wrong command class or packet type cannot create Guardian state",
+                    !await fixture.DispatchAsync(session, Request(3511), cmd: 0)
+                    && !await fixture.DispatchAsync(session, Request(3511), type: (ushort)CmdPacketTypeA21.ADVANCE_ALTAR_START_GAME)
+                    && fixture.Packets.Count == 0 && session.Player.CurrentRun == null);
+            }
+        }
+
+        private static async Task CheckFencesAsync(Action<string, bool> check, GuardianAltarMenuDefinition definition)
+        {
+            foreach (var phase in new[] { "load", "prepare" })
+            foreach (var change in new[] { "GameSession", "session directory", "account", "day", "window", "level", "party", "trade" })
+            {
+                using var fixture = new Fixture(definition);
+                fixture.Open();
+                var session = fixture.CreateSession(1);
+                Action mutation = () =>
+                {
+                    // A real displaced session is torn down by the lifecycle
+                    // owner. Simulate that concurrent memory transition before
+                    // changing its identity; do not let this no-DB fixture invoke
+                    // production experience persistence on an uninitialized token.
+                    if (phase == "prepare" && (change is "GameSession" or "session directory" or "account")
+                        && session.Player.CurrentRun is { } oldRun)
+                        fixture.EndMemoryRun(session, oldRun.CaptureIdentity());
+                    switch (change)
+                    {
+                        case "GameSession": session.GameSession = GameSessionIdentity(); break;
+                        case "session directory": fixture.CreateSession(1); break;
+                        case "account": session.Account = new AccountRecord { AccountId = 12 }; break;
+                        case "day": fixture.Now = fixture.Now.AddDays(1); break;
+                        case "window": fixture.Opening.Close(); break;
+                        case "level": session.Player.Level = 49; break;
+                        case "party": fixture.InParty = true; break;
+                        case "trade": fixture.Trading = true; break;
+                    }
+                };
+                if (phase == "load") fixture.Progress.DuringLoad = mutation;
+                else fixture.BeforePrepare = mutation;
+                var exception = await ObserveAsync(() => fixture.DispatchAsync(session, Request(definition.FirstDungeonId)));
+                check(change + " changed during " + phase + " cannot project Guardian combat or retain an abandoned run",
+                    exception == null && !HasStartMap(fixture.Packets) && session.Player.CurrentRun == null
+                    && fixture.Instances.CaptureInstanceParticipantRoster(fixture.LastInstanceIdentity).Count == 0);
+                if (change is "GameSession" or "session directory" or "account")
+                    check(change + " changed during " + phase + " cannot send packets to a stale identity",
+                        fixture.Packets.Count == 0);
+            }
+            foreach (var change in new[] { "GameSession", "session directory", "account", "window", "day" })
+            {
+                using var fixture = new Fixture(definition);
+                fixture.Open();
+                var session = fixture.CreateSession(1);
+                fixture.AfterFirstWrite = () =>
+                {
+                    if (change is "GameSession" or "session directory" or "account")
+                        fixture.EndMemoryRun(session, session.Player.CurrentRun.CaptureIdentity());
+                    switch (change)
+                    {
+                        case "GameSession": session.GameSession = GameSessionIdentity(); break;
+                        case "session directory": fixture.CreateSession(1); break;
+                        case "account": session.Account = new AccountRecord { AccountId = 12 }; break;
+                        case "window": fixture.Opening.Close(); break;
+                        case "day": fixture.Now = fixture.Now.AddDays(1); break;
+                    }
+                };
+                var exception = await ObserveAsync(() => fixture.DispatchAsync(session, Request(definition.FirstDungeonId)));
+                check(change + " changed after first write cancels the remaining stage/map frames and cleans the old run",
+                    exception == null && fixture.Packets.Count == 1 && Type(fixture.Packets[0]) == (ushort)NotiPacketTypeA21.USER_STATE
+                    && !HasStartMap(fixture.Packets) && session.Player.CurrentRun == null
+                    && fixture.Instances.CaptureInstanceParticipantRoster(fixture.LastInstanceIdentity).Count == 0);
+            }
+        }
+
+        private static async Task CheckFailuresAsync(Action<string, bool> check, GuardianAltarMenuDefinition definition)
+        {
+            foreach (var error in new Exception[]
+            {
+                new InvalidDataException("invalid Guardian resource"),
+                new InvalidOperationException("inconsistent Guardian progress"),
+                new NotSupportedException("opaque progress dependency failure")
+            })
+            {
+                using var fixture = new Fixture(definition);
+                fixture.Open();
+                var session = fixture.CreateSession(1);
+                fixture.Progress.Error = error;
+                var observed = await ObserveAsync(() => fixture.DispatchAsync(session, Request(definition.FirstDungeonId)));
+                var visibleFailure = error is NotSupportedException
+                    ? observed is NotSupportedException && fixture.Packets.Count == 0
+                    : observed == null && IsRejection(fixture.Packets);
+                check(error.GetType().Name + " while loading progress remains observable without fake success or run state",
+                    visibleFailure && session.Player.CurrentRun == null
+                    && fixture.LoadingRegistrations == 0);
+            }
+            foreach (var invalid in new[] { "wrong character", "locked stage", "zero tickets" })
+            {
+                using var fixture = new Fixture(definition);
+                fixture.Open();
+                var session = fixture.CreateSession(1);
+                if (invalid == "wrong character") fixture.Progress.WrongCharacter = true;
+                else if (invalid == "locked stage") fixture.Progress.Transform = x => Copy(x, stages: new[] { new GuardianAltarStage(3512, -1) });
+                else fixture.Progress.Transform = x => Copy(x, header: x.Header with { FreeTickets = 0, SecondaryTickets = 0 });
+                var observed = await ObserveAsync(() => fixture.DispatchAsync(session, Request(definition.FirstDungeonId)));
+                check(invalid + " refuses start before allocating a participant run",
+                    observed == null && IsRejection(fixture.Packets) && session.Player.CurrentRun == null);
+            }
+            foreach (var error in new Exception[]
+            {
+                new IOException("partial Guardian transport failure"),
+                new NotSupportedException("opaque Guardian send failure")
+            })
+            {
+                using var fixture = new Fixture(definition);
+                fixture.Open();
+                var session = fixture.CreateSession(1);
+                fixture.FailAfterPackets = 1;
+                fixture.SendError = error;
+                var observed = await ObserveAsync(() => fixture.DispatchAsync(session, Request(definition.FirstDungeonId)));
+                check(error.GetType().Name + " after USER_STATE terminates only the failed run through the return owner",
+                    (error is NotSupportedException ? observed is NotSupportedException : observed == null)
+                    && fixture.Packets.Count == 1 && !HasStartMap(fixture.Packets)
+                    && fixture.ReturnAttempts == 1 && fixture.ReturnApplied == 1
+                    && session.Player.CurrentRun == null && fixture.LastRun.RunState == DungeonRunState.Ended
+                    && fixture.Instances.CaptureInstanceParticipantRoster(fixture.LastInstanceIdentity).Count == 0);
+                fixture.FailAfterPackets = -1;
+                await fixture.DispatchAsync(session, Request(definition.FirstDungeonId));
+                check(error.GetType().Name + " cleanup permits a fresh legitimate retry, without ticket mutation",
+                    session.Player.CurrentRun?.RunState == DungeonRunState.Active
+                    && fixture.Progress.Reads == 2
+                    && session.Player.CurrentRun.Instance.Mechanisms.GuardianAltar.Progress.Header.FreeTickets == definition.DailyRefillTicket);
+            }
+            using (var fixture = new Fixture(definition))
+            {
+                fixture.Open();
+                var session = fixture.CreateSession(1);
+                fixture.FailAfterPackets = 1;
+                fixture.SendError = new IOException("late failure");
+                DungeonRun replacement = null;
+                fixture.BeforeReturn = () =>
+                {
+                    var old = session.Player.CurrentRun;
+                    fixture.EndMemoryRun(session, old.CaptureIdentity());
+                    var instance = new DungeonInstance((short)definition.FirstDungeonId, 0, DungeonRewardPolicy.GuardianAltar);
+                    if (!DungeonRunLifecycle.BeginRunFromAuthorizedTown(session, instance, Anchor(session),
+                        session.Player.CurrentDungeonRunGeneration, () => true, out replacement))
+                        throw new InvalidOperationException("replacement test run could not begin");
+                };
+                var observed = await ObserveAsync(() => fixture.DispatchAsync(session, Request(definition.FirstDungeonId)));
+                check("a delayed return callback cannot terminate a newer run with a different identity",
+                    observed == null && replacement != null && ReferenceEquals(session.Player.CurrentRun, replacement)
+                    && replacement.RunState == DungeonRunState.Selecting
+                    && fixture.ReturnAttempts == 1 && fixture.ReturnApplied == 0);
+            }
+        }
+
+        private static async Task CheckPreparedBatchAsync(Action<string, bool> check)
+        {
+            using var sendLock = new SemaphoreSlim(1, 1);
+            var packets = new[] { new byte[] { 1 }, new byte[] { 2 }, new byte[] { 3 } };
+            var written = new List<byte>();
+            await EnhancedClientSession.SendPreparedPacketBatchCoreAsync(sendLock, () => packets,
+                packet => { written.Add(packet[0]); return Task.CompletedTask; });
+            check("shared prepared batch keeps existing non-fenced callers and ordering unchanged",
+                written.SequenceEqual(new byte[] { 1, 2, 3 }) && sendLock.CurrentCount == 1);
+            written.Clear();
+            var canceled = await ObserveAsync(() => EnhancedClientSession.SendPreparedPacketBatchCoreAsync(
+                sendLock, () => packets, packet => { written.Add(packet[0]); return Task.CompletedTask; }, () => false));
+            check("an expired initial write fence emits no frame and releases the send lock",
+                canceled is OperationCanceledException && written.Count == 0 && sendLock.CurrentCount == 1);
+            written.Clear();
+            var current = true;
+            canceled = await ObserveAsync(() => EnhancedClientSession.SendPreparedPacketBatchCoreAsync(
+                sendLock, () => packets, async packet =>
+                {
+                    written.Add(packet[0]);
+                    await Task.Yield();
+                    current = false;
+                }, () => current));
+            check("a source displaced while first frame is awaited cannot write the remaining prepared frames",
+                canceled is OperationCanceledException && written.SequenceEqual(new byte[] { 1 })
+                && sendLock.CurrentCount == 1);
+            written.Clear();
+            await EnhancedClientSession.SendPreparedPacketBatchCoreAsync(sendLock, () => packets,
+                packet => { written.Add(packet[0]); return Task.CompletedTask; }, () => true);
+            check("canceling an old prepared batch does not poison a later valid batch",
+                written.SequenceEqual(new byte[] { 1, 2, 3 }) && sendLock.CurrentCount == 1);
+        }
+
+        private static GuardianAltarProgressSnapshot Fresh(GuardianAltarMenuDefinition definition, int characterId) =>
+            new GuardianAltarProgressSnapshot(characterId,
+                new GuardianAltarHeader(definition.RidableId, definition.DailyRefillTicket, 0, 0, 0, 0, 0, 0, 0, 0),
+                new[] { new GuardianAltarStage(definition.FirstDungeonId, -1) },
+                definition.InitialPurchases, definition.InitialSlots, Array.Empty<GuardianAltarAchievement>());
+
+        private static GuardianAltarProgressSnapshot Copy(GuardianAltarProgressSnapshot source,
+            GuardianAltarHeader header = null, IEnumerable<GuardianAltarStage> stages = null) =>
+            new GuardianAltarProgressSnapshot(source.CharacterId, header ?? source.Header, stages ?? source.Stages,
+                source.Purchases, source.Slots, source.Achievements);
+
+        private static bool SameProgress(GuardianAltarProgressSnapshot a, GuardianAltarProgressSnapshot b) =>
+            a.CharacterId == b.CharacterId && a.Header == b.Header && a.Stages.SequenceEqual(b.Stages)
+            && a.Purchases.SequenceEqual(b.Purchases) && a.Slots.SequenceEqual(b.Slots)
+            && a.Achievements.SequenceEqual(b.Achievements);
+
+        private static byte[] Request(int dungeonId, byte difficulty = 0)
+        {
+            var body = new byte[15];
+            BinaryPrimitives.WriteInt32LittleEndian(body, dungeonId);
+            body[4] = difficulty; body[5] = 3;
+            BinaryPrimitives.WriteUInt16LittleEndian(body.AsSpan(7), ushort.MaxValue);
+            return body;
+        }
+        private static int I32(byte[] body, int offset) => BinaryPrimitives.ReadInt32LittleEndian(body.AsSpan(offset, 4));
+        private static uint U32(byte[] body, int offset) => BinaryPrimitives.ReadUInt32LittleEndian(body.AsSpan(offset, 4));
+        private static ushort U16(byte[] body, int offset) => BinaryPrimitives.ReadUInt16LittleEndian(body.AsSpan(offset, 2));
+        private static ushort Type(byte[] packet) => U16(packet, 1);
+        private static bool HasStartMap(IEnumerable<byte[]> packets) => packets.Any(x => Type(x) == (ushort)NotiPacketTypeA21.ADVANCE_ALTAR_START_MAP);
+        private static bool IsRejection(IReadOnlyList<byte[]> packets) => packets.Count == 2
+            && Type(packets[0]) == (ushort)CmdPacketTypeA21.SELECT_DUNGEON && packets[0][0] == 1
+            && packets[0].AsSpan(15).SequenceEqual(DungeonAdmissionRejectBuilder.Build(DungeonAdmissionReject.DungeonUnavailable))
+            && Type(packets[1]) == (ushort)NotiPacketTypeA21.SERVER_NOTICE_MESSAGE && packets[1][0] == 0;
+        private static DungeonTownReturnAnchor Anchor(EnhancedClientSession session) => new DungeonTownReturnAnchor(
+            session.Player.CurTownId, session.Player.CurAreaId, session.Player.CurPosX, session.Player.CurPosY,
+            session.Player.CurDirection, session.Player.CurAreaState);
+        private static GameSession GameSessionIdentity() => (GameSession)RuntimeHelpers.GetUninitializedObject(typeof(GameSession));
+        private static bool Throws<TException>(Action action) where TException : Exception
+        {
+            try { action(); }
+            catch (TException) { return true; }
+            return false;
+        }
+        private static async Task<Exception> ObserveAsync(Func<Task> action)
+        {
+            try { await action(); return null; }
+            catch (Exception exception) { return exception; }
+        }
+
+        private sealed class ProgressStub : IGuardianAltarProgressService
+        {
+            private readonly GuardianAltarMenuDefinition _definition;
+            internal ProgressStub(GuardianAltarMenuDefinition definition) => _definition = definition;
+            internal int Reads;
+            internal bool Preparing;
+            internal bool ReadInPrepare;
+            internal bool WrongCharacter;
+            internal Action DuringLoad;
+            internal Exception Error;
+            internal Func<GuardianAltarProgressSnapshot, GuardianAltarProgressSnapshot> Transform;
+            public GuardianAltarProgressSnapshot LoadMenu(int characterId, DateTime utcNow, Func<bool> isCurrent = null)
+            {
+                Reads++;
+                ReadInPrepare |= Preparing;
+                DuringLoad?.Invoke();
+                if (Error != null) throw Error;
+                if (isCurrent != null && !isCurrent())
+                    throw new InvalidOperationException("test progress source changed");
+                var result = Fresh(_definition, characterId + (WrongCharacter ? 1 : 0));
+                return Transform == null ? result : Transform(result);
+            }
+        }
+
+        private sealed class MercenaryStub : IMercenaryRestrictionService
+        {
+            internal bool Assigned;
+            public bool IsAssigned(int characterId) => Assigned;
+            public bool CanDelete(int characterId) => !Assigned;
+            public bool CanMutateAppearance(int characterId) => !Assigned;
+            public bool CanEnterContent(int characterId) => !Assigned;
+        }
+
+        private sealed class Fixture : IDisposable
+        {
+            private readonly List<EnhancedClientSession> _sessions = new();
+            private readonly SemaphoreSlim _sendLock = new(1, 1);
+            internal readonly GuardianAltarOpeningService Opening = new();
+            internal readonly SessionDirectory Sessions = new();
+            internal readonly CharacterTransitionCoordinator Transitions;
+            internal readonly DungeonInstanceRegistry Instances;
+            internal readonly GuardianAltarDungeonCoordinator Coordinator;
+            internal readonly ProgressStub Progress;
+            internal readonly MercenaryStub Mercenary = new();
+            internal readonly List<byte[]> Packets = new();
+            internal DateTimeOffset Now = new(2026, 10, 2, 10, 0, 0, TimeSpan.Zero);
+            internal bool Trading;
+            internal bool InParty;
+            internal Action BeforePrepare;
+            internal Action BeforeReturn;
+            internal Action AfterFirstWrite;
+            internal Exception SendError;
+            internal int FailAfterPackets = -1;
+            internal int ReturnAttempts;
+            internal int ReturnApplied;
+            internal int LoadingRegistrations;
+            internal long LoadingGeneration;
+            internal DungeonRun LastRun;
+            internal DungeonInstanceRoom LastRoom;
+            internal DungeonInstanceIdentity LastInstanceIdentity => LastRun?.Instance.Identity ?? default;
+
+            internal Fixture(GuardianAltarMenuDefinition definition)
+            {
+                Progress = new ProgressStub(definition);
+                Transitions = new CharacterTransitionCoordinator(Sessions);
+                Instances = new DungeonInstanceRegistry(utcNow: () => Now.UtcDateTime);
+                Coordinator = new GuardianAltarDungeonCoordinator(Opening, Progress, () => definition,
+                    Sessions, Transitions, Instances,
+                    _ => Trading, Mercenary, _ => InParty, RegisterLoading, ReturnAsync,
+                    utcNow: () => Now, send: SendAsync, isGuardianDungeon: definition.ContainsDungeon);
+            }
+            internal void Open() => Opening.SetWindow(Now, Now.AddMinutes(5));
+            internal EnhancedClientSession CreateSession(int characterId)
+            {
+                var session = new EnhancedClientSession(new TcpClient(), new GamePacketHeader());
+                session.Account = new AccountRecord { AccountId = 11 };
+                session.Player.CharacterId = characterId;
+                session.Player.UserId = 12001;
+                session.Player.Level = 50;
+                session.Player.UserState = 0;
+                session.Player.TownPresenceReady = true;
+                session.Player.CurTownId = 1;
+                session.Player.CurAreaId = 2;
+                session.Player.CurPosX = 100;
+                session.Player.CurPosY = 200;
+                session.GameSession = GameSessionIdentity();
+                _sessions.Add(session);
+                Sessions.Register(characterId, session);
+                return session;
+            }
+            internal Task<bool> DispatchAsync(EnhancedClientSession session, byte[] body, byte cmd = 1, ushort? type = null) =>
+                Coordinator.TryHandleSelectDungeonAsync(session, new GamePacketHeader {
+                    cmd = cmd, type = type ?? (ushort)CmdPacketTypeA21.SELECT_DUNGEON,
+                    length = checked((uint)(14 + (body?.Length ?? 0))) }, body);
+
+            private void RegisterLoading(DungeonRun run, DungeonInstanceRoom room, long projectionId)
+            {
+                LastRun = run; LastRoom = room;
+                LoadingRegistrations++;
+                LoadingGeneration = room.RegisterLoadingProjection(run.CaptureIdentity(), projectionId,
+                    new[] { run.CaptureIdentity() }, out _);
+                if (LoadingGeneration <= 0)
+                    throw new InvalidOperationException("test dedicated barrier could not register");
+            }
+            private Task SendAsync(EnhancedClientSession session, Func<IReadOnlyList<byte[]>> prepare)
+            {
+                // Exercise the real shared batch core with the same immutable
+                // source fence as the production sender; no socket or DB I/O.
+                var cid = session.Player.CharacterId;
+                var uid = session.Player.UserId;
+                var aid = session.Account.AccountId;
+                var gameSession = session.GameSession;
+                var runIdentity = session.Player.CurrentRun?.CaptureIdentity();
+                var isGuardianRun = session.Player.CurrentRun?.Instance.Mechanisms.GuardianAltar != null;
+                var revision = Opening.Revision;
+                var day = Game.DailyReset.DailyResetService.TodayId(Now.UtcDateTime);
+                var written = 0;
+                return EnhancedClientSession.SendPreparedPacketBatchCoreAsync(_sendLock, () =>
+                {
+                    var before = BeforePrepare; BeforePrepare = null; before?.Invoke();
+                    Progress.Preparing = true;
+                    try { return prepare(); }
+                    finally { Progress.Preparing = false; }
+                }, async packet =>
+                {
+                    if (FailAfterPackets >= 0 && written == FailAfterPackets)
+                        throw SendError ?? new IOException("test partial write");
+                    Packets.Add(packet.ToArray()); written++;
+                    if (written == 1)
+                    {
+                        await Task.Yield();
+                        var after = AfterFirstWrite; AfterFirstWrite = null; after?.Invoke();
+                    }
+                }, () => session.Player.CharacterId == cid && session.Player.UserId == uid
+                    && session.Account.AccountId == aid && ReferenceEquals(session.GameSession, gameSession)
+                    && Sessions.TryGet(cid, out var current) && ReferenceEquals(current, session)
+                    && Opening.Revision == revision && (!isGuardianRun || Opening.GetSnapshot(Now).IsOpen)
+                    && Game.DailyReset.DailyResetService.TodayId(Now.UtcDateTime) == day
+                    && (!runIdentity.HasValue || session.Player.IsCurrentDungeonRun(runIdentity.Value)));
+            }
+            private Task ReturnAsync(EnhancedClientSession session, DungeonRunIdentity identity)
+            {
+                ReturnAttempts++;
+                var before = BeforeReturn; BeforeReturn = null; before?.Invoke();
+                if (EndMemoryRun(session, identity)) ReturnApplied++;
+                return Task.CompletedTask;
+            }
+            // A bounded no-I/O test implementation of the injected expected-run
+            // return contract. This does not replace production Town/EndRun
+            // protocol, database persistence or pet recovery regression tests.
+            internal bool EndMemoryRun(EnhancedClientSession session, DungeonRunIdentity identity)
+            {
+                DungeonRun run;
+                lock (session.Player.DungeonRunLifecycleSyncRoot)
+                {
+                    run = session.Player.CurrentRun;
+                    if (run == null || !run.Matches(identity)) return false;
+                    run.TryBeginEnding();
+                    session.Player.CurrentRun = null;
+                    session.Player.UserState = 0;
+                    session.Player.TownPresenceReady = true;
+                }
+                Instances.Terminate(session.Player.CharacterId, identity, "Guardian entry selftest return");
+                DungeonRunLifecycle.CancelAllTimers(run);
+                run.Instance.TryBeginEnding(); run.Instance.TryMarkEnded(); run.TryMarkEnded();
+                return true;
+            }
+            public void Dispose()
+            {
+                foreach (var session in _sessions)
+                {
+                    var run = session.Player.CurrentRun;
+                    if (run != null) EndMemoryRun(session, run.CaptureIdentity());
+                }
+                Instances.Dispose();
+                _sendLock.Dispose();
+                foreach (var session in _sessions) session.Close();
+            }
+        }
+    }
+}

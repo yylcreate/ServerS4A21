@@ -16,6 +16,7 @@ using DfoServer.Network.Builders.Party;
 using DfoServer.Network.Parsers.Town;
 using System;
 using System.Collections.Generic;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace DfoServer.Network.Handlers
@@ -596,6 +597,37 @@ namespace DfoServer.Network.Handlers
             await _growthCapsule.SendExpProgressAsync(session, "finish-loading");
         }
 
+        internal Task<bool> TrySendFinishLoadingCompletionAsync(
+            EnhancedClientSession session,
+            Func<bool> canContinue)
+            => SendFinishLoadingCompletionCoreAsync(
+                canContinue,
+                (packet, fence) => session.TrySendPacketAsync(
+                    packet, CancellationToken.None, fence),
+                () => _growthCapsule.SendExpProgressAsync(session, "finish-loading"));
+
+        // Shared guarded path: the transport must evaluate the same source
+        // fence inside its send lock. The ordinary unguarded town call above
+        // retains its existing wire and follow-up behavior.
+        internal static async Task<bool> SendFinishLoadingCompletionCoreAsync(
+            Func<bool> canContinue,
+            Func<byte[], Func<bool>, Task<bool>> send,
+            Func<Task> afterCompletion = null)
+        {
+            ArgumentNullException.ThrowIfNull(canContinue);
+            ArgumentNullException.ThrowIfNull(send);
+            if (!canContinue())
+                return false;
+            var packet = GamePacketEnvelopeBuilder.Build(
+                0, (ushort)NotiPacketTypeA21.FINISH_LOADING,
+                FinishLoadingBuilder.BuildNotification());
+            if (!await send(packet, canContinue) || !canContinue())
+                return false;
+            if (afterCompletion != null)
+                await afterCompletion();
+            return true;
+        }
+
         public async Task Handle_ENUM_CMDPACKET_TELEPORT(EnhancedClientSession session, GamePacketHeader header, byte[] body)
         {
             if (!ItemTeleportRequest.TryParse(body, out var request))
@@ -1141,6 +1173,79 @@ namespace DfoServer.Network.Handlers
             }
             if (rerouteAfterRunGate)
                 await Handle_ENUM_CMDPACKET_GIVEUP_GAME(session, header, body);
+        }
+
+        internal Task<bool> TryHandleDelayedDungeonGiveupAsync(
+            EnhancedClientSession session,
+            DungeonParticipantRoomIdentity expectedRoom,
+            Func<bool> canContinue)
+            => TryHandleDelayedDungeonGiveupCoreAsync(
+                session, expectedRoom, canContinue,
+                sourceRun => HandleGiveupFromRunAsync(session,
+                    new GamePacketHeader
+                    {
+                        cmd = 1,
+                        type = (ushort)CmdPacketTypeA21.GIVEUP_GAME,
+                    }, sourceRun),
+                _ => Dungeon.DungeonRunLifecycle.EndRunAsync(
+                    session, DungeonRunEndReason.EntryRejected,
+                    expectedRoom.Run, _dungeonInstances));
+
+        // Timer/projection cleanup is not a client's request to exit whatever
+        // run happens to be current. Keep the source room through the cohort
+        // wait, then claim the existing ending transition before releasing the
+        // run lock. The normal client entry keeps its rerouting semantics.
+        internal static async Task<bool> TryHandleDelayedDungeonGiveupCoreAsync(
+            EnhancedClientSession session,
+            DungeonParticipantRoomIdentity expectedRoom,
+            Func<bool> canContinue,
+            Func<DungeonRun, Task> giveupFromRun,
+            Func<DungeonRun, Task> ensureEnded)
+        {
+            ArgumentNullException.ThrowIfNull(canContinue);
+            ArgumentNullException.ThrowIfNull(giveupFromRun);
+            ArgumentNullException.ThrowIfNull(ensureEnded);
+            var player = session?.Player;
+            var sourceRun = player?.CurrentRun;
+            if (!expectedRoom.IsValid || sourceRun == null
+                || !player.IsCurrentDungeonParticipantRoom(expectedRoom)
+                || !canContinue())
+                return false;
+
+            var gate = sourceRun.EntryPartySelectionCohort?.TransitionGate;
+            if (gate != null)
+                await gate.WaitAsync();
+            try
+            {
+                // Never hold this monitor over persistence or network awaits.
+                // MOVE_MAP publishes its room under the same run lock and
+                // cannot reserve another projection after TryBeginEnding.
+                lock (sourceRun.SyncRoot)
+                {
+                    if (!ReferenceEquals(player.CurrentRun, sourceRun)
+                        || !player.IsCurrentDungeonParticipantRoom(expectedRoom)
+                        || !canContinue()
+                        || !sourceRun.TryBeginEnding())
+                        return false;
+                }
+                try
+                {
+                    await giveupFromRun(sourceRun);
+                    return true;
+                }
+                finally
+                {
+                    // An exception before the normal EndRun must not leave a
+                    // claimed Ending run attached. Production uses the same
+                    // expected-run ending owner; a replacement is never ended.
+                    if (ReferenceEquals(player.CurrentRun, sourceRun))
+                        await ensureEnded(sourceRun);
+                }
+            }
+            finally
+            {
+                gate?.Release();
+            }
         }
 
         private async Task HandleGiveupFromRunAsync(

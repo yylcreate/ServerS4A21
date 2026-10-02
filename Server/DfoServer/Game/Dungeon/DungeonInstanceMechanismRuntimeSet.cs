@@ -9,6 +9,7 @@ namespace DfoServer.Game.Dungeon
         private readonly object _syncRoot = new object();
         private TournamentDungeonRuntime _tournament;
         private BloodAltarDungeonRuntime _bloodAltar;
+        private Events.GuardianAltar.GuardianAltarDungeonStartPlan _guardianAltar;
         private DungeonBossRouteRuntime _bossRoute;
         private AntonAwakeningRewardRuntime _antonAwakeningReward;
         private bool _conditionalBossSpawned;
@@ -16,6 +17,23 @@ namespace DfoServer.Game.Dungeon
 
         internal DungeonDynamicActorRegistry DynamicActors { get; } =
             new DungeonDynamicActorRegistry();
+
+        // Frozen entry only; the common Run/Room loading barrier owns loading
+        // and ending. Do not introduce a second Guardian run state machine.
+        internal Events.GuardianAltar.GuardianAltarDungeonStartPlan GuardianAltar
+        {
+            get { lock (_syncRoot) return _guardianAltar; }
+        }
+
+        internal bool TryAttachGuardianAltar(Events.GuardianAltar.GuardianAltarDungeonStartPlan plan)
+        {
+            ArgumentNullException.ThrowIfNull(plan);
+            lock (_syncRoot)
+            {
+                if (_guardianAltar == null) { _guardianAltar = plan; return true; }
+                return ReferenceEquals(_guardianAltar, plan);
+            }
+        }
 
         internal bool ConditionalBossSpawned
         {

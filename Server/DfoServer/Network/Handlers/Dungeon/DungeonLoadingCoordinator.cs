@@ -49,6 +49,7 @@ namespace DfoServer.Network.Handlers.Dungeon
             byte[] body)
         {
             var run = session?.Player?.CurrentRun;
+            var sourceCurrent = CaptureFinishLoadingSourceFence(session, _sessions, run);
             if (run?.Tower != null)
             {
                 await HandleDeathTowerFinishLoadingAsync(session, run);
@@ -65,7 +66,8 @@ namespace DfoServer.Network.Handlers.Dungeon
                 await HandleDungeonFinishLoadingAsync(session, run);
             }
 
-            await _raid.HandleDungeonLoadedAsync(session);
+            if (sourceCurrent())
+                await _raid.HandleDungeonLoadedAsync(session);
         }
 
         private async Task HandleDeathTowerFinishLoadingAsync(
@@ -91,7 +93,10 @@ namespace DfoServer.Network.Handlers.Dungeon
                 return;
             }
 
-            await _town.SendFinishLoadingCompletionAsync(session);
+            var canContinue = CaptureContinuationFence(session, _sessions, run,
+                additional: () => ReferenceEquals(run.Tower, tower) && tower.CurrentStage == stage);
+            if (!await _town.TrySendFinishLoadingCompletionAsync(session, canContinue))
+                return;
             FileLogger.Log(
                 "[DeathTower] SENT FINISH_LOADING release after client ready: " +
                 $"cid={session.Player.CharacterId} " +
@@ -134,7 +139,9 @@ namespace DfoServer.Network.Handlers.Dungeon
                     $"cid={session?.Player?.CharacterId ?? 0} " +
                     $"run={run?.RunId ?? 0} " +
                     $"room={run?.CurrentRoomInstanceId ?? 0}");
-                await _town.SendFinishLoadingCompletionAsync(session);
+                await _town.TrySendFinishLoadingCompletionAsync(session,
+                    CaptureContinuationFence(session, _sessions, run,
+                        participantRoom.IsValid ? participantRoom.Room : null));
                 return;
             }
 
@@ -163,6 +170,7 @@ namespace DfoServer.Network.Handlers.Dungeon
             {
                 await SendLoadingCompletionAsync(
                     participantRoom.Room,
+                    ready.Generation,
                     ready.Participants,
                     "all-ready");
             }
@@ -186,6 +194,7 @@ namespace DfoServer.Network.Handlers.Dungeon
 
         private async Task SendLoadingCompletionAsync(
             DungeonRoomIdentity roomIdentity,
+            long loadingGeneration,
             IReadOnlyList<DungeonRunIdentity> participants,
             string reason)
         {
@@ -214,10 +223,16 @@ namespace DfoServer.Network.Handlers.Dungeon
                 }
 
                 var instance = participant.Run.Instance;
-                if (instance.TryGetRoom(roomIdentity.RoomInstanceId, out var room))
-                    DungeonMechanismTimerCoordinator.StartElevator(
-                        instance, room, _instances, _sessions);
-                releases.Add(TrySendLoadingCompletionAsync(candidate));
+                if (!instance.TryGetRoom(roomIdentity.RoomInstanceId, out var room))
+                    continue;
+                var canContinue = CaptureContinuationFence(candidate, _sessions,
+                    participant.Run, roomIdentity,
+                    () => room.IsCurrentLoadingGeneration(loadingGeneration));
+                if (!canContinue())
+                    continue;
+                DungeonMechanismTimerCoordinator.StartElevator(
+                    instance, room, _instances, _sessions);
+                releases.Add(TrySendLoadingCompletionAsync(candidate, canContinue));
             }
 
             var releaseResults = await Task.WhenAll(releases);
@@ -236,12 +251,12 @@ namespace DfoServer.Network.Handlers.Dungeon
         }
 
         private async Task<bool> TrySendLoadingCompletionAsync(
-            EnhancedClientSession session)
+            EnhancedClientSession session,
+            Func<bool> canContinue)
         {
             try
             {
-                await _town.SendFinishLoadingCompletionAsync(session);
-                return true;
+                return await _town.TrySendFinishLoadingCompletionAsync(session, canContinue);
             }
             catch (Exception ex)
             {
@@ -275,23 +290,12 @@ namespace DfoServer.Network.Handlers.Dungeon
             DungeonRunIdentity runIdentity,
             DungeonRoomIdentity roomIdentity)
         {
-            if (session?.Player == null
-                || !session.Player.IsCurrentDungeonParticipantRoom(
-                    new DungeonParticipantRoomIdentity(
-                        runIdentity,
-                        roomIdentity)))
-            {
+            var sourceRun = session?.Player?.CurrentRun;
+            var expected = new DungeonParticipantRoomIdentity(runIdentity, roomIdentity);
+            var canContinue = CaptureContinuationFence(session, _sessions, sourceRun, roomIdentity);
+            if (sourceRun == null || !sourceRun.Matches(expected) || !canContinue())
                 return;
-            }
-
-            await HandleGiveupGameAsync(
-                session,
-                new GamePacketHeader
-                {
-                    cmd = 0x01,
-                    type = 0x002A,
-                },
-                Array.Empty<byte>());
+            await HandleDelayedGiveupAsync(session, sourceRun, expected, canContinue);
         }
 
         private async Task HandleLoadingTimeoutAsync(
@@ -317,8 +321,10 @@ namespace DfoServer.Network.Handlers.Dungeon
 
             var missingCandidates = new List<(
                 EnhancedClientSession Session,
-                DungeonRunIdentity RunIdentity,
-                int CharacterId)>();
+                DungeonRun Run,
+                DungeonParticipantRoomIdentity ParticipantRoom,
+                int CharacterId,
+                Func<bool> CanContinue)>();
             var instanceRoster = _instances
                 .CaptureInstanceParticipantRoster(roomIdentity.Instance);
             foreach (var participant in instanceRoster)
@@ -337,14 +343,23 @@ namespace DfoServer.Network.Handlers.Dungeon
                 }
 
                 var candidateRun = candidate.Player.CurrentRun;
+                var participantRoom = new DungeonParticipantRoomIdentity(
+                    participant.RunIdentity, roomIdentity);
+                var sourceCurrent = CaptureContinuationFence(candidate, _sessions,
+                    candidateRun, roomIdentity,
+                    () => room.IsCurrentLoadingGeneration(timeout.Generation));
                 if (candidateRun != null
+                    && candidateRun.Matches(participantRoom)
+                    && sourceCurrent()
                     && candidateRun.TryCancelLoadingProjection(
                         timeout.ProjectionId))
                 {
                     missingCandidates.Add((
                         candidate,
-                        participant.RunIdentity,
-                        participant.CharacterId));
+                        candidateRun,
+                        participantRoom,
+                        participant.CharacterId,
+                        () => sourceCurrent() && candidateRun.IsLoadingProjectionCanceled(timeout.ProjectionId)));
                 }
             }
 
@@ -352,6 +367,7 @@ namespace DfoServer.Network.Handlers.Dungeon
             {
                 await SendLoadingCompletionAsync(
                     roomIdentity,
+                    timeout.Generation,
                     timeout.ReadyParticipants,
                     "timeout");
             }
@@ -359,26 +375,15 @@ namespace DfoServer.Network.Handlers.Dungeon
             foreach (var missing in missingCandidates)
             {
                 var candidate = missing.Session;
-                var candidateRun = candidate?.Player?.CurrentRun;
-                if (candidateRun == null
-                    || !candidate.Player.IsCurrentDungeonRun(
-                        missing.RunIdentity)
-                    || !candidateRun.IsLoadingProjectionCanceled(
-                        timeout.ProjectionId))
+                if (!missing.CanContinue())
                 {
                     continue;
                 }
 
                 try
                 {
-                    await HandleGiveupGameAsync(
-                        candidate,
-                        new GamePacketHeader
-                        {
-                            cmd = 0x01,
-                            type = 0x002A,
-                        },
-                        Array.Empty<byte>());
+                    await HandleDelayedGiveupAsync(candidate, missing.Run,
+                        missing.ParticipantRoom, missing.CanContinue);
                 }
                 catch (Exception ex)
                 {
@@ -390,6 +395,69 @@ namespace DfoServer.Network.Handlers.Dungeon
                         $"error={ex.Message}");
                 }
             }
+        }
+
+        private async Task HandleDelayedGiveupAsync(
+            EnhancedClientSession session,
+            DungeonRun sourceRun,
+            DungeonParticipantRoomIdentity expectedRoom,
+            Func<bool> canContinue)
+        {
+            var sessionCurrent = CaptureSessionFence(session, _sessions);
+            if (await _town.TryHandleDelayedDungeonGiveupAsync(session, expectedRoom, canContinue)
+                && sessionCurrent() && session.Player.CurrentRun == null
+                && session.Player.CurrentDungeonRunGeneration == expectedRoom.Run.RunGeneration)
+                await _raid.HandleDungeonAbortedAsync(session, sourceRun.DungeonId, "loading-rejected");
+        }
+
+        // A continuation captures its source once. These predicates only read
+        // identity/state: no lifecycle/character/cohort gate or database I/O.
+        internal static Func<bool> CaptureSessionFence(
+            EnhancedClientSession session,
+            ISessionDirectory sessions)
+        {
+            var player = session?.Player;
+            var characterId = player?.CharacterId ?? 0;
+            var userId = player?.UserId ?? 0;
+            var accountId = session?.Account?.AccountId ?? 0;
+            var gameSession = session?.GameSession;
+            var sessionId = session?.SessionId ?? Guid.Empty;
+            return () => session != null && sessions != null && player != null
+                && characterId > 0 && userId > 0 && accountId > 0 && gameSession != null
+                && ReferenceEquals(session.Player, player) && session.SessionId == sessionId
+                && player.CharacterId == characterId && player.UserId == userId
+                && session.Account?.AccountId == accountId
+                && ReferenceEquals(session.GameSession, gameSession)
+                && session.TcpClient != null && session.TcpClient.Connected
+                && sessions.TryGet(characterId, out var current) && ReferenceEquals(current, session);
+        }
+
+        internal static Func<bool> CaptureContinuationFence(
+            EnhancedClientSession session,
+            ISessionDirectory sessions,
+            DungeonRun sourceRun,
+            DungeonRoomIdentity? expectedRoom = null,
+            Func<bool> additional = null)
+        {
+            var sessionCurrent = CaptureSessionFence(session, sessions);
+            var runIdentity = sourceRun?.CaptureIdentity() ?? default(DungeonRunIdentity);
+            return () => sessionCurrent() && runIdentity.IsValid
+                && ReferenceEquals(session.Player.CurrentRun, sourceRun)
+                && session.Player.IsCurrentDungeonRun(runIdentity)
+                && sourceRun.RunState != DungeonRunState.Ending && sourceRun.RunState != DungeonRunState.Ended
+                && (!expectedRoom.HasValue || session.Player.IsCurrentDungeonRoom(expectedRoom.Value))
+                && (additional == null || additional());
+        }
+
+        internal static Func<bool> CaptureFinishLoadingSourceFence(
+            EnhancedClientSession session,
+            ISessionDirectory sessions,
+            DungeonRun sourceRun)
+        {
+            if (sourceRun != null)
+                return CaptureContinuationFence(session, sessions, sourceRun);
+            var sessionCurrent = CaptureSessionFence(session, sessions);
+            return () => sessionCurrent() && session.Player.CurrentRun == null;
         }
 
         private static bool ContainsRunIdentity(
