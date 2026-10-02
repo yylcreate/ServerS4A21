@@ -3,6 +3,7 @@ using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Net;
 using System.Net.Sockets;
 using System.Runtime.CompilerServices;
 using System.Threading;
@@ -54,6 +55,7 @@ namespace DfoServer.SelfTests
                 Section("Guardian entry and rejection", () => CheckEntryAsync(Check, definition).GetAwaiter().GetResult());
                 Section("Guardian source fencing", () => CheckFencesAsync(Check, definition).GetAwaiter().GetResult());
                 Section("Guardian failure cleanup", () => CheckFailuresAsync(Check, definition).GetAwaiter().GetResult());
+                Section("Guardian energy coordinator", () => CheckEnergyAsync(Check, definition).GetAwaiter().GetResult());
             }
             Console.WriteLine($"GUARDIAN_ALTAR_DUNGEON_ENTRY assertions={assertions} failures={failures}");
             return failures;
@@ -562,6 +564,125 @@ namespace DfoServer.SelfTests
                 written.SequenceEqual(new byte[] { 1, 2, 3 }) && sendLock.CurrentCount == 1);
         }
 
+        private static async Task CheckEnergyAsync(Action<string, bool> check, GuardianAltarMenuDefinition definition)
+        {
+            using var fixture = new Fixture(definition);
+            fixture.Open();
+            var session = await fixture.CreateConnectedSessionAsync(301);
+            var pauseHeader = new GamePacketHeader { cmd = 1, type = (ushort)CmdPacketTypeA21.ADVANCE_ALTAR_PAUSE };
+            var registry = new GameCommandRegistry();
+            registry.RegisterGroup("guardian-altar-runtime", fixture.Coordinator.RegisterRuntimeHandlers);
+            check("the real Guardian runtime registration resolves the current A21 pause command",
+                registry.Count == 1 && registry.TryGetValue((ushort)CmdPacketTypeA21.ADVANCE_ALTAR_PAUSE, out _));
+            registry.TryGetValue((ushort)CmdPacketTypeA21.ADVANCE_ALTAR_PAUSE, out var pauseHandler);
+            check("duplicate Guardian runtime registration fails instead of silently replacing a handler",
+                Throws<InvalidOperationException>(() => registry.RegisterGroup("duplicate", fixture.Coordinator.RegisterRuntimeHandlers)));
+            Task Pause(bool paused)
+            {
+                var body = new byte[15]; body[14] = paused ? (byte)1 : (byte)0;
+                return pauseHandler(session, pauseHeader, body);
+            }
+            bool Ack(bool success, bool paused) => fixture.Packets.Count > 0
+                && Type(fixture.Packets[^1]) == (ushort)CmdPacketTypeA21.ADVANCE_ALTAR_PAUSE
+                && fixture.Packets[^1].AsSpan(15).SequenceEqual(GuardianAltarPauseAckBodyBuilder.Build(success, paused));
+
+            await Pause(false);
+            check("town pause returns a complete failure without creating an activity run",
+                Ack(false, false) && session.Player.CurrentRun == null);
+            fixture.Packets.Clear();
+            await fixture.DispatchAsync(session, Request(definition.FirstDungeonId));
+            var run = fixture.LastRun;
+            var room = fixture.LastRoom;
+            var energy = run.Instance.Mechanisms.GuardianAltarEnergy;
+            var progress = run.Instance.Mechanisms.GuardianAltar.Progress;
+            await Pause(false);
+            check("resume before loading release is denied without starting energy",
+                Ack(false, false) && !energy.ReadSnapshot(fixture.MonotonicMilliseconds).IsReady);
+            var ready = room.MarkLoadingReady(run.CaptureIdentity(), new[] { run.CaptureIdentity() });
+            check("Guardian uses the existing room barrier before energy binding", ready.Released);
+            var fence = DungeonLoadingCoordinator.CaptureContinuationFence(session, fixture.Sessions, run,
+                room.Identity, () => room.IsCurrentLoadingGeneration(ready.Generation));
+            await Network.Handlers.TownHandler.SendFinishLoadingCompletionCoreAsync(fence,
+                (_, _) => Task.FromResult(false), onReleased: () =>
+                    GuardianAltarDungeonCoordinator.OnLoadingReleased(run, room.Identity, ready.Generation));
+            check("failed FINISH_LOADING write does not bind Guardian energy",
+                !energy.ReadSnapshot(fixture.MonotonicMilliseconds).IsReady);
+            var transitionGate = session.Player.DungeonRunTransitionGate;
+            await transitionGate.WaitAsync();
+            var waitingPause = Pause(true);
+            try
+            {
+                await Network.Handlers.TownHandler.SendFinishLoadingCompletionCoreAsync(fence,
+                    (_, _) => Task.FromResult(true), onReleased: () =>
+                        GuardianAltarDungeonCoordinator.OnLoadingReleased(run, room.Identity, ready.Generation));
+            }
+            finally { transitionGate.Release(); }
+            await waitingPause.WaitAsync(TimeSpan.FromSeconds(5));
+            check("a loading release during the run-gate wait is consumed with its current bound generation",
+                Ack(true, true));
+            var bound = energy.ReadSnapshot(fixture.MonotonicMilliseconds);
+            check("successful release binds the exact run room and loading generation without initial energy",
+                bound.IsReady && bound.Paused && bound.EnergyFixed == 0
+                && bound.Identity.Equals(run.CaptureParticipantRoomIdentity())
+                && bound.LoadingGeneration == ready.Generation);
+            fixture.MonotonicMilliseconds = 10000;
+            await Pause(false);
+            var resumed = energy.ReadSnapshot(10000);
+            check("first resume accepts the A21 six-byte ACK and starts an empty level-zero gauge",
+                Ack(true, false) && !resumed.Paused && resumed.EnergyFixed == 0 && resumed.Level == 0);
+            fixture.MonotonicMilliseconds = 11999;
+            await Pause(false);
+            check("duplicate resume does not reset elapsed time or the ACK version",
+                Ack(true, false) && energy.ReadSnapshot(11999).EnergyFixed == 1000
+                && energy.ReadSnapshot(11999).Version == resumed.Version);
+            GuardianAltarDungeonCoordinator.OnLoadingReleased(run, room.Identity, ready.Generation);
+            check("duplicate loading release cannot reset an active energy anchor",
+                energy.ReadSnapshot(12000).EnergyFixed == 2000 && !energy.ReadSnapshot(12000).Paused);
+            fixture.MonotonicMilliseconds = 12000;
+            await Pause(true);
+            fixture.MonotonicMilliseconds = 20000;
+            check("accepted pause freezes natural energy", Ack(true, true) && energy.ReadSnapshot(20000).EnergyFixed == 2000);
+            await Pause(false);
+            fixture.MonotonicMilliseconds = 21000;
+            check("resume continues from the stored value", Ack(true, false) && energy.ReadSnapshot(21000).EnergyFixed == 3000);
+            var invalid = new byte[15]; invalid[3] = 1;
+            await fixture.Coordinator.HandlePauseAsync(session, pauseHeader, invalid);
+            check("malformed pause cannot change the valid runtime", Ack(false, false) && !energy.ReadSnapshot(21000).Paused);
+            fixture.Opening.Close();
+            await Pause(true);
+            check("closing menu admission does not revoke a live run pause", Ack(true, true));
+            fixture.PauseSendError = new IOException("test failed energy ACK");
+            await Pause(false);
+            var afterFailure = energy.ReadSnapshot(21000);
+            fixture.PauseSendError = null;
+            fixture.MonotonicMilliseconds = 22000;
+            await Pause(false);
+            check("failed ACK followed by retry does not restart energy or double-apply a transition",
+                Ack(true, false) && energy.ReadSnapshot(22000).EnergyFixed == 4000
+                && energy.ReadSnapshot(22000).Version == afterFailure.Version);
+            var packetCount = fixture.Packets.Count;
+            fixture.BeforePausePrepare = () => session.GameSession = GameSessionIdentity();
+            await Pause(true);
+            check("an ACK delayed across GameSession replacement is suppressed", fixture.Packets.Count == packetCount);
+            check("energy requests do not mutate persisted menu progress or grant ordinary combat rewards",
+                SameProgress(progress, Fresh(definition, session.Player.CharacterId))
+                && run.RewardPolicy.Kind == DungeonRewardPolicyKind.GuardianAltar
+                && !run.RewardPolicy.AllowsMonsterExperience && !run.RewardPolicy.AllowsSettlement
+                && ReferenceEquals(run.Instance.Mechanisms.GuardianAltar.Progress, progress));
+            fixture.EndMemoryRun(session, run.CaptureIdentity());
+            check("ending the physical instance closes energy and invalidates old ACK snapshots",
+                energy.ReadSnapshot(22000).IsClosed && !energy.IsCurrent(afterFailure));
+            var closed = energy.ReadSnapshot(22000);
+            fixture.Open();
+            fixture.Packets.Clear();
+            await fixture.DispatchAsync(session, Request(definition.FirstDungeonId));
+            await Pause(false);
+            check("a replacement run starts empty and cannot use an old loading release",
+                Ack(false, false) && !fixture.LastRun.Instance.Mechanisms.GuardianAltarEnergy.ReadSnapshot(22000).IsReady
+                && fixture.LastRun.Instance.Mechanisms.GuardianAltarEnergy.ReadSnapshot(22000).EnergyFixed == 0
+                && energy.ReadSnapshot(22000) == closed);
+        }
+
         private static GuardianAltarProgressSnapshot Fresh(GuardianAltarMenuDefinition definition, int characterId) =>
             new GuardianAltarProgressSnapshot(characterId,
                 new GuardianAltarHeader(definition.RidableId, definition.DailyRefillTicket, 0, 0, 0, 0, 0, 0, 0, 0),
@@ -647,6 +768,7 @@ namespace DfoServer.SelfTests
         private sealed class Fixture : IDisposable
         {
             private readonly List<EnhancedClientSession> _sessions = new();
+            private readonly List<TcpClient> _peers = new();
             private readonly SemaphoreSlim _sendLock = new(1, 1);
             internal readonly GuardianAltarOpeningService Opening = new();
             internal readonly SessionDirectory Sessions = new();
@@ -663,6 +785,9 @@ namespace DfoServer.SelfTests
             internal Action BeforeReturn;
             internal Action AfterFirstWrite;
             internal Exception SendError;
+            internal Exception PauseSendError;
+            internal Action BeforePausePrepare;
+            internal long MonotonicMilliseconds;
             internal int FailAfterPackets = -1;
             internal int ReturnAttempts;
             internal int ReturnApplied;
@@ -680,12 +805,13 @@ namespace DfoServer.SelfTests
                 Coordinator = new GuardianAltarDungeonCoordinator(Opening, Progress, () => definition,
                     Sessions, Transitions, Instances,
                     _ => Trading, Mercenary, _ => InParty, RegisterLoading, ReturnAsync,
-                    utcNow: () => Now, send: SendAsync, isGuardianDungeon: definition.ContainsDungeon);
+                    utcNow: () => Now, send: SendAsync, isGuardianDungeon: definition.ContainsDungeon,
+                    monotonicMilliseconds: () => MonotonicMilliseconds, sendPause: SendPauseAsync);
             }
             internal void Open() => Opening.SetWindow(Now, Now.AddMinutes(5));
-            internal EnhancedClientSession CreateSession(int characterId)
+            internal EnhancedClientSession CreateSession(int characterId, TcpClient tcp = null)
             {
-                var session = new EnhancedClientSession(new TcpClient(), new GamePacketHeader());
+                var session = new EnhancedClientSession(tcp ?? new TcpClient(), new GamePacketHeader());
                 session.Account = new AccountRecord { AccountId = 11 };
                 session.Player.CharacterId = characterId;
                 session.Player.UserId = 12001;
@@ -701,6 +827,28 @@ namespace DfoServer.SelfTests
                 Sessions.Register(characterId, session);
                 return session;
             }
+            internal async Task<EnhancedClientSession> CreateConnectedSessionAsync(int characterId)
+            {
+                using var listener = new TcpListener(IPAddress.Loopback, 0);
+                listener.Start();
+                var peer = new TcpClient();
+                _peers.Add(peer);
+                var accept = listener.AcceptTcpClientAsync();
+                await peer.ConnectAsync((IPEndPoint)listener.LocalEndpoint).WaitAsync(TimeSpan.FromSeconds(5));
+                return CreateSession(characterId, await accept.WaitAsync(TimeSpan.FromSeconds(5)));
+            }
+            private Task SendPauseAsync(EnhancedClientSession session,
+                Func<IReadOnlyList<byte[]>> prepare, Func<bool> current)
+                => EnhancedClientSession.SendPreparedPacketBatchCoreAsync(_sendLock, () =>
+                {
+                    var before = BeforePausePrepare; BeforePausePrepare = null; before?.Invoke();
+                    return prepare();
+                }, packet =>
+                {
+                    if (PauseSendError != null) throw PauseSendError;
+                    Packets.Add(packet.ToArray());
+                    return Task.CompletedTask;
+                }, current);
             internal Task<bool> DispatchAsync(EnhancedClientSession session, byte[] body, byte cmd = 1, ushort? type = null) =>
                 Coordinator.TryHandleSelectDungeonAsync(session, new GamePacketHeader {
                     cmd = cmd, type = type ?? (ushort)CmdPacketTypeA21.SELECT_DUNGEON,
@@ -788,6 +936,7 @@ namespace DfoServer.SelfTests
                 Instances.Dispose();
                 _sendLock.Dispose();
                 foreach (var session in _sessions) session.Close();
+                foreach (var peer in _peers) peer.Dispose();
             }
         }
     }

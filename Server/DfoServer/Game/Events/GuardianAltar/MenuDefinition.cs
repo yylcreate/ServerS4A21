@@ -18,6 +18,7 @@ namespace DfoServer.Game.Events.GuardianAltar
         private readonly IReadOnlyList<GuardianAltarShopEntry> _shopEntries;
         private readonly Func<int, GuardianAltarDungeonFile> _dungeonLoader;
         private readonly Func<int, MapFile> _mapLoader;
+        private readonly GuardianAltarEnergyConfigFile _energy;
 
         internal GuardianAltarMenuDefinition(int dailyRefillTicket, int ridableId,
             int firstDungeonId, IEnumerable<GuardianAltarPurchase> initialPurchases,
@@ -27,7 +28,8 @@ namespace DfoServer.Game.Events.GuardianAltar
             IEnumerable<int> knownAchievementIds = null,
             IEnumerable<GuardianAltarShopEntry> shopEntries = null,
             Func<int, GuardianAltarDungeonFile> dungeonLoader = null,
-            Func<int, MapFile> mapLoader = null)
+            Func<int, MapFile> mapLoader = null,
+            GuardianAltarEnergyConfigFile energy = null)
         {
             if (dailyRefillTicket < 0 || ridableId <= 0 || firstDungeonId <= 0)
                 throw new ArgumentOutOfRangeException(nameof(dailyRefillTicket));
@@ -43,6 +45,7 @@ namespace DfoServer.Game.Events.GuardianAltar
             _shopEntries = Array.AsReadOnly((shopEntries ?? Array.Empty<GuardianAltarShopEntry>()).ToArray());
             _dungeonLoader = dungeonLoader;
             _mapLoader = mapLoader;
+            _energy = energy;
             ValidateProgress(new GuardianAltarProgressSnapshot(1,
                 new GuardianAltarHeader(ridableId, dailyRefillTicket, 0, 0, 0, 0, 0, 0, 0, 0),
                 new[] { new GuardianAltarStage(firstDungeonId, -1) },
@@ -68,6 +71,8 @@ namespace DfoServer.Game.Events.GuardianAltar
                 throw new InvalidOperationException("Guardian stage requires an available ticket.");
             if (_dungeonLoader == null || _mapLoader == null)
                 throw new InvalidOperationException("Guardian combat resource definitions are unavailable.");
+            if (_energy == null || !_energy.IsValid)
+                throw new InvalidDataException("Guardian energy resource is unavailable: " + _energy?.InvalidReason);
             var dungeon = _dungeonLoader(dungeonId);
             if (dungeon == null || !dungeon.IsValid)
                 throw new InvalidDataException(dungeon?.InvalidReason ?? "Guardian DGN is missing.");
@@ -115,7 +120,7 @@ namespace DfoServer.Game.Events.GuardianAltar
             if (guardianMap.CenterIndices.Any(x => !learnedCenters.Contains(x)))
                 throw new InvalidDataException("Guardian MAP has no learned entry for a required center.");
             return new GuardianAltarDungeonStartPlan(dungeonId, difficulty, selected.MapId,
-                selected.MapBasisLevel, guardianMap.TotalDurationMilliseconds, summaries, centers, progress);
+                selected.MapBasisLevel, guardianMap.TotalDurationMilliseconds, summaries, centers, progress, _energy);
         }
 
         internal void ValidateProgress(GuardianAltarProgressSnapshot snapshot)
@@ -207,7 +212,8 @@ namespace DfoServer.Game.Events.GuardianAltar
                 first.DungeonId, purchases, slots, knownDungeons,
                 ridable.Entries.SelectMany(x => x.Levels.Select(level =>
                     new GuardianAltarPurchase(x.ShopType, x.ResourceId, level.Level, level.Price))),
-                knownAchievementIds, ridable.Entries, dungeonLoader, mapLoader);
+                knownAchievementIds, ridable.Entries, dungeonLoader, mapLoader,
+                GuardianAltarEnergyConfigFile.Parse(config));
         }
     }
 }

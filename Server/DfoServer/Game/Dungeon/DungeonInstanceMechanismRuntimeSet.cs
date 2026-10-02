@@ -10,6 +10,7 @@ namespace DfoServer.Game.Dungeon
         private TournamentDungeonRuntime _tournament;
         private BloodAltarDungeonRuntime _bloodAltar;
         private Events.GuardianAltar.GuardianAltarDungeonStartPlan _guardianAltar;
+        private Events.GuardianAltar.GuardianAltarEnergyRuntime _guardianAltarEnergy;
         private DungeonBossRouteRuntime _bossRoute;
         private AntonAwakeningRewardRuntime _antonAwakeningReward;
         private bool _conditionalBossSpawned;
@@ -18,8 +19,8 @@ namespace DfoServer.Game.Dungeon
         internal DungeonDynamicActorRegistry DynamicActors { get; } =
             new DungeonDynamicActorRegistry();
 
-        // Frozen entry only; the common Run/Room loading barrier owns loading
-        // and ending. Do not introduce a second Guardian run state machine.
+        // The common Run/Room loading barrier still owns loading and ending.
+        // Energy is a disposable, per-instance elapsed-time projection.
         internal Events.GuardianAltar.GuardianAltarDungeonStartPlan GuardianAltar
         {
             get { lock (_syncRoot) return _guardianAltar; }
@@ -30,9 +31,20 @@ namespace DfoServer.Game.Dungeon
             ArgumentNullException.ThrowIfNull(plan);
             lock (_syncRoot)
             {
-                if (_guardianAltar == null) { _guardianAltar = plan; return true; }
+                if (_guardianAltar == null)
+                {
+                    var energy = new Events.GuardianAltar.GuardianAltarEnergyRuntime(plan.Energy);
+                    _guardianAltar = plan;
+                    _guardianAltarEnergy = energy;
+                    return true;
+                }
                 return ReferenceEquals(_guardianAltar, plan);
             }
+        }
+
+        internal Events.GuardianAltar.GuardianAltarEnergyRuntime GuardianAltarEnergy
+        {
+            get { lock (_syncRoot) return _guardianAltarEnergy; }
         }
 
         internal bool ConditionalBossSpawned
@@ -182,10 +194,15 @@ namespace DfoServer.Game.Dungeon
         internal void OnInstanceEnding()
         {
             BloodAltarDungeonRuntime bloodAltar;
+            Events.GuardianAltar.GuardianAltarEnergyRuntime guardianEnergy;
             lock (_syncRoot)
+            {
                 bloodAltar = _bloodAltar;
+                guardianEnergy = _guardianAltarEnergy;
+            }
 
             bloodAltar?.Timers.CancelAll();
+            guardianEnergy?.Close();
         }
     }
 }

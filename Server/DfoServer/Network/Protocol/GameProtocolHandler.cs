@@ -290,10 +290,13 @@ namespace DfoServer.Network
             _cmdDispatch.RegisterGroup("event-joust", RegisterEventJoustHandlers);
             _cmdDispatch.RegisterGroup("npc-favor", _npcFavorHandler.RegisterHandlers);
             if (_guardianAltarOpening != null)
+            {
                 _cmdDispatch.RegisterGroup("guardian-altar-entry", handlers =>
                     _guardianAltarOpening.RegisterEntryHandlers(handlers,
                         _socialHandlers.Trade.HasActiveTrade,
                         _worldDependencies.MercenaryRestrictions));
+                _cmdDispatch.RegisterGroup("guardian-altar-runtime", _dungeonHandler.RegisterGuardianAltarRuntimeHandlers);
+            }
         }
 
         public void Dispose()

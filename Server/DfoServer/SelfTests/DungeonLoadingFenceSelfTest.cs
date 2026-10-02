@@ -92,6 +92,30 @@ namespace DfoServer.SelfTests
 
             using (var fixture = new SourceFixture())
             {
+                var releaseObserved = false;
+                var followupFailed = false;
+                try
+                {
+                    await TownHandler.SendFinishLoadingCompletionCoreAsync(fixture.Fence(),
+                        (packet, fence) => fixture.Session.TrySendPacketAsync(packet, CancellationToken.None, fence),
+                        () => throw new InvalidOperationException("test unrelated follow-up failure"),
+                        () => releaseObserved = true).WaitAsync(TestTimeout);
+                }
+                catch (InvalidOperationException) { followupFailed = true; }
+                check("successful loading release is observed before an unrelated follow-up failure",
+                    releaseObserved && followupFailed && fixture.Peer.Available > 0);
+            }
+
+            using (var fixture = new SourceFixture())
+            {
+                var releaseObserved = false;
+                var sent = await TownHandler.SendFinishLoadingCompletionCoreAsync(fixture.Fence(),
+                    (_, _) => Task.FromResult(false), onReleased: () => releaseObserved = true);
+                check("a failed loading write does not activate a local mechanism", !sent && !releaseObserved);
+            }
+
+            using (var fixture = new SourceFixture())
+            {
                 var followedUp = 0;
                 var sent = await TownHandler.SendFinishLoadingCompletionCoreAsync(fixture.Fence(),
                     async (packet, fence) =>

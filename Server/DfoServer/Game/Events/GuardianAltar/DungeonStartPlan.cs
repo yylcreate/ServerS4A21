@@ -19,7 +19,8 @@ namespace DfoServer.Game.Events.GuardianAltar
             int mapId, int mapBasisLevel, int durationMilliseconds,
             IEnumerable<GuardianAltarPhaseSummary> phases,
             IEnumerable<GuardianAltarCenterSpawn> centers,
-            GuardianAltarProgressSnapshot progress)
+            GuardianAltarProgressSnapshot progress,
+            PvfLib.GuardianAltarEnergyConfigFile energy = null)
         {
             if (dungeonId <= 0 || dungeonId > short.MaxValue || difficulty > 2
                 || mapId <= 0 || mapBasisLevel < 0 || durationMilliseconds <= 0)
@@ -30,6 +31,7 @@ namespace DfoServer.Game.Events.GuardianAltar
             MapBasisLevel = mapBasisLevel;
             DurationMilliseconds = durationMilliseconds;
             Progress = progress ?? throw new ArgumentNullException(nameof(progress));
+            Energy = energy;
             Phases = Array.AsReadOnly(phases.ToArray());
             Centers = Array.AsReadOnly(centers.ToArray());
             if (Phases.Count == 0 || Centers.Count == 0 || Centers.Count > ushort.MaxValue
@@ -57,5 +59,6 @@ namespace DfoServer.Game.Events.GuardianAltar
         internal IReadOnlyList<GuardianAltarPhaseSummary> Phases { get; }
         internal IReadOnlyList<GuardianAltarCenterSpawn> Centers { get; }
         internal GuardianAltarProgressSnapshot Progress { get; }
+        internal PvfLib.GuardianAltarEnergyConfigFile Energy { get; }
     }
 }

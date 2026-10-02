@@ -170,6 +170,13 @@ namespace DfoServer.Network.Handlers
                 });
         }
 
+        internal void RegisterGuardianAltarRuntimeHandlers(GameCommandRegistry.GameCommandRegistrationGroup handlers)
+            => _guardianAltar?.RegisterRuntimeHandlers(handlers);
+
+        internal void OnGuardianAltarLoadingReleased(DungeonRun run,
+            DungeonRoomIdentity room, long loadingGeneration)
+            => GuardianAltarDungeonCoordinator.OnLoadingReleased(run, room, loadingGeneration);
+
         internal void ConfigureTownPresenceProjection(
             Func<EnhancedClientSession, DungeonRunIdentity, Task> projection)
             => _services.TownReturn.ConfigureTownPresenceProjection(projection);

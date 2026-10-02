@@ -232,7 +232,9 @@ namespace DfoServer.Network.Handlers.Dungeon
                     continue;
                 DungeonMechanismTimerCoordinator.StartElevator(
                     instance, room, _instances, _sessions);
-                releases.Add(TrySendLoadingCompletionAsync(candidate, canContinue));
+                releases.Add(TrySendLoadingCompletionAsync(candidate, canContinue,
+                    () => _dungeon.OnGuardianAltarLoadingReleased(
+                        participant.Run, roomIdentity, loadingGeneration)));
             }
 
             var releaseResults = await Task.WhenAll(releases);
@@ -252,11 +254,12 @@ namespace DfoServer.Network.Handlers.Dungeon
 
         private async Task<bool> TrySendLoadingCompletionAsync(
             EnhancedClientSession session,
-            Func<bool> canContinue)
+            Func<bool> canContinue,
+            Action onReleased = null)
         {
             try
             {
-                return await _town.TrySendFinishLoadingCompletionAsync(session, canContinue);
+                return await _town.TrySendFinishLoadingCompletionAsync(session, canContinue, onReleased);
             }
             catch (Exception ex)
             {

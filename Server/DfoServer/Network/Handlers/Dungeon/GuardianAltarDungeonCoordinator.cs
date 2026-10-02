@@ -19,7 +19,7 @@ namespace DfoServer.Network.Handlers.Dungeon
     // Resource-classified special entry, not a replacement SELECT handler or
     // another run/loading state machine. This batch does not execute waves or
     // settle Guardian rewards. It must never enter ordinary maze/hell/card paths.
-    internal sealed class GuardianAltarDungeonCoordinator
+    internal sealed partial class GuardianAltarDungeonCoordinator
     {
         private readonly GuardianAltarOpeningService _opening;
         private readonly IGuardianAltarProgressService _progress;
@@ -47,7 +47,9 @@ namespace DfoServer.Network.Handlers.Dungeon
             Func<DateTimeOffset> utcNow = null,
             Func<EnhancedClientSession, Func<IReadOnlyList<byte[]>>, Task> send = null,
             Func<int, bool> isGuardianDungeon = null,
-            Func<EnhancedClientSession, DungeonRunIdentity, Task> onEntered = null)
+            Func<EnhancedClientSession, DungeonRunIdentity, Task> onEntered = null,
+            Func<long> monotonicMilliseconds = null,
+            Func<EnhancedClientSession, Func<IReadOnlyList<byte[]>>, Func<bool>, Task> sendPause = null)
         {
             _opening = opening ?? throw new ArgumentNullException(nameof(opening));
             _progress = progress ?? throw new ArgumentNullException(nameof(progress));
@@ -69,6 +71,9 @@ namespace DfoServer.Network.Handlers.Dungeon
                     StringComparison.OrdinalIgnoreCase) || !string.IsNullOrWhiteSpace(dungeon.AdvanceAltarType));
             });
             _onEntered = onEntered ?? ((_, _) => Task.CompletedTask);
+            _monotonicMilliseconds = monotonicMilliseconds ?? (() => Environment.TickCount64);
+            _sendPause = sendPause ?? ((session, prepare, current) =>
+                session.SendPreparedPacketBatchAsync(prepare, current));
         }
 
         internal async Task<bool> TryHandleSelectDungeonAsync(EnhancedClientSession session,

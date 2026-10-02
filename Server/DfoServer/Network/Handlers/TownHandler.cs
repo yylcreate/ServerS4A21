@@ -599,12 +599,13 @@ namespace DfoServer.Network.Handlers
 
         internal Task<bool> TrySendFinishLoadingCompletionAsync(
             EnhancedClientSession session,
-            Func<bool> canContinue)
+            Func<bool> canContinue,
+            Action onReleased = null)
             => SendFinishLoadingCompletionCoreAsync(
                 canContinue,
                 (packet, fence) => session.TrySendPacketAsync(
                     packet, CancellationToken.None, fence),
-                () => _growthCapsule.SendExpProgressAsync(session, "finish-loading"));
+                () => _growthCapsule.SendExpProgressAsync(session, "finish-loading"), onReleased);
 
         // Shared guarded path: the transport must evaluate the same source
         // fence inside its send lock. The ordinary unguarded town call above
@@ -612,7 +613,8 @@ namespace DfoServer.Network.Handlers
         internal static async Task<bool> SendFinishLoadingCompletionCoreAsync(
             Func<bool> canContinue,
             Func<byte[], Func<bool>, Task<bool>> send,
-            Func<Task> afterCompletion = null)
+            Func<Task> afterCompletion = null,
+            Action onReleased = null)
         {
             ArgumentNullException.ThrowIfNull(canContinue);
             ArgumentNullException.ThrowIfNull(send);
@@ -623,6 +625,10 @@ namespace DfoServer.Network.Handlers
                 FinishLoadingBuilder.BuildNotification());
             if (!await send(packet, canContinue) || !canContinue())
                 return false;
+            // A local mechanism observes the successful release before an
+            // unrelated follow-up. Growth notification failure cannot undo a
+            // FINISH_LOADING frame that the client has already received.
+            onReleased?.Invoke();
             if (afterCompletion != null)
                 await afterCompletion();
             return true;
