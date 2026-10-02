@@ -32,6 +32,10 @@ namespace DfoServer.SelfTests
             Section("partial batch projection", () => CheckPartialProjection(Check));
             Section("signed sequence allocation", () => CheckSequence(Check));
             Section("shared active clock", () => CheckEnergyClock(Check));
+            Section("terminal success authority", () => CheckTerminalSuccess(Check));
+            Section("terminal pending projection", () => CheckTerminalPending(Check));
+            Section("terminal failure and abort", () => CheckTerminalFailure(Check));
+            Section("terminal scope fencing", () => CheckTerminalScope(Check));
             Section("definition admission and close", () => CheckBoundary(Check));
             Console.WriteLine($"GUARDIAN_ALTAR_COMBAT_RUNTIME assertions={assertions} failures={failures}");
             return failures;
@@ -301,6 +305,201 @@ namespace DfoServer.SelfTests
             combat.Close();
         }
 
+        private static void CheckTerminalSuccess(Action<string, bool> check)
+        {
+            var identity = Identity();
+            var runtime = Runtime(Phases((1000, "1 -1 -1")), "1 1 0 500 1",
+                centerSequences: new ushort[] { 0 });
+            check("unbound combat cannot authorize terminal success",
+                !runtime.TryComplete(identity, 1, 1000, out var unbound) && unbound == null);
+            runtime.BindLoadingRelease(identity, 1);
+            check("an empty enemy roster before the first phase cannot authorize success",
+                !runtime.TryComplete(identity, 1, 0, out var initial) && initial == null);
+            var batch = Reserve(runtime, 0);
+            Publish(runtime, batch);
+            runtime.TryApplyDeath(identity, 1, batch.Spawns[0].SequenceId, out _);
+            check("all current enemies dead still waits for the final phase boundary",
+                runtime.AliveCount == 0 && !runtime.TryComplete(identity, 1, 500, out var waiting)
+                && waiting == null && !runtime.IsTerminal);
+            runtime.TryReserveDue(1000, identity, 1, out _, out _);
+            var ticket = runtime.Timers.Begin(new RunTimerKey("guardian-altar", "terminal-test"));
+            check("all phases and summons ended with no enemies and a surviving center freezes success once",
+                runtime.TryComplete(identity, 1, 1000, out var success)
+                && success.Result == GuardianAltarTerminalResult.Succeeded && success.EventId != Guid.Empty
+                && success.Identity.Equals(identity) && success.LoadingGeneration == 1
+                && success.ActiveMilliseconds == 1000 && runtime.IsTerminal
+                && runtime.NextDueActiveMilliseconds == null && !runtime.Timers.IsCurrent(ticket));
+            var fact = runtime.TerminalFact;
+            check("duplicate completion reads the same event, time and result without rewriting authority",
+                runtime.TryComplete(identity, 1, 100000, out var repeated) && ReferenceEquals(fact, repeated)
+                && repeated.ActiveMilliseconds == 1000 && repeated.EventId == fact.EventId);
+            check("late center death cannot overwrite a succeeded result",
+                !runtime.TryFailCenter(identity, 1, 0, 100000, out var lateFailure)
+                && ReferenceEquals(fact, lateFailure) && runtime.TerminalFact.Result == GuardianAltarTerminalResult.Succeeded);
+            check("terminal success blocks new waves, allocations and death mutations",
+                !runtime.TryReserveDue(100000, identity, 1, out _, out _)
+                && !runtime.TryAllocateSequence(identity, 1, out _)
+                && !runtime.TryApplyDeath(identity, 1, batch.Spawns[0].SequenceId, out _)
+                && !runtime.CanAcceptActorDeath(identity, 1, batch.Spawns[0].SequenceId)
+                && !runtime.CanAcceptCenterDeath(identity, 1, 0)
+                && !runtime.TryCommitRegistered(batch) && !runtime.TryMarkProjected(batch)
+                && runtime.AliveCount == 0 && ReferenceEquals(runtime.TerminalFact, fact));
+            runtime.Close();
+            check("cleanup after completed success preserves the original fact and forbids a new success request",
+                ReferenceEquals(runtime.TerminalFact, fact)
+                && !runtime.TryComplete(identity, 1, 100000, out _));
+
+            var lastDeath = Runtime(Phases((1000, "1 -1 -1")), "1 1 0 500 1",
+                centerSequences: new ushort[] { 0 });
+            lastDeath.BindLoadingRelease(identity, 1);
+            var aliveBatch = Reserve(lastDeath, 0);
+            Publish(lastDeath, aliveBatch);
+            lastDeath.TryReserveDue(1000, identity, 1, out _, out _);
+            check("phase time ending cannot authorize success while an enemy is still alive",
+                !lastDeath.TryComplete(identity, 1, 1000, out _) && lastDeath.AliveCount == 1);
+            check("last canonical death after timeline end enables the same dedicated completion owner",
+                lastDeath.TryApplyDeath(identity, 1, aliveBatch.Spawns[0].SequenceId, out var changed) && changed
+                && lastDeath.TryComplete(identity, 1, 1250, out var lastFact)
+                && lastFact.Result == GuardianAltarTerminalResult.Succeeded && lastFact.ActiveMilliseconds == 1250);
+            lastDeath.Close();
+        }
+
+        private static void CheckTerminalPending(Action<string, bool> check)
+        {
+            var identity = Identity();
+            var runtime = Runtime(Phases((1000, "1 -1 -1")), "1 1 0 500 1 2 0 500 1",
+                centerSequences: new ushort[] { 0 });
+            runtime.BindLoadingRelease(identity, 1);
+            var batch = Reserve(runtime, 0);
+            check("an unregistered pending batch prevents a fabricated empty-roster completion",
+                !runtime.TryComplete(identity, 1, 1000, out _) && runtime.RetainForRetry(batch)
+                && runtime.TryReserveDue(1000, identity, 1, out var retry, out _)
+                && ReferenceEquals(batch, retry));
+            runtime.TryCommitRegistered(batch);
+            foreach (var spawn in batch.Spawns)
+                runtime.TryApplyDeath(identity, 1, spawn.SequenceId, out _);
+            runtime.TryRecordSpawnProjected(batch, 0);
+            check("all enemies dead cannot bypass an unfinished tail frame or pending batch",
+                runtime.AliveCount == 0 && !runtime.TryComplete(identity, 1, 1100, out _)
+                && !runtime.TryMarkProjected(batch) && runtime.GetProjectionOffset(batch) == 1
+                && runtime.TryReserveDue(1100, identity, 1, out retry, out _)
+                && ReferenceEquals(batch, retry) && runtime.GetProjectionOffset(retry) == 1);
+            runtime.TryRecordSpawnProjected(batch, 1);
+            runtime.TryMarkProjected(batch);
+            check("projection completion alone does not invent the timeline-end fact",
+                !runtime.TryComplete(identity, 1, 1100, out _));
+            runtime.TryReserveDue(1100, identity, 1, out _, out _);
+            check("retained projection completes without another registration or duplicate completion effect",
+                runtime.TryComplete(identity, 1, 1100, out var success)
+                && runtime.TryComplete(identity, 1, 1500, out var repeated)
+                && ReferenceEquals(success, repeated) && runtime.AliveCount == 0);
+            runtime.Close();
+        }
+
+        private static void CheckTerminalFailure(Action<string, bool> check)
+        {
+            var identity = Identity();
+            var runtime = Runtime(Phases((5000, "1 -1 -1")), "1 1 0 500 0",
+                centerSequences: new ushort[] { 0 });
+            runtime.BindLoadingRelease(identity, 1);
+            var batch = Reserve(runtime, 0);
+            runtime.TryCommitRegistered(batch);
+            var ticket = runtime.Timers.Begin(new RunTimerKey("guardian-altar", "center-failure-test"));
+            check("center death is admitted only from the explicitly frozen static sequence including zero",
+                runtime.CanAcceptCenterDeath(identity, 1, 0)
+                && !runtime.CanAcceptCenterDeath(identity, 1, batch.Spawns[0].SequenceId)
+                && !runtime.TryFailCenter(identity, 1, batch.Spawns[0].SequenceId, 100, out _));
+            check("no surviving configured center freezes failure before remaining waves or enemies finish",
+                runtime.TryFailCenter(identity, 1, 0, 100, out var failed)
+                && failed.Result == GuardianAltarTerminalResult.Failed && failed.ActiveMilliseconds == 100
+                && failed.EventId != Guid.Empty && runtime.IsTerminal && !runtime.Timers.IsCurrent(ticket)
+                && runtime.NextDueActiveMilliseconds == null && runtime.AliveCount == 1);
+            var fact = runtime.TerminalFact;
+            check("duplicate center failure returns the same fact and late success cannot replace it",
+                runtime.TryFailCenter(identity, 1, 0, 10000, out var duplicate) && ReferenceEquals(fact, duplicate)
+                && !runtime.TryComplete(identity, 1, 10000, out var falseSuccess) && ReferenceEquals(fact, falseSuccess));
+            check("failure blocks all pending projection and late enemy-death mutations",
+                !runtime.TryCommitRegistered(batch) && !runtime.TryRecordSpawnProjected(batch, 0)
+                && !runtime.TryMarkProjected(batch) && !runtime.RetainForRetry(batch)
+                && !runtime.TryApplyDeath(identity, 1, batch.Spawns[0].SequenceId, out _)
+                && !runtime.TryAllocateSequence(identity, 1, out _) && runtime.AliveCount == 1);
+            runtime.Close();
+            check("closing a failed run preserves its stable failure event", ReferenceEquals(fact, runtime.TerminalFact));
+
+            var multiple = Runtime(Phases((1000, "1 -1 -1")), "1 1 0 500 1", firstSequence: 2,
+                centerSequences: new ushort[] { 0, 1 });
+            multiple.BindLoadingRelease(identity, 1);
+            check("one surviving configured center prevents failure and repeated partial death is idempotent",
+                multiple.TryFailCenter(identity, 1, 0, 100, out var partial) && partial == null
+                && !multiple.CanAcceptCenterDeath(identity, 1, 0) && multiple.CanAcceptCenterDeath(identity, 1, 1)
+                && multiple.TryFailCenter(identity, 1, 0, 200, out partial) && partial == null && !multiple.IsTerminal);
+            check("failure occurs only after the last frozen center dies",
+                multiple.TryFailCenter(identity, 1, 1, 300, out var allDead)
+                && allDead.Result == GuardianAltarTerminalResult.Failed);
+            multiple.Close();
+
+            var aborted = Runtime(Phases((1000, "1 -1 -1")), "1 1 0 500 1",
+                centerSequences: new ushort[] { 0 });
+            aborted.BindLoadingRelease(identity, 1);
+            Publish(aborted, Reserve(aborted, 0));
+            aborted.TryReserveDue(500, identity, 1, out _, out _);
+            aborted.Close();
+            var abortFact = aborted.TerminalFact;
+            check("exit creates an aborted fact and cleared cleanup counters can never authorize success",
+                abortFact is { Result: GuardianAltarTerminalResult.Aborted, ActiveMilliseconds: 500 }
+                && aborted.IsClosed && aborted.IsTerminal && aborted.AliveCount == 0
+                && !aborted.TryComplete(identity, 1, 1000, out _)
+                && !aborted.TryFailCenter(identity, 1, 0, 1000, out _));
+            aborted.Close();
+            check("repeated exit preserves the same abort event", ReferenceEquals(abortFact, aborted.TerminalFact));
+        }
+
+        private static void CheckTerminalScope(Action<string, bool> check)
+        {
+            var identity = Identity();
+            var runtime = Runtime(Phases((1000, "1 -1 -1")), "1 1 0 500 1",
+                centerSequences: new ushort[] { 0 });
+            runtime.BindLoadingRelease(identity, 5);
+            var batch = Reserve(runtime, 0, generation: 5);
+            Publish(runtime, batch);
+            runtime.TryApplyDeath(identity, 5, batch.Spawns[0].SequenceId, out _);
+            runtime.TryReserveDue(1000, identity, 5, out _, out _);
+            foreach (var mismatch in new[]
+            {
+                Identity(instanceId: 2), Identity(runId: 2), Identity(runGeneration: 2), Identity(roomId: 2)
+            })
+                check("old instance, run or room cannot complete or fail the current terminal owner",
+                    !runtime.TryComplete(mismatch, 5, 100000, out var wrongSuccess) && wrongSuccess == null
+                    && !runtime.CanAcceptCenterDeath(mismatch, 5, 0)
+                    && !runtime.TryFailCenter(mismatch, 5, 0, 100000, out var wrongFailure) && wrongFailure == null
+                    && runtime.TerminalFact == null);
+            check("old loading generation and negative active time cannot create terminal authority",
+                !runtime.TryComplete(identity, 4, 100000, out _)
+                && !runtime.TryFailCenter(identity, 4, 0, 100000, out _)
+                && !runtime.TryComplete(identity, 5, -1, out _)
+                && !runtime.TryFailCenter(identity, 5, 0, -1, out _) && runtime.TerminalFact == null);
+            check("rejected old sources cannot advance the current terminal timestamp",
+                runtime.TryComplete(identity, 5, 1000, out var success) && success.ActiveMilliseconds == 1000);
+            runtime.Close();
+
+            var noCenters = Runtime(Phases((1000, "1 -1 -1")), "1 1 0 500 1");
+            noCenters.BindLoadingRelease(identity, 1);
+            var enemy = Reserve(noCenters, 0);
+            Publish(noCenters, enemy);
+            noCenters.TryApplyDeath(identity, 1, enemy.Spawns[0].SequenceId, out _);
+            noCenters.TryReserveDue(1000, identity, 1, out _, out _);
+            check("absent frozen failure centers do not imply a surviving center or authorize default sequence zero",
+                !noCenters.TryComplete(identity, 1, 1000, out _)
+                && !noCenters.CanAcceptCenterDeath(identity, 1, 0)
+                && !noCenters.TryFailCenter(identity, 1, 0, 1000, out _) && noCenters.TerminalFact == null);
+            noCenters.Close();
+            check("duplicate or overlapping center sequences are rejected before actor allocation",
+                Throws<InvalidDataException>(() => Runtime(Phases((1000, "1 -1 -1")), "1 1 0 500 1",
+                    centerSequences: new ushort[] { 0, 0 }))
+                && Throws<InvalidDataException>(() => Runtime(Phases((1000, "1 -1 -1")), "1 1 0 500 1",
+                    centerSequences: new ushort[] { 1 })));
+        }
+
         private static void CheckBoundary(Action<string, bool> check)
         {
             var map = GuardianAltarMapFile.Parse(Phases((1000, "1 -1 -1")));
@@ -340,19 +539,21 @@ namespace DfoServer.SelfTests
                 && !closed.TryApplyDeath(identity, 1, pending.Spawns[0].SequenceId, out _));
         }
 
-        private static GuardianAltarCombatRuntime Runtime(string map, string action, int firstSequence = 1)
-            => Runtime(map, new[] { action }, firstSequence);
+        private static GuardianAltarCombatRuntime Runtime(string map, string action, int firstSequence = 1,
+            ushort[] centerSequences = null)
+            => Runtime(map, new[] { action }, firstSequence, centerSequences);
 
         private static GuardianAltarCombatRuntime Runtime(string map, string firstAction, string secondAction)
             => Runtime(map, new[] { firstAction, secondAction });
 
-        private static GuardianAltarCombatRuntime Runtime(string map, string[] actions, int firstSequence = 1)
+        private static GuardianAltarCombatRuntime Runtime(string map, string[] actions, int firstSequence = 1,
+            ushort[] centerSequences = null)
             => new GuardianAltarCombatRuntime(GuardianAltarMapFile.Parse(map),
                 GuardianAltarSummonDataFile.Parse(Definition(
                     "1 `enemy` `normal` 64599 1 1 1682 265 0\n"
                     + "2 `enemy` `normal` 64600 1 1 1682 265 0\n"
                     + "3 `enemy` `named` 64601 1 1 1682 265 0\n"
-                    + "4 `enemy` `boss` 64602 1 1 1682 265 0", actions)), firstSequence);
+                    + "4 `enemy` `boss` 64602 1 1 1682 265 0", actions)), firstSequence, centerSequences);
 
         private static string Definition(string objects, params string[] actions)
             => "[summon object]\n" + objects + "\n[/summon object]\n[action define]\n"

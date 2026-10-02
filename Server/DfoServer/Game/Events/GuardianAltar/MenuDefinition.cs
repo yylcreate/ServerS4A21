@@ -22,6 +22,8 @@ namespace DfoServer.Game.Events.GuardianAltar
         private readonly Func<int, MapFile> _mapLoader;
         private readonly GuardianAltarEnergyConfigFile _energy;
         private readonly GuardianAltarSummonDataFile _summonData;
+        private readonly IReadOnlyList<GuardianAltarStageDefinition> _orderedStages;
+        private readonly Func<int, GuardianAltarClearRewardFile> _clearRewardLoader;
 
         internal GuardianAltarMenuDefinition(int dailyRefillTicket, int ridableId,
             int firstDungeonId, IEnumerable<GuardianAltarPurchase> initialPurchases,
@@ -33,7 +35,9 @@ namespace DfoServer.Game.Events.GuardianAltar
             Func<int, GuardianAltarDungeonFile> dungeonLoader = null,
             Func<int, MapFile> mapLoader = null,
             GuardianAltarEnergyConfigFile energy = null,
-            GuardianAltarSummonDataFile summonData = null)
+            GuardianAltarSummonDataFile summonData = null,
+            IEnumerable<GuardianAltarStageDefinition> orderedStages = null,
+            Func<int, GuardianAltarClearRewardFile> clearRewardLoader = null)
         {
             if (dailyRefillTicket < 0 || ridableId <= 0 || firstDungeonId <= 0)
                 throw new ArgumentOutOfRangeException(nameof(dailyRefillTicket));
@@ -51,6 +55,10 @@ namespace DfoServer.Game.Events.GuardianAltar
             _mapLoader = mapLoader;
             _energy = energy;
             _summonData = summonData;
+            _orderedStages = Array.AsReadOnly((orderedStages ?? Array.Empty<GuardianAltarStageDefinition>())
+                .Where(x => !x.IsSurvival).OrderBy(x => x.AreaId).ThenBy(x => x.DistrictId)
+                .ThenBy(x => x.StageOrder).ToArray());
+            _clearRewardLoader = clearRewardLoader;
             ValidateProgress(new GuardianAltarProgressSnapshot(1,
                 new GuardianAltarHeader(ridableId, dailyRefillTicket, 0, 0, 0, 0, 0, 0, 0, 0),
                 new[] { new GuardianAltarStage(firstDungeonId, -1) },
@@ -72,6 +80,8 @@ namespace DfoServer.Game.Events.GuardianAltar
             if (!ContainsDungeon(dungeonId) || difficulty > 2
                 || !progress.Stages.Any(x => x.DungeonId == dungeonId))
                 throw new InvalidOperationException("Guardian stage is not unlocked or difficulty is invalid.");
+            if (difficulty > progress.Stages.Single(x => x.DungeonId == dungeonId).Progress + 1)
+                throw new InvalidOperationException("Guardian difficulties must be cleared in sequence.");
             if ((long)progress.Header.FreeTickets + progress.Header.SecondaryTickets <= 0)
                 throw new InvalidOperationException("Guardian stage requires an available ticket.");
             if (_dungeonLoader == null || _mapLoader == null)
@@ -121,7 +131,8 @@ namespace DfoServer.Game.Events.GuardianAltar
                     || purchased.Level > byte.MaxValue || (int)monster.Type > 3)
                     throw new InvalidDataException("Guardian center upgrade cannot be represented by the current protocol.");
                 centers.Add(new GuardianAltarCenterSpawn((ushort)rows[0].Index,
-                    (byte)purchased.Level, (byte)monster.Type));
+                    (byte)purchased.Level, (byte)monster.Type,
+                    guardianMap.CenterIndices.Contains(monster.MonsterId.Value)));
                 learnedCenters.Add(purchased.ResourceId);
             }
             if (guardianMap.CenterIndices.Any(x => !learnedCenters.Contains(x)))
@@ -147,9 +158,40 @@ namespace DfoServer.Game.Events.GuardianAltar
                     checked(item.AdvanceAltarNeedGage.Value * _energy.Scale),
                     item.CoolTime, cooldownGroup.ToString(CultureInfo.InvariantCulture)));
             }
+            GuardianAltarClearCommitPlan clearPlan = null;
+            if (_clearRewardLoader != null)
+            {
+                var reward = _clearRewardLoader(dungeonId);
+                if (reward == null || !reward.IsValid)
+                    throw new InvalidDataException("Guardian clear rewards are unavailable: " + reward?.InvalidReason);
+                clearPlan = new GuardianAltarClearCommitPlan(CreateClearProgressPlan(dungeonId, difficulty),
+                    reward.Difficulties.Single(x => x.DifficultyName == difficultyName).Items);
+            }
             return new GuardianAltarDungeonStartPlan(dungeonId, difficulty, selected.MapId,
                 selected.MapBasisLevel, guardianMap.TotalDurationMilliseconds, summaries, centers, progress,
-                _energy, guardianMap, _summonData, units);
+                _energy, guardianMap, _summonData, units, clearPlan);
+        }
+
+        // The current ordinary catalog owns stage order. Neither coordinates,
+        // numeric dungeon adjacency nor a capture authorizes the next stage.
+        internal GuardianAltarClearProgressPlan CreateClearProgressPlan(int dungeonId, byte difficulty)
+        {
+            var index = _orderedStages.ToList().FindIndex(x => x.DungeonId == dungeonId);
+            if (index < 0 || difficulty > 2)
+                throw new InvalidOperationException("Guardian ordinary clear has no catalog stage.");
+            var next = index + 1 < _orderedStages.Count
+                ? new[] { _orderedStages[index + 1].DungeonId } : Array.Empty<int>();
+            var purchases = _shopEntries.Where(x => x.UnlockStageIndex == dungeonId).Select(x =>
+            {
+                var level = x.Levels.SingleOrDefault(row => row.Level == 0)
+                    ?? x.Levels.SingleOrDefault(row => row.Level == 1)
+                    ?? throw new InvalidDataException("Guardian unlock purchase has no initial level.");
+                return new GuardianAltarPurchase(x.ShopType, x.ResourceId, level.Level, level.Price);
+            });
+            // Verified StageDifficulty order easy/medium/hard and kRewardStar.
+            // Each new difficulty grants its own stars; replays grant none.
+            return new GuardianAltarClearProgressPlan(RidableId, dungeonId, difficulty,
+                new[] { 3, 2, 1 }[difficulty], next, purchases);
         }
 
         internal void ValidateProgress(GuardianAltarProgressSnapshot snapshot)
@@ -181,7 +223,8 @@ namespace DfoServer.Game.Events.GuardianAltar
                 id => GuardianAltarDungeonFile.Parse(DungeonCatalog.GetDungeonFile(id)),
                 LoadRegisteredMap,
                 GuardianAltarSummonDataFile.Parse(PvfArchiveAccessor.ReadText(
-                    "etc/advancealtar/advancealtarsummondata.etc")));
+                    "etc/advancealtar/advancealtarsummondata.etc")),
+                id => GuardianAltarClearRewardFile.Parse(DungeonCatalog.GetDungeonFile(id)));
         }
 
         internal static MapFile LoadRegisteredMap(int mapId)
@@ -196,7 +239,8 @@ namespace DfoServer.Game.Events.GuardianAltar
             IEnumerable<int> knownAchievementIds = null,
             Func<int, GuardianAltarDungeonFile> dungeonLoader = null,
             Func<int, MapFile> mapLoader = null,
-            GuardianAltarSummonDataFile summonData = null)
+            GuardianAltarSummonDataFile summonData = null,
+            Func<int, GuardianAltarClearRewardFile> clearRewardLoader = null)
         {
             ArgumentNullException.ThrowIfNull(config);
             ArgumentNullException.ThrowIfNull(stageMap);
@@ -245,7 +289,7 @@ namespace DfoServer.Game.Events.GuardianAltar
                 ridable.Entries.SelectMany(x => x.Levels.Select(level =>
                     new GuardianAltarPurchase(x.ShopType, x.ResourceId, level.Level, level.Price))),
                 knownAchievementIds, ridable.Entries, dungeonLoader, mapLoader,
-                GuardianAltarEnergyConfigFile.Parse(config), summonData);
+                GuardianAltarEnergyConfigFile.Parse(config), summonData, stageMap.Stages, clearRewardLoader);
         }
     }
 }

@@ -58,6 +58,8 @@ namespace DfoServer.SelfTests
                 Section("Guardian source fencing", () => CheckFencesAsync(Check, definition).GetAwaiter().GetResult());
                 Section("Guardian failure cleanup", () => CheckFailuresAsync(Check, definition).GetAwaiter().GetResult());
                 Section("Guardian energy coordinator", () => CheckEnergyAsync(Check, definition).GetAwaiter().GetResult());
+                Section("Guardian formal clear resource plans", () => CheckClearPlans(Check, definition));
+                Section("Guardian dedicated failed settlement", () => CheckFailedClearAsync(Check, definition).GetAwaiter().GetResult());
             }
             Console.WriteLine($"GUARDIAN_ALTAR_DUNGEON_ENTRY assertions={assertions} failures={failures}");
             return failures;
@@ -109,11 +111,20 @@ namespace DfoServer.SelfTests
             var expectedMaps = new[] { 25081, 25082, 25083 };
             for (byte difficulty = 0; difficulty < 3; difficulty++)
             {
-                var plan = definition.CreateStartPlan(definition.FirstDungeonId, difficulty, progress);
+                var unlocked = Copy(progress, stages: new[]
+                    { new GuardianAltarStage(definition.FirstDungeonId, difficulty - 1) });
+                var plan = definition.CreateStartPlan(definition.FirstDungeonId, difficulty, unlocked);
                 check($"real difficulty {difficulty} selects its own Guardian MAP",
                     plan.DungeonId == definition.FirstDungeonId && plan.Difficulty == difficulty
-                    && plan.MapId == expectedMaps[difficulty] && ReferenceEquals(plan.Progress, progress));
+                    && plan.MapId == expectedMaps[difficulty] && ReferenceEquals(plan.Progress, unlocked));
             }
+            check("fresh stage permits easy but rejects medium and hard without a completed earlier difficulty",
+                Throws<InvalidOperationException>(() => definition.CreateStartPlan(definition.FirstDungeonId, 1, progress))
+                && Throws<InvalidOperationException>(() => definition.CreateStartPlan(definition.FirstDungeonId, 2, progress)));
+            var easyCleared = Copy(progress, stages: new[] { new GuardianAltarStage(definition.FirstDungeonId, 0) });
+            check("completed easy stage permits medium but cannot skip directly to hard",
+                definition.CreateStartPlan(definition.FirstDungeonId, 1, easyCleared).Difficulty == 1
+                && Throws<InvalidOperationException>(() => definition.CreateStartPlan(definition.FirstDungeonId, 2, easyCleared)));
             var fresh = definition.CreateStartPlan(definition.FirstDungeonId, 0, progress);
             var stage = GuardianAltarDungeonPacketBuilder.BuildStageInfo(fresh);
             var map = GuardianAltarDungeonPacketBuilder.BuildStartMap(fresh);
@@ -137,6 +148,9 @@ namespace DfoServer.SelfTests
                 I32(map, 52) == 0 && U16(map, 56) == 0 && U16(map, 58) == center.MonsterCode
                 && map[60] == center.Level && map[61] == center.MonsterType
                 && map.AsSpan(62, 3).SequenceEqual(new byte[3]));
+            check("real failure center belongs to the dedicated START_MAP wire sequence zero",
+                center.IsFailureCenter && U16(map, 56) == 0
+                && fresh.CombatMap.CenterIndices.Contains(center.MonsterCode));
 
             // Serialization fixture only: current real fresh PVF has one center.
             // Copy its valid plan/center and vary the second row deliberately;
@@ -197,6 +211,67 @@ namespace DfoServer.SelfTests
                     fresh.DungeonId, fresh.Difficulty, fresh.MapId, fresh.MapBasisLevel, 257,
                     Enumerable.Range(0, 257).Select(i => new GuardianAltarPhaseSummary(i, i, 0)),
                     fresh.Centers, fresh.Progress)));
+        }
+
+        private static void CheckClearPlans(Action<string, bool> check, GuardianAltarMenuDefinition definition)
+        {
+            var stageList = PvfLib.LstFile.Parse(GameWorld.PvfArchiveAccessor.ReadText("stagemap/stagemap.lst"));
+            var stageEntry = stageList.GetById(definition.RidableId)
+                ?? throw new InvalidDataException("Current Guardian ridable has no formal stage-map registration.");
+            var stageMap = PvfLib.GuardianAltarStageMapFile.Parse(
+                GameWorld.PvfArchiveAccessor.ReadText("stagemap/" + stageEntry.FilePath));
+            if (!stageMap.IsValid) throw new InvalidDataException(stageMap.InvalidReason);
+            var ordered = stageMap.Stages.Where(x => !x.IsSurvival).OrderBy(x => x.AreaId)
+                .ThenBy(x => x.DistrictId).ThenBy(x => x.StageOrder).ToArray();
+            check("formal Guardian stage map supplies twelve ordinary clear-resource owners", ordered.Length == 12);
+            var covered = 0;
+            for (var stageIndex = 0; stageIndex < ordered.Length; stageIndex++)
+            {
+                var dungeonId = ordered[stageIndex].DungeonId;
+                var shared = GameWorld.DungeonCatalog.GetDungeonFile(dungeonId);
+                var rewards = PvfLib.GuardianAltarClearRewardFile.Parse(shared);
+                if (!rewards.IsValid) throw new InvalidDataException(rewards.InvalidReason);
+                for (byte difficulty = 0; difficulty < 3; difficulty++)
+                {
+                    var fresh = Fresh(definition, 1);
+                    var stages = fresh.Stages.Where(x => x.DungeonId != dungeonId)
+                        .Append(new GuardianAltarStage(dungeonId, difficulty - 1));
+                    var progress = Copy(fresh, stages: stages);
+                    var plan = definition.CreateStartPlan(dungeonId, difficulty, progress);
+                    var expected = rewards.Difficulties.Single(x =>
+                        x.DifficultyName == new[] { "easy", "medium", "hard" }[difficulty]);
+                    var next = stageIndex + 1 < ordered.Length
+                        ? new[] { ordered[stageIndex + 1].DungeonId } : Array.Empty<int>();
+                    check($"formal DGN {dungeonId} difficulty {difficulty} freezes exactly its typed rewards and stage progress",
+                        plan.ClearPlan != null && plan.ClearPlan.ProgressPlan.DungeonId == dungeonId
+                        && plan.ClearPlan.ProgressPlan.Difficulty == difficulty
+                        && plan.ClearPlan.ProgressPlan.StarsOnImprovement == new[] { 3, 2, 1 }[difficulty]
+                        && plan.ClearPlan.ProgressPlan.NextDungeonIds.SequenceEqual(next)
+                        && plan.ClearPlan.Rewards.Select(x => (x.Kind, x.ItemId, x.Count))
+                            .SequenceEqual(expected.Items.Select(x => (x.Kind, x.ItemId, x.Count))));
+                    var wire = GuardianAltarDungeonPacketBuilder.BuildStartMap(plan);
+                    var centersOffset = 24 + plan.Phases.Count * 12 + 4;
+                    check($"formal DGN {dungeonId} difficulty {difficulty} preserves the failure center's actual wire index",
+                        plan.Centers.Count > 0 && plan.Centers.Where(x => x.IsFailureCenter).Any()
+                        && plan.Centers.Select((center, index) => !center.IsFailureCenter
+                            || U16(wire, centersOffset + index * 13 + 4) == index).All(x => x));
+                    covered++;
+                }
+            }
+            check("all twelve formal ordinary stages and three difficulties have a frozen clear plan", covered == 36);
+
+            // Catalog-order fixture only: sparse and descending IDs deliberately
+            // rule out numeric adjacency as a next-stage authorization source.
+            var sparse = PvfLib.GuardianAltarStageMapFile.Parse(
+                "[area]\n0\n[district]\n1\n[stage]\n9001 0 0 0\n12001 1 0 0\n7001 2 0 0\n[/stage]\n[/area]\n");
+            if (!sparse.IsValid) throw new InvalidDataException(sparse.InvalidReason);
+            var sparseDefinition = new GuardianAltarMenuDefinition(definition.DailyRefillTicket, definition.RidableId,
+                9001, definition.InitialPurchases, definition.InitialSlots, new[] { 9001, 12001, 7001 },
+                orderedStages: sparse.Stages);
+            check("next ordinary stage follows sparse catalog row order rather than DungeonId plus one",
+                sparseDefinition.CreateClearProgressPlan(9001, 0).NextDungeonIds.SequenceEqual(new[] { 12001 })
+                && sparseDefinition.CreateClearProgressPlan(12001, 1).NextDungeonIds.SequenceEqual(new[] { 7001 })
+                && sparseDefinition.CreateClearProgressPlan(7001, 2).NextDungeonIds.Count == 0);
         }
 
         private static async Task CheckLockOrderAsync(Action<string, bool> check,
@@ -884,6 +959,224 @@ namespace DfoServer.SelfTests
                 replacementGeneration > released.Generation && fixture.Packets.Count == packetCount
                 && combat.AliveCount == 0 && run.Instance.Mechanisms.DynamicActors.Capture(room.Identity,
                     GuardianAltarCombatRuntime.DynamicActorProvider, released.Generation).Count == 0);
+        }
+
+        private static async Task CheckFailedClearAsync(Action<string, bool> check, GuardianAltarMenuDefinition definition)
+        {
+            using (var fixture = new Fixture(definition))
+            {
+                fixture.Open();
+                var session = await fixture.CreateConnectedSessionAsync(401);
+                await ReadyGuardianAsync(fixture, session, definition);
+                var run = fixture.LastRun;
+                var room = fixture.LastRoom;
+                var identity = run.CaptureParticipantRoomIdentity();
+                var combat = run.Instance.Mechanisms.GuardianAltarCombat;
+                var energy = run.Instance.Mechanisms.GuardianAltarEnergy;
+                var eplpHeader = new GamePacketHeader { cmd = 1, type = (ushort)CmdPacketTypeA21.EPLP_COMMAND };
+                var beforeEplp = fixture.Packets.Count;
+                check("Guardian consumes manual return before its EPLP UI without acknowledgement or ordinary fallback",
+                    await fixture.Coordinator.TryHandleEplpCommandAsync(session, eplpHeader, new byte[] { 1, 2 })
+                        .WaitAsync(TimeSpan.FromSeconds(5))
+                    && fixture.Packets.Count == beforeEplp && fixture.ReturnAttempts == 0
+                    && ReferenceEquals(session.Player.CurrentRun, run));
+                combat.Timers.TryGetCurrentTicket(DungeonRunTimerKeys.GuardianAltarWaveSchedule, out var oldWave);
+                var fence = DungeonLoadingCoordinator.CaptureContinuationFence(session, fixture.Sessions, run, room.Identity);
+                var before = fixture.Packets.Count;
+                var applied = await fixture.Coordinator.TryHandleCenterDeathAsync(session, run, 0)
+                    .WaitAsync(TimeSpan.FromSeconds(5));
+                var terminalPackets = fixture.Packets.Skip(before).ToArray();
+                var fact = combat.TerminalFact;
+                check("current failure-center zero enters dedicated DIE and EPLP without a persistent reward owner",
+                    applied && fact?.Result == GuardianAltarTerminalResult.Failed
+                    && terminalPackets.Length == 2
+                    && Type(terminalPackets[0]) == (ushort)NotiPacketTypeA21.DIE_MONSTER
+                    && Type(terminalPackets[1]) == (ushort)NotiPacketTypeA21.ADVANCE_ALTAR_EPLP_STATE
+                    && U16(terminalPackets[0], 15) == 0
+                    && terminalPackets[1].AsSpan(15).SequenceEqual(GuardianAltarClearBodyBuilder.BuildEplpState(0, 1)));
+                check("failed Guardian never creates a normal clear/card UI or a reward commit",
+                    combat.Presentation.CommitResult == null && !combat.Presentation.InventoryProjectionSent
+                    && !combat.Presentation.MenuProjectionSent && !combat.Presentation.ClearProjectionSent
+                    && combat.Presentation.EplpProjectionSent && energy.ReadSnapshot(0).Paused
+                    && !run.RewardPolicy.AllowsClearCommit && !run.RewardPolicy.AllowsSettlement
+                    && !combat.Timers.IsCurrent(oldWave));
+                var returnAt = combat.Presentation.ReturnDeadlineUtc;
+                before = fixture.Packets.Count;
+                await fixture.Coordinator.TryCompleteAsync(session, run).WaitAsync(TimeSpan.FromSeconds(5));
+                await fixture.Coordinator.TryHandleCenterDeathAsync(session, run, 0).WaitAsync(TimeSpan.FromSeconds(5));
+                check("repeated failed completion preserves event and return deadline without another EPLP",
+                    ReferenceEquals(combat.TerminalFact, fact) && combat.Presentation.ReturnDeadlineUtc == returnAt
+                    && fixture.Packets.Skip(before).All(x => Type(x) == (ushort)NotiPacketTypeA21.DIE_MONSTER));
+                before = fixture.Packets.Count;
+                fixture.MonotonicMilliseconds = run.Instance.Mechanisms.GuardianAltar.DurationMilliseconds + 1;
+                await fixture.Coordinator.OnCombatTimerAsync(session, run, identity, fixture.LoadingGeneration,
+                    oldWave, fence).WaitAsync(TimeSpan.FromSeconds(5));
+                check("old phase-end reminder after center failure cannot summon, commit or replace terminal authority",
+                    fixture.Packets.Count == before && ReferenceEquals(combat.TerminalFact, fact)
+                    && combat.Presentation.CommitResult == null && !combat.Timers.IsCurrent(oldWave));
+                before = fixture.Packets.Count;
+                var acknowledgedBeforeReturn = false;
+                fixture.BeforeReturn = () => acknowledgedBeforeReturn = fixture.Packets.Count == before + 1
+                    && fixture.Packets[^1][0] == 1 && Type(fixture.Packets[^1]) == (ushort)CmdPacketTypeA21.EPLP_COMMAND
+                    && fixture.Packets[^1].AsSpan(15).SequenceEqual(new byte[] { 1, 1, 2 })
+                    && ReferenceEquals(session.Player.CurrentRun, run) && run.Matches(identity.Run);
+                var returned = await fixture.Coordinator.TryHandleEplpCommandAsync(session, eplpHeader, new byte[] { 1, 2 })
+                    .WaitAsync(TimeSpan.FromSeconds(5));
+                check("valid failed-stage manual return acknowledges [1,1,2] before returning the original run identity",
+                    returned && acknowledgedBeforeReturn && fixture.ReturnAttempts == 1 && fixture.ReturnApplied == 1
+                    && session.Player.CurrentRun == null && run.RunState == DungeonRunState.Ended);
+            }
+
+            using (var fixture = new Fixture(definition))
+            {
+                fixture.Open();
+                var session = await fixture.CreateConnectedSessionAsync(402);
+                await ReadyGuardianAsync(fixture, session, definition);
+                var run = fixture.LastRun;
+                var room = fixture.LastRoom;
+                var combat = run.Instance.Mechanisms.GuardianAltarCombat;
+                var replacement = room.RegisterLoadingProjection(run.CaptureIdentity(),
+                    DungeonMapHandler.CreateLoadingProjectionId(), new[] { run.CaptureIdentity() }, out _);
+                var before = fixture.Packets.Count;
+                var consumed = await fixture.Coordinator.TryHandleCenterDeathAsync(session, run, 0)
+                    .WaitAsync(TimeSpan.FromSeconds(5));
+                check("old loaded generation's center request is consumed without failing or projecting the newer room",
+                    consumed && replacement > fixture.LoadingGeneration && fixture.Packets.Count == before
+                    && combat.TerminalFact == null && !combat.Presentation.EplpProjectionSent);
+            }
+
+            using (var fixture = new Fixture(definition))
+            {
+                fixture.Open();
+                var session = await fixture.CreateConnectedSessionAsync(403);
+                await ReadyGuardianAsync(fixture, session, definition);
+                var run = fixture.LastRun;
+                var combat = run.Instance.Mechanisms.GuardianAltarCombat;
+                var before = fixture.Packets.Count;
+                fixture.BeforePausePrepare = () => session.GameSession = GameSessionIdentity();
+                await fixture.Coordinator.TryHandleCenterDeathAsync(session, run, 0).WaitAsync(TimeSpan.FromSeconds(5));
+                check("GameSession replacement before center DIE write fences the captured old terminal projection",
+                    fixture.Packets.Count == before && combat.TerminalFact?.Result == GuardianAltarTerminalResult.Failed
+                    && !combat.Presentation.EplpProjectionSent && combat.Presentation.CommitResult == null);
+            }
+
+            using (var fixture = new Fixture(definition))
+            {
+                fixture.Open();
+                var session = await fixture.CreateConnectedSessionAsync(404);
+                await ReadyGuardianAsync(fixture, session, definition);
+                var run = fixture.LastRun;
+                var combat = run.Instance.Mechanisms.GuardianAltarCombat;
+                fixture.PauseSendError = new IOException("injected failure before center DIE projection");
+                var error = await ObserveAsync(async () =>
+                    await fixture.Coordinator.TryHandleCenterDeathAsync(session, run, 0).WaitAsync(TimeSpan.FromSeconds(5)));
+                check("failed first center write retains terminal authority and schedules the dedicated continuation",
+                    error == null && combat.TerminalFact?.Result == GuardianAltarTerminalResult.Failed
+                    && !combat.Presentation.EplpProjectionSent
+                    && combat.Timers.TryGetCurrentTicket(DungeonRunTimerKeys.GuardianAltarClearPresentation, out _));
+                var fact = combat.TerminalFact;
+                var before = fixture.Packets.Count;
+                fixture.PauseSendError = null;
+                await fixture.Coordinator.TryCompleteAsync(session, run).WaitAsync(TimeSpan.FromSeconds(5));
+                check("authorized retry resumes failed EPLP without awarding items or entering ordinary settlement",
+                    ReferenceEquals(combat.TerminalFact, fact) && combat.Presentation.EplpProjectionSent
+                    && combat.Presentation.CommitResult == null && !combat.Presentation.ClearProjectionSent
+                    && fixture.Packets.Skip(before).Any(x => Type(x) == (ushort)NotiPacketTypeA21.ADVANCE_ALTAR_EPLP_STATE)
+                    && fixture.Packets.Skip(before).All(x => Type(x) == (ushort)NotiPacketTypeA21.DIE_MONSTER
+                        || Type(x) == (ushort)NotiPacketTypeA21.ADVANCE_ALTAR_EPLP_STATE));
+            }
+
+            using (var fixture = new Fixture(definition))
+            {
+                fixture.Open();
+                var session = await fixture.CreateConnectedSessionAsync(405);
+                await ReadyGuardianAsync(fixture, session, definition);
+                var run = fixture.LastRun;
+                var room = fixture.LastRoom;
+                var identity = run.CaptureParticipantRoomIdentity();
+                var combat = run.Instance.Mechanisms.GuardianAltarCombat;
+                var fence = DungeonLoadingCoordinator.CaptureContinuationFence(session, fixture.Sessions, run, room.Identity);
+                var callbacks = 0;
+                while (!combat.IsTerminal && combat.NextDueActiveMilliseconds is { } due && callbacks++ < 32)
+                {
+                    fixture.MonotonicMilliseconds = due;
+                    if (!combat.Timers.TryGetCurrentTicket(DungeonRunTimerKeys.GuardianAltarWaveSchedule, out var ticket))
+                        throw new InvalidOperationException("Guardian end-boundary test lost its current reminder.");
+                    await fixture.Coordinator.OnCombatTimerAsync(session, run, identity, fixture.LoadingGeneration,
+                        ticket, fence).WaitAsync(TimeSpan.FromSeconds(5));
+                    foreach (var actor in run.Instance.Mechanisms.DynamicActors.Capture(room.Identity,
+                        GuardianAltarCombatRuntime.DynamicActorProvider, fixture.LoadingGeneration))
+                        if (DungeonKillApplicationService.CanAcceptGuardianActorDeath(run, actor))
+                        {
+                            var death = room.TryRecordActorDeath(DungeonEventEnvelope.Create(run,
+                                    session.Player.CharacterId, "guardian clear entry regression"),
+                                actor.SequenceId, actor.ActorCode, actor.ActorType);
+                            if (!death.Accepted || !DungeonKillApplicationService.TryApplyGuardianActorDeath(run, actor, death.Fact.Source))
+                                throw new InvalidOperationException("Guardian end-boundary test could not apply canonical enemy death.");
+                        }
+                    await fixture.Coordinator.TryCompleteAsync(session, run).WaitAsync(TimeSpan.FromSeconds(5));
+                }
+                check("real phase-boundary coordinator reaches terminal success after the final canonical enemy death",
+                    callbacks < 32 && combat.TerminalFact?.Result == GuardianAltarTerminalResult.Succeeded
+                    && combat.AliveCount == 0 && combat.NextDueActiveMilliseconds == null);
+                check("missing persistent owner cannot fabricate successful inventory, menu or clear projection",
+                    combat.Presentation.CommitResult == null && !combat.Presentation.InventoryProjectionSent
+                    && !combat.Presentation.MenuProjectionSent && !combat.Presentation.ClearProjectionSent
+                    && !combat.Presentation.EplpProjectionSent
+                    && !fixture.Packets.Any(x => Type(x) == (ushort)NotiPacketTypeA21.ADVANCE_ALTAR_CLEAR_STAGE
+                        || Type(x) == (ushort)NotiPacketTypeA21.ADVANCE_ALTAR_EPLP_STATE)
+                    && combat.Timers.TryGetCurrentTicket(DungeonRunTimerKeys.GuardianAltarClearPresentation, out _));
+            }
+
+            foreach (var change in new[] { "GameSession and replacement run after ACK", "loading generation before ACK" })
+            {
+                using var fixture = new Fixture(definition);
+                fixture.Open();
+                var session = await fixture.CreateConnectedSessionAsync(change.StartsWith("GameSession", StringComparison.Ordinal) ? 406 : 407);
+                await ReadyGuardianAsync(fixture, session, definition);
+                var run = fixture.LastRun;
+                var room = fixture.LastRoom;
+                await fixture.Coordinator.TryHandleCenterDeathAsync(session, run, 0).WaitAsync(TimeSpan.FromSeconds(5));
+                var before = fixture.Packets.Count;
+                DungeonRun replacement = null;
+                long replacementGeneration = 0;
+                if (change.StartsWith("GameSession", StringComparison.Ordinal))
+                    fixture.AfterPauseWrite = () =>
+                    {
+                        session.GameSession = GameSessionIdentity();
+                        fixture.EndMemoryRun(session, run.CaptureIdentity());
+                        var instance = new DungeonInstance((short)definition.FirstDungeonId, 0, DungeonRewardPolicy.GuardianAltar);
+                        if (!DungeonRunLifecycle.BeginRunFromAuthorizedTown(session, instance, Anchor(session),
+                                session.Player.CurrentDungeonRunGeneration, () => true, out replacement))
+                            throw new InvalidOperationException("Guardian EPLP replacement run could not begin.");
+                    };
+                else
+                    fixture.BeforePausePrepare = () => replacementGeneration = room.RegisterLoadingProjection(
+                        run.CaptureIdentity(), DungeonMapHandler.CreateLoadingProjectionId(), new[] { run.CaptureIdentity() }, out _);
+                var consumed = await fixture.Coordinator.TryHandleEplpCommandAsync(session,
+                    new GamePacketHeader { cmd = 1, type = (ushort)CmdPacketTypeA21.EPLP_COMMAND }, new byte[] { 1, 2 })
+                    .WaitAsync(TimeSpan.FromSeconds(5));
+                check(change + " invalidates the captured manual return and cannot terminate a newer owner",
+                    consumed && fixture.ReturnAttempts == 0 && fixture.ReturnApplied == 0
+                    && (replacement != null
+                        ? ReferenceEquals(session.Player.CurrentRun, replacement) && replacement.RunState == DungeonRunState.Selecting
+                            && fixture.Packets.Count == before + 1 && fixture.Packets[^1].AsSpan(15).SequenceEqual(new byte[] { 1, 1, 2 })
+                        : replacementGeneration > fixture.LoadingGeneration && ReferenceEquals(session.Player.CurrentRun, run)
+                            && fixture.Packets.Count == before));
+            }
+        }
+
+        private static async Task ReadyGuardianAsync(Fixture fixture, EnhancedClientSession session,
+            GuardianAltarMenuDefinition definition)
+        {
+            await fixture.DispatchAsync(session, Request(definition.FirstDungeonId)).WaitAsync(TimeSpan.FromSeconds(5));
+            var run = fixture.LastRun;
+            var room = fixture.LastRoom;
+            var release = room.MarkLoadingReady(run.CaptureIdentity(), new[] { run.CaptureIdentity() });
+            GuardianAltarDungeonCoordinator.OnLoadingReleased(run, room.Identity, release.Generation);
+            await fixture.Coordinator.HandlePauseAsync(session, new GamePacketHeader
+                { cmd = 1, type = (ushort)CmdPacketTypeA21.ADVANCE_ALTAR_PAUSE }, new byte[15])
+                .WaitAsync(TimeSpan.FromSeconds(5));
         }
 
         private static GuardianAltarProgressSnapshot Fresh(GuardianAltarMenuDefinition definition, int characterId) =>

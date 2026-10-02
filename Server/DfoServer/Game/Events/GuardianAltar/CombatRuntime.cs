@@ -9,6 +9,17 @@ namespace DfoServer.Game.Events.GuardianAltar
 {
     internal sealed record GuardianAltarCombatSpawn(ushort SequenceId, GuardianAltarSummonObject Object);
 
+    internal enum GuardianAltarTerminalResult
+    {
+        Succeeded,
+        Failed,
+        Aborted,
+    }
+
+    internal sealed record GuardianAltarTerminalFact(Guid EventId,
+        DungeonParticipantRoomIdentity Identity, long LoadingGeneration,
+        long ActiveMilliseconds, GuardianAltarTerminalResult Result, string Reason);
+
     internal sealed class GuardianAltarSpawnBatch
     {
         internal GuardianAltarSpawnBatch(DungeonParticipantRoomIdentity identity, long providerGeneration,
@@ -58,6 +69,8 @@ namespace DfoServer.Game.Events.GuardianAltar
         private readonly Phase[] _phases;
         private readonly Dictionary<int, Entry[]> _actions;
         private readonly Dictionary<ushort, ActorState> _actors = new Dictionary<ushort, ActorState>();
+        private readonly HashSet<ushort> _centerSequences;
+        private readonly HashSet<ushort> _deadCenters = new HashSet<ushort>();
         private DungeonParticipantRoomIdentity _identity;
         private long _generation;
         private bool _bound;
@@ -75,9 +88,11 @@ namespace DfoServer.Game.Events.GuardianAltar
         private bool _pendingRegistered;
         private int _pendingProjectionOffset;
         private Guid _lastProjectedReservationId;
+        private GuardianAltarTerminalFact _terminalFact;
 
         internal GuardianAltarCombatRuntime(GuardianAltarMapFile map,
-            GuardianAltarSummonDataFile summonData, int firstSequence)
+            GuardianAltarSummonDataFile summonData, int firstSequence,
+            IEnumerable<ushort> centerSequences = null)
         {
             ArgumentNullException.ThrowIfNull(map);
             ArgumentNullException.ThrowIfNull(summonData);
@@ -86,6 +101,14 @@ namespace DfoServer.Game.Events.GuardianAltar
             if (firstSequence <= 0 || firstSequence > short.MaxValue)
                 throw new ArgumentOutOfRangeException(nameof(firstSequence));
             _nextSequence = firstSequence;
+            var centers = (centerSequences ?? Array.Empty<ushort>()).ToArray();
+            if (centers.Any(x => x >= firstSequence || x > short.MaxValue)
+                || centers.Distinct().Count() != centers.Length)
+                throw new InvalidDataException("Guardian failure-center sequences overlap dynamic actors or repeat.");
+            // The caller freezes failure centers from the actual START_MAP
+            // projection and typed center resource. Absence cannot authorize a
+            // success or imply that sequence zero is a valid failure center.
+            _centerSequences = new HashSet<ushort>(centers);
 
             var objects = summonData.Objects.ToDictionary(x => x.Id);
             var actions = summonData.Actions.ToDictionary(x => x.Id);
@@ -132,7 +155,7 @@ namespace DfoServer.Game.Events.GuardianAltar
         {
             lock (_syncRoot)
             {
-                if (_closed || !identity.IsValid || loadingGeneration <= 0)
+                if (_closed || _terminalFact != null || !identity.IsValid || loadingGeneration <= 0)
                     return false;
                 if (_bound)
                     return _identity.Equals(identity) && _generation == loadingGeneration;
@@ -145,7 +168,10 @@ namespace DfoServer.Game.Events.GuardianAltar
 
         internal int AliveCount { get { lock (_syncRoot) return _alive; } }
         internal bool IsClosed { get { lock (_syncRoot) return _closed; } }
+        internal bool IsTerminal { get { lock (_syncRoot) return _terminalFact != null || _closed; } }
+        internal GuardianAltarTerminalFact TerminalFact { get { lock (_syncRoot) return _terminalFact; } }
         internal RunTimerRegistry Timers { get; } = new RunTimerRegistry();
+        internal GuardianAltarClearPresentationRuntime Presentation { get; } = new GuardianAltarClearPresentationRuntime();
 
         internal long? NextDueActiveMilliseconds
         {
@@ -153,7 +179,7 @@ namespace DfoServer.Game.Events.GuardianAltar
             {
                 lock (_syncRoot)
                 {
-                    if (!_bound || _closed || _exhausted || _timelineEnded)
+                    if (!_bound || _closed || _terminalFact != null || _exhausted || _timelineEnded)
                         return null;
                     if (_pending != null)
                         return _pending.DueActiveMilliseconds;
@@ -350,12 +376,84 @@ namespace DfoServer.Game.Events.GuardianAltar
             }
         }
 
+        internal bool TryComplete(DungeonParticipantRoomIdentity identity, long loadingGeneration,
+            long activeMilliseconds, out GuardianAltarTerminalFact fact)
+        {
+            var created = false;
+            lock (_syncRoot)
+            {
+                fact = null;
+                if (!MatchesScopeLocked(identity, loadingGeneration) || activeMilliseconds < 0)
+                    return false;
+                if (_terminalFact != null)
+                {
+                    fact = _terminalFact;
+                    return fact.Result == GuardianAltarTerminalResult.Succeeded;
+                }
+                _lastActiveMilliseconds = Math.Max(_lastActiveMilliseconds, activeMilliseconds);
+                if (!_timelineEnded || _pending != null || _alive != 0 || _exhausted
+                    || _centerSequences.Count == 0 || _deadCenters.Count == _centerSequences.Count)
+                    return false;
+                fact = new GuardianAltarTerminalFact(Guid.NewGuid(), _identity, _generation,
+                    _lastActiveMilliseconds, GuardianAltarTerminalResult.Succeeded, "all-phases-and-enemies-complete");
+                _terminalFact = fact;
+                created = true;
+            }
+            if (created)
+                Timers.CancelAll();
+            return true;
+        }
+
+        internal bool CanAcceptCenterDeath(DungeonParticipantRoomIdentity identity,
+            long loadingGeneration, ushort sequenceId)
+        {
+            lock (_syncRoot)
+                return MatchesLocked(identity, loadingGeneration)
+                    && _centerSequences.Contains(sequenceId) && !_deadCenters.Contains(sequenceId);
+        }
+
+        // A center may use wire sequence zero. It never enters the dynamic
+        // enemy roster or the ordinary shared canonical actor-death ledger.
+        // Accepted partial center deaths return true with no terminal fact;
+        // failure is first-write-wins when no configured center survives.
+        internal bool TryFailCenter(DungeonParticipantRoomIdentity identity, long loadingGeneration,
+            ushort sequenceId, long activeMilliseconds, out GuardianAltarTerminalFact fact)
+        {
+            var created = false;
+            lock (_syncRoot)
+            {
+                fact = null;
+                if (!MatchesScopeLocked(identity, loadingGeneration) || activeMilliseconds < 0
+                    || !_centerSequences.Contains(sequenceId))
+                    return false;
+                if (_terminalFact != null)
+                {
+                    fact = _terminalFact;
+                    return fact.Result == GuardianAltarTerminalResult.Failed;
+                }
+                _lastActiveMilliseconds = Math.Max(_lastActiveMilliseconds, activeMilliseconds);
+                _deadCenters.Add(sequenceId);
+                if (_deadCenters.Count != _centerSequences.Count)
+                    return true;
+                fact = new GuardianAltarTerminalFact(Guid.NewGuid(), _identity, _generation,
+                    _lastActiveMilliseconds, GuardianAltarTerminalResult.Failed, "all-failure-centers-defeated");
+                _terminalFact = fact;
+                created = true;
+            }
+            if (created)
+                Timers.CancelAll();
+            return true;
+        }
+
         internal void Close()
         {
             lock (_syncRoot)
             {
                 if (_closed)
                     return;
+                if (_bound && _terminalFact == null)
+                    _terminalFact = new GuardianAltarTerminalFact(Guid.NewGuid(), _identity, _generation,
+                        _lastActiveMilliseconds, GuardianAltarTerminalResult.Aborted, "instance-closed");
                 _closed = true;
                 _pending = null;
                 _pendingEntries = null;
@@ -391,6 +489,9 @@ namespace DfoServer.Game.Events.GuardianAltar
             => entry.Definition.MaximumCount > 0 && entry.Count >= entry.Definition.MaximumCount;
 
         private bool MatchesLocked(DungeonParticipantRoomIdentity identity, long loadingGeneration)
+            => _terminalFact == null && MatchesScopeLocked(identity, loadingGeneration);
+
+        private bool MatchesScopeLocked(DungeonParticipantRoomIdentity identity, long loadingGeneration)
             => _bound && !_closed && identity.IsValid && _identity.Equals(identity)
                 && _generation == loadingGeneration;
 

@@ -36,6 +36,15 @@ namespace DfoServer.Network.Handlers.Dungeon
         private readonly DungeonSettlementHandler _settlement;
         private readonly DungeonKillApplicationService _kills;
         private readonly TournamentDungeonCoordinator _tournament;
+        private Func<EnhancedClientSession, DungeonRun, ushort, Task<bool>> _guardianCenterDeath;
+
+        internal void ConfigureGuardianAltar(
+            Func<EnhancedClientSession, DungeonRun, Task> completion,
+            Func<EnhancedClientSession, DungeonRun, ushort, Task<bool>> centerDeath)
+        {
+            _kills.ConfigureGuardianCompletion(completion);
+            _guardianCenterDeath = centerDeath ?? throw new ArgumentNullException(nameof(centerDeath));
+        }
 
         internal DungeonCombatHandler(
             DungeonSharedServices svc,
@@ -70,6 +79,9 @@ namespace DfoServer.Network.Handlers.Dungeon
                 return;
 
             var request = DieMonsterRequest.Parse(body);
+            if (_guardianCenterDeath != null
+                && await _guardianCenterDeath(session, run, request.LocalIndex))
+                return;
             var runIdentity = run.CaptureIdentity();
             run.TryCaptureCurrentRoomSnapshot(out var currentRoomSnapshot);
             var treatAsPassiveObject = ShouldTreatAsPassiveObject(

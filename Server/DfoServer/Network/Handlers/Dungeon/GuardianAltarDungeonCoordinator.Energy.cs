@@ -76,7 +76,8 @@ namespace DfoServer.Network.Handlers.Dungeon
                         && run.Instance.TryGetRoom(sourceRoom.Room.RoomInstanceId, out var room)
                         && room.IsCurrentLoadingGeneration(generation);
                     var accepted = false;
-                    if (parsed && energy != null && GuardianCurrent())
+                    if (parsed && energy != null && GuardianCurrent()
+                        && run.Instance.Mechanisms.GuardianAltarCombat?.IsTerminal != true)
                         accepted = energy.TrySetPaused(sourceRoom, generation, request.Paused,
                             _monotonicMilliseconds(), out snapshot);
                     if (accepted)

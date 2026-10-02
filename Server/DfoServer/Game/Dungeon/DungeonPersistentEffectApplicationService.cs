@@ -38,6 +38,8 @@ namespace DfoServer.Game.Dungeon
             "blood-altar-reward";
         internal const string LicensedDungeonRewardCommit =
             "licensed-dungeon-reward-commit";
+        internal const string GuardianAltarClearCommit =
+            "guardian-altar-clear-commit";
     }
 
     internal sealed class SuitableDungeonLuckyStarResult
@@ -275,7 +277,7 @@ namespace DfoServer.Game.Dungeon
 
     // Typed persistent effect dispatcher. Only registered payload kinds can
     // mutate state; unknown versions are moved to dead-letter without execution.
-    internal sealed class DungeonPersistentEffectApplicationService
+    internal sealed partial class DungeonPersistentEffectApplicationService
     {
         private const int PayloadVersion = 1;
         private const int ResultVersion = 1;
@@ -912,6 +914,17 @@ namespace DfoServer.Game.Dungeon
                         {
                             result.FailedCount++;
                             LogRecoveryFailure(record, licensedRewardError);
+                        }
+                        break;
+                    case DungeonPersistentEffectKinds.GuardianAltarClearCommit:
+                        if (TryExecuteGuardianAltarClear(record, lease: null,
+                                ownerSessionId: Guid.Empty, isCurrent: null, requireOwnedLease: false,
+                                out _, out var guardianClearError))
+                            result.CommittedCount++;
+                        else
+                        {
+                            result.FailedCount++;
+                            LogRecoveryFailure(record, guardianClearError);
                         }
                         break;
                     default:

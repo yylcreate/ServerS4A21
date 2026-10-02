@@ -4,8 +4,8 @@ using Microsoft.Data.Sqlite;
 
 namespace DfoServer.Game.Events.GuardianAltar
 {
-    // SQL only. The application service owns initialization/refill policy and
-    // supplies the one transaction shared by every part of the menu snapshot.
+    // SQL only. The progress/effect application owners supply the transaction
+    // shared by menu initialization or an ordinary clear and its rewards.
     internal sealed class GuardianAltarProgressRepository
     {
         internal void ValidateRefillReceipt(SqliteConnection connection, SqliteTransaction transaction,
@@ -84,6 +84,57 @@ SET free_tickets=@tickets, updated_at=CURRENT_TIMESTAMP
 WHERE character_id=@cid AND ridable_id=@ridable;",
                     ("@tickets", freeTickets), ("@cid", characterId), ("@ridable", ridableId)) != 1)
                 throw new InvalidOperationException("Guardian refill has no current character progress row.");
+        }
+
+        internal void RequireCharacterOwnership(SqliteConnection connection, SqliteTransaction transaction,
+            int characterId, int accountId)
+        {
+            using var command = connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = "SELECT 1 FROM characters WHERE character_id=@cid AND account_id=@aid AND delete_flag=0;";
+            command.Parameters.AddWithValue("@cid", characterId);
+            command.Parameters.AddWithValue("@aid", accountId);
+            if (command.ExecuteScalar() == null)
+                throw new InvalidOperationException("Guardian clear participant is not the existing character owner.");
+        }
+
+        internal void UpdateClearedStage(SqliteConnection connection, SqliteTransaction transaction,
+            int characterId, int ridableId, int dungeonId, int previousProgress, int newProgress)
+        {
+            if (Execute(connection, transaction, @"
+UPDATE character_guardian_altar_stages SET progress=@new
+WHERE character_id=@cid AND ridable_id=@ridable AND dungeon_id=@dungeon AND progress=@previous;",
+                    ("@cid", characterId), ("@ridable", ridableId), ("@dungeon", dungeonId),
+                    ("@previous", previousProgress), ("@new", newProgress)) != 1)
+                throw new InvalidOperationException("Guardian clear stage progress changed before commit.");
+        }
+
+        internal bool TryUnlockStage(SqliteConnection connection, SqliteTransaction transaction,
+            int characterId, int ridableId, int dungeonId) => Execute(connection, transaction, @"
+INSERT INTO character_guardian_altar_stages (character_id,ridable_id,dungeon_id,progress)
+VALUES (@cid,@ridable,@dungeon,-1)
+ON CONFLICT(character_id,ridable_id,dungeon_id) DO NOTHING;",
+                ("@cid", characterId), ("@ridable", ridableId), ("@dungeon", dungeonId)) == 1;
+
+        internal bool TryUnlockPurchase(SqliteConnection connection, SqliteTransaction transaction,
+            int characterId, int ridableId, GuardianAltarPurchase purchase) => Execute(connection, transaction, @"
+INSERT INTO character_guardian_altar_purchases (character_id,ridable_id,shop_type,resource_id,level,price)
+VALUES (@cid,@ridable,@type,@resource,@level,@price)
+ON CONFLICT(character_id,ridable_id,shop_type,resource_id) DO NOTHING;",
+                ("@cid", characterId), ("@ridable", ridableId), ("@type", purchase.ShopType),
+                ("@resource", purchase.ResourceId), ("@level", purchase.Level), ("@price", purchase.Price)) == 1;
+
+        internal void UpdateClearHeader(SqliteConnection connection, SqliteTransaction transaction,
+            int characterId, GuardianAltarHeader header)
+        {
+            if (Execute(connection, transaction, @"
+UPDATE character_guardian_altar SET free_tickets=@free,secondary_tickets=@secondary,
+    stage_stars=@stageStars,available_stars=@availableStars,menu_hint_flag=@hint,updated_at=CURRENT_TIMESTAMP
+WHERE character_id=@cid AND ridable_id=@ridable;",
+                    ("@cid", characterId), ("@ridable", header.RidableId), ("@free", header.FreeTickets),
+                    ("@secondary", header.SecondaryTickets), ("@stageStars", header.StageStars),
+                    ("@availableStars", header.AvailableStars), ("@hint", header.MenuHintFlag)) != 1)
+                throw new InvalidOperationException("Guardian clear has no current character progress header.");
         }
 
         internal GuardianAltarProgressSnapshot Read(SqliteConnection connection,

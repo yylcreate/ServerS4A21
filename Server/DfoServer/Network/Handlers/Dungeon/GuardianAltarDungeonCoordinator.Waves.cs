@@ -77,6 +77,7 @@ namespace DfoServer.Network.Handlers.Dungeon
                     {
                         if (!string.IsNullOrEmpty(failure))
                             FileLogger.Log($"[GuardianAltarWave] deferred run={run.RunId} reason={failure}");
+                        await TryCompleteWithinTransitionAsync(session, run, Current);
                         if (combat.Timers.TryComplete(ticket) && Current())
                             ScheduleCombat(session, run, energy.ReadSnapshot(_monotonicMilliseconds()),
                                 string.IsNullOrEmpty(failure) ? 0 : WaveRetryMilliseconds);
@@ -135,6 +136,7 @@ namespace DfoServer.Network.Handlers.Dungeon
                     if (combat.Timers.TryComplete(ticket) && Current())
                         ScheduleCombat(session, run, energy.ReadSnapshot(_monotonicMilliseconds()),
                             combat.IsCurrent(batch) ? WaveRetryMilliseconds : 0);
+                    if (Current()) await TryCompleteWithinTransitionAsync(session, run, Current);
                 });
             }
             finally { gate.Release(); }

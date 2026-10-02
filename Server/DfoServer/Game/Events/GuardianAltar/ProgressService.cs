@@ -3,12 +3,13 @@ using System.Globalization;
 using System.Linq;
 using DfoServer.Game.DailyReset;
 using DfoServer.Infrastructure;
+using Microsoft.Data.Sqlite;
 
 namespace DfoServer.Game.Events.GuardianAltar
 {
-    // Durable role progress is the only menu-state authority. Opening windows
-    // and socket projections remain separate; this service never enters a run,
-    // spends tickets, creates combat state or grants rewards.
+    // Durable role progress is the only menu-state authority. Ordinary clears
+    // use the caller's inventory/outbox transaction; socket projections and
+    // combat state remain with the Guardian coordinator/runtime.
     internal sealed class GuardianAltarProgressService : IGuardianAltarProgressService
     {
         private readonly IGameDatabase _database;
@@ -76,10 +77,89 @@ namespace DfoServer.Game.Events.GuardianAltar
             });
         }
 
+        internal string DatabaseConnectionString => _database.ConnectionString;
+
+        // Call before the inventory lock/SQLite transaction. Recovery may be
+        // this owner's first operation and must not perform lazy PVF I/O there.
+        internal void PrepareClearDefinition(GuardianAltarClearProgressPlan plan)
+        {
+            ArgumentNullException.ThrowIfNull(plan);
+            RequireMatchingClearPlan(plan, _definition.Value);
+        }
+
+        private static void RequireMatchingClearPlan(GuardianAltarClearProgressPlan plan,
+            GuardianAltarMenuDefinition definition)
+        {
+            var expected = definition.CreateClearProgressPlan(plan.DungeonId, plan.Difficulty);
+            if (plan.RidableId != expected.RidableId || plan.StarsOnImprovement != expected.StarsOnImprovement
+                || !plan.NextDungeonIds.SequenceEqual(expected.NextDungeonIds)
+                || !plan.UnlockPurchases.SequenceEqual(expected.UnlockPurchases))
+                throw new InvalidOperationException("Guardian frozen clear progress plan does not match its resource owner.");
+        }
+
         private static void RequireCurrentGeneration(Func<bool> isCurrent)
         {
             if (isCurrent != null && !isCurrent())
                 throw new InvalidOperationException("Guardian progress request belongs to an obsolete generation.");
+        }
+
+        internal GuardianAltarClearProgressCommitResult ApplyClearInTransaction(
+            SqliteConnection connection, SqliteTransaction transaction, int characterId, int accountId,
+            GuardianAltarClearProgressPlan plan, Func<bool> isCurrent = null)
+        {
+            ArgumentNullException.ThrowIfNull(connection);
+            ArgumentNullException.ThrowIfNull(transaction);
+            ArgumentNullException.ThrowIfNull(plan);
+            RequireCurrentGeneration(isCurrent);
+            if (!_definition.IsValueCreated)
+                throw new InvalidOperationException("Guardian clear definition must be prepared before the transaction.");
+            var definition = _definition.Value;
+            RequireMatchingClearPlan(plan, definition);
+            _repository.RequireCharacterOwnership(connection, transaction, characterId, accountId);
+            var before = _repository.Read(connection, transaction, characterId, plan.RidableId);
+            ValidateComplete(before, definition);
+            var currentStage = before.Stages.SingleOrDefault(x => x.DungeonId == plan.DungeonId)
+                ?? throw new InvalidOperationException("Guardian clear stage is not unlocked for this participant.");
+            if (currentStage.Progress > 2 || plan.Difficulty > currentStage.Progress + 1)
+                throw new InvalidOperationException("Guardian ordinary clear cannot skip the current difficulty progression.");
+            var header = before.Header;
+            if ((long)header.FreeTickets + header.SecondaryTickets <= 0)
+                throw new InvalidOperationException("Guardian successful clear requires one available ticket.");
+
+            var firstClear = currentStage.Progress == -1;
+            var stars = currentStage.Progress < plan.Difficulty ? plan.StarsOnImprovement : 0;
+            if (stars > 0)
+                _repository.UpdateClearedStage(connection, transaction, characterId, plan.RidableId,
+                    plan.DungeonId, currentStage.Progress, plan.Difficulty);
+            var purchases = new System.Collections.Generic.List<GuardianAltarPurchase>();
+            var unlocked = false;
+            if (firstClear)
+            {
+                foreach (var next in plan.NextDungeonIds)
+                    unlocked |= _repository.TryUnlockStage(connection, transaction, characterId, plan.RidableId, next);
+                foreach (var purchase in plan.UnlockPurchases)
+                    if (_repository.TryUnlockPurchase(connection, transaction, characterId, plan.RidableId, purchase))
+                        purchases.Add(purchase);
+            }
+            var afterHeader = header with
+            {
+                FreeTickets = header.FreeTickets > 0 ? header.FreeTickets - 1 : 0,
+                SecondaryTickets = header.FreeTickets > 0 ? header.SecondaryTickets : header.SecondaryTickets - 1,
+                StageStars = checked(header.StageStars + stars),
+                AvailableStars = checked(header.AvailableStars + stars),
+                MenuHintFlag = unlocked ? (byte)1 : header.MenuHintFlag,
+            };
+            _repository.UpdateClearHeader(connection, transaction, characterId, afterHeader);
+            var after = _repository.Read(connection, transaction, characterId, plan.RidableId);
+            ValidateComplete(after, definition);
+            RequireCurrentGeneration(isCurrent);
+            return new GuardianAltarClearProgressCommitResult
+            {
+                StarsGained = stars,
+                FirstClear = firstClear,
+                NewPurchases = purchases.AsReadOnly(),
+                ProgressSnapshot = after,
+            };
         }
 
         private static void ValidateComplete(GuardianAltarProgressSnapshot snapshot,

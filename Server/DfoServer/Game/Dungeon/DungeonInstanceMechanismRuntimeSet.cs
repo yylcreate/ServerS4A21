@@ -1,6 +1,7 @@
 using DfoServer.Game.Dungeon.Tournament;
 using DfoServer.Game.Dungeon.BloodAltar;
 using System;
+using System.Linq;
 
 namespace DfoServer.Game.Dungeon
 {
@@ -36,7 +37,9 @@ namespace DfoServer.Game.Dungeon
                 {
                     var energy = new Events.GuardianAltar.GuardianAltarEnergyRuntime(plan.Energy);
                     var combat = new Events.GuardianAltar.GuardianAltarCombatRuntime(
-                        plan.CombatMap, plan.SummonData, Math.Max(1, plan.Centers.Count));
+                        plan.CombatMap, plan.SummonData, Math.Max(1, plan.Centers.Count),
+                        plan.Centers.Select((center, index) => (center, index))
+                            .Where(x => x.center.IsFailureCenter).Select(x => checked((ushort)x.index)));
                     _guardianAltar = plan;
                     _guardianAltarEnergy = energy;
                     _guardianAltarCombat = combat;

@@ -52,6 +52,10 @@ namespace DfoServer.Network.Handlers.Dungeon
         private readonly DungeonSettlementHandler _settlement;
         private readonly TournamentDungeonCoordinator _tournament;
         private readonly BloodAltarDungeonCoordinator _bloodAltar;
+        private Func<EnhancedClientSession, DungeonRun, Task> _guardianCompletion;
+
+        internal void ConfigureGuardianCompletion(Func<EnhancedClientSession, DungeonRun, Task> completion)
+            => _guardianCompletion = completion ?? throw new ArgumentNullException(nameof(completion));
 
         internal DungeonKillApplicationService(
             DungeonSharedServices services,
@@ -160,6 +164,8 @@ namespace DfoServer.Network.Handlers.Dungeon
                     && existingState == DungeonParticipantEffectState.Committed)
                 {
                     await RelayAndCompleteDeferredClearFanoutAsync(context, run);
+                    if (run.Instance.Mechanisms.GuardianAltarCombat != null && _guardianCompletion != null)
+                        await _guardianCompletion(session, run);
                 }
                 return;
             }
@@ -194,10 +200,14 @@ namespace DfoServer.Network.Handlers.Dungeon
 
                 if (context.IsLocalReport)
                     await RelayAndCompleteDeferredClearFanoutAsync(context, run);
+                if (run.Instance.Mechanisms.GuardianAltarCombat != null && _guardianCompletion != null)
+                    await _guardianCompletion(session, run);
             }
             catch
             {
                 run.Instance.ParticipantEffects.TryFail(reservation);
+                if (run.Instance.Mechanisms.GuardianAltarCombat != null && _guardianCompletion != null)
+                    await _guardianCompletion(session, run);
                 throw;
             }
         }
@@ -432,6 +442,11 @@ namespace DfoServer.Network.Handlers.Dungeon
                 drops = MergeDrops(drops, captureDrops);
             }
 
+            if (dynamicActor != null && worldDeath.Accepted && worldDeath.Fact != null
+                && IsGuardianDynamicActor(run, dynamicActor))
+                // The canonical death fact already exists. Transport failure
+                // must not leave Guardian's living roster ahead of that fact.
+                TryApplyGuardianActorDeath(run, dynamicActor, worldDeath.Fact.Source);
             await SendMonsterDieAsync(session, context, drops);
             if (!IsCurrent(run, context.Envelope))
                 return false;

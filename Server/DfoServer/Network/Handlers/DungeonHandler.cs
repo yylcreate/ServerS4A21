@@ -167,7 +167,10 @@ namespace DfoServer.Network.Handlers
                         session, anchor.TownId, anchor.AreaId);
                     if (session.Player.IsCurrentDungeonRun(identity))
                         await Game.Friends.UnitedFriendSystem.NotifyUserStateChanged(session, _services.Sessions);
-                });
+                }, persistentEffects: _services.PersistentEffects);
+            _combat.ConfigureGuardianAltar(_guardianAltar.TryCompleteAsync,
+                _guardianAltar.TryHandleCenterDeathAsync);
+            _settlement.ConfigureGuardianAltarEplp(_guardianAltar.TryHandleEplpCommandAsync);
         }
 
         internal void RegisterGuardianAltarRuntimeHandlers(GameCommandRegistry.GameCommandRegistrationGroup handlers)

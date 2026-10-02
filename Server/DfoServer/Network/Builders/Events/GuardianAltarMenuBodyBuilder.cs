@@ -9,12 +9,29 @@ namespace DfoServer.Network.Builders
         internal static byte[] Build(GuardianAltarProgressSnapshot snapshot)
         {
             GuardianAltarProgressValidator.Validate(snapshot);
-            var header = snapshot.Header;
-
             var writer = new GamePacketWriter();
             writer.WriteByte(1);
             writer.WriteInt32(0);
             writer.WriteUInt32(1);
+            WriteSnapshot(writer, snapshot);
+            return writer.ToArray();
+        }
+
+        internal static byte[] BuildUpdateRidable(GuardianAltarProgressSnapshot snapshot, byte rawPrefix)
+        {
+            GuardianAltarProgressValidator.Validate(snapshot);
+            var writer = new GamePacketWriter();
+            // A21 sub_1156CA0 reads one byte at 0, then the 33-byte header.
+            // There is no entry-CMD success/result or UInt32 record count.
+            // The consumer does not use this raw prefix later in the function.
+            writer.WriteByte(rawPrefix);
+            WriteSnapshot(writer, snapshot);
+            return writer.ToArray();
+        }
+
+        private static void WriteSnapshot(GamePacketWriter writer, GuardianAltarProgressSnapshot snapshot)
+        {
+            var header = snapshot.Header;
             // A21 sub_1108400: exactly 33 bytes, not eight Int32 fields.
             writer.WriteInt32(header.RidableId);
             writer.WriteInt32(header.FreeTickets);
@@ -62,7 +79,6 @@ namespace DfoServer.Network.Builders
                 writer.WriteInt32(achievement.AchievementId);
                 writer.WriteByte(achievement.Claimed);
             }
-            return writer.ToArray();
         }
     }
 }

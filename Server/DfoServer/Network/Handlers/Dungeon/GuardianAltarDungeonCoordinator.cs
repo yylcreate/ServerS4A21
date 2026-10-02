@@ -19,7 +19,7 @@ namespace DfoServer.Network.Handlers.Dungeon
 {
     // Resource-classified special entry, not a replacement SELECT handler or
     // another run/loading state machine. Dedicated combat shares its energy
-    // clock; Guardian rewards still have no settlement path in this batch.
+    // clock; dedicated terminal facts authorize dedicated persistent rewards.
     // It must never enter ordinary maze/hell/card paths.
     internal sealed partial class GuardianAltarDungeonCoordinator
     {
@@ -52,7 +52,8 @@ namespace DfoServer.Network.Handlers.Dungeon
             Func<EnhancedClientSession, DungeonRunIdentity, Task> onEntered = null,
             Func<long> monotonicMilliseconds = null,
             Func<EnhancedClientSession, Func<IReadOnlyList<byte[]>>, Func<bool>, Task> sendPause = null,
-            ClockService combatClock = null)
+            ClockService combatClock = null,
+            DungeonPersistentEffectApplicationService persistentEffects = null)
         {
             _opening = opening ?? throw new ArgumentNullException(nameof(opening));
             _progress = progress ?? throw new ArgumentNullException(nameof(progress));
@@ -78,6 +79,7 @@ namespace DfoServer.Network.Handlers.Dungeon
             _sendPause = sendPause ?? ((session, prepare, current) =>
                 session.SendPreparedPacketBatchAsync(prepare, current));
             _combatClock = combatClock ?? ClockService.Instance;
+            _persistentEffects = persistentEffects;
         }
 
         internal async Task<bool> TryHandleSelectDungeonAsync(EnhancedClientSession session,

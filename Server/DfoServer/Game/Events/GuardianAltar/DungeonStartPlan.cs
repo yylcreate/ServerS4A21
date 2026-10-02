@@ -11,7 +11,7 @@ namespace DfoServer.Game.Events.GuardianAltar
     // STAssignMonster/_mapMonster. Conditional/NPC centers are not admitted by
     // this batch; never reinterpret drop counts as parent-object fields.
     internal sealed record GuardianAltarCenterSpawn(
-        ushort MonsterCode, byte Level, byte MonsterType);
+        ushort MonsterCode, byte Level, byte MonsterType, bool IsFailureCenter = false);
 
     internal sealed record GuardianAltarUnitDefinition(byte Slot, int PrototypeId,
         int EnergyCostFixed, int CooldownMilliseconds, string CooldownGroup);
@@ -26,7 +26,8 @@ namespace DfoServer.Game.Events.GuardianAltar
             PvfLib.GuardianAltarEnergyConfigFile energy = null,
             PvfLib.GuardianAltarMapFile combatMap = null,
             PvfLib.GuardianAltarSummonDataFile summonData = null,
-            IEnumerable<GuardianAltarUnitDefinition> units = null)
+            IEnumerable<GuardianAltarUnitDefinition> units = null,
+            GuardianAltarClearCommitPlan clearPlan = null)
         {
             if (dungeonId <= 0 || dungeonId > short.MaxValue || difficulty > 2
                 || mapId <= 0 || mapBasisLevel < 0 || durationMilliseconds <= 0)
@@ -40,6 +41,7 @@ namespace DfoServer.Game.Events.GuardianAltar
             Energy = energy;
             CombatMap = combatMap;
             SummonData = summonData;
+            ClearPlan = clearPlan;
             Units = Array.AsReadOnly((units ?? Array.Empty<GuardianAltarUnitDefinition>()).ToArray());
             Phases = Array.AsReadOnly(phases.ToArray());
             Centers = Array.AsReadOnly(centers.ToArray());
@@ -72,5 +74,6 @@ namespace DfoServer.Game.Events.GuardianAltar
         internal PvfLib.GuardianAltarMapFile CombatMap { get; }
         internal PvfLib.GuardianAltarSummonDataFile SummonData { get; }
         internal IReadOnlyList<GuardianAltarUnitDefinition> Units { get; }
+        internal GuardianAltarClearCommitPlan ClearPlan { get; }
     }
 }
