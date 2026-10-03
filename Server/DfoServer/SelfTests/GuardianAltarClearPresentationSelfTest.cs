@@ -27,6 +27,7 @@ namespace DfoServer.SelfTests
             Section("terminal binding and commit", () => CheckBinding(Check));
             Section("successful projection order and deadlines", () => CheckSuccess(Check));
             Section("failed direct EPLP", () => CheckFailure(Check));
+            Section("survival failure presents committed completed rounds", () => CheckSurvivalFailure(Check));
             Section("projection retry and stale events", () => CheckRetry(Check));
             Section("explicit UTC and deadline overflow", () => CheckClock(Check));
             Console.WriteLine($"GUARDIAN_ALTAR_CLEAR_PRESENTATION assertions={assertions} failures={failures}");
@@ -147,6 +148,38 @@ namespace DfoServer.SelfTests
             check("failed EPLP retry preserves the same fact and return deadline",
                 runtime.TryBind(fact) && runtime.TryMarkEplpProjectionSent(fact.EventId, now.AddMinutes(1))
                 && ReferenceEquals(fact, runtime.Fact) && runtime.ReturnDeadlineUtc == now.AddSeconds(50));
+        }
+
+        private static void CheckSurvivalFailure(Action<string, bool> check)
+        {
+            var runtime = new GuardianAltarClearPresentationRuntime();
+            var fact = Fact() with { Result = GuardianAltarTerminalResult.Failed, ClearedRounds = 2 };
+            var now = Utc();
+            var progress = Progress();
+            var result = new GuardianAltarClearCommitResult
+            {
+                ClearedRounds = 2, BestRound = 2, Improved = true,
+                ProgressSnapshot = new GuardianAltarProgressSnapshot(progress.CharacterId,
+                    progress.Header with { SurvivalBestPhase = 2 }, progress.Stages,
+                    progress.Purchases, progress.Slots, progress.Achievements),
+            };
+            check("survival failure binds earned rounds but cannot send EPLP before a committed result",
+                runtime.TryBind(fact, survivalResult: true) && !runtime.TryCommit(null)
+                && !runtime.TryBind(fact, survivalResult: false)
+                && !runtime.TryMarkEplpProjectionSent(fact.EventId, now));
+            check("survival result preserves the frozen score and rejects an ordinary successful star result",
+                !runtime.TryCommit(Result()) && runtime.TryCommit(result)
+                && runtime.TryMarkInventoryProjectionSent(fact.EventId)
+                && !runtime.TryMarkClearProjectionSent(fact.EventId, now)
+                && runtime.TryMarkMenuProjectionSent(fact.EventId)
+                && runtime.TryMarkClearProjectionSent(fact.EventId, now));
+            check("survival result has the existing clear-to-EPLP deadline and repeats do not restart it",
+                !runtime.TryMarkEplpProjectionSent(fact.EventId, now.AddMilliseconds(3999))
+                && runtime.TryMarkClearProjectionSent(fact.EventId, now.AddSeconds(1))
+                && runtime.EplpDeadlineUtc == now.AddSeconds(4)
+                && runtime.TryMarkEplpProjectionSent(fact.EventId, now.AddSeconds(4))
+                && runtime.TryMarkEplpProjectionSent(fact.EventId, now.AddSeconds(5))
+                && runtime.ReturnDeadlineUtc == now.AddSeconds(54));
         }
 
         private static void CheckRetry(Action<string, bool> check)

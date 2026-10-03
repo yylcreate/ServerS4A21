@@ -39,7 +39,8 @@ namespace DfoServer.Game.Dungeon
                     var combat = new Events.GuardianAltar.GuardianAltarCombatRuntime(
                         plan.CombatMap, plan.SummonData, Math.Max(1, plan.Centers.Count),
                         plan.Centers.Select((center, index) => (center, index))
-                            .Where(x => x.center.IsFailureCenter).Select(x => checked((ushort)x.index)));
+                            .Where(x => x.center.IsFailureCenter).Select(x => checked((ushort)x.index)),
+                        plan.SurvivalRounds);
                     _guardianAltar = plan;
                     _guardianAltarEnergy = energy;
                     _guardianAltarCombat = combat;

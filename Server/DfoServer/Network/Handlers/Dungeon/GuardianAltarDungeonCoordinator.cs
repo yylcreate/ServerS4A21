@@ -129,6 +129,7 @@ namespace DfoServer.Network.Handlers.Dungeon
                     if (parsed && existing?.Instance?.Mechanisms.GuardianAltar is { } existingPlan
                         && existingPlan.DungeonId == command.DungeonId
                         && existingPlan.Difficulty == command.Difficulty
+                        && existingPlan.IsSurvival == command.SurvivalSelector
                         && existing.RunState is DungeonRunState.Selecting or DungeonRunState.Active)
                     {
                         FileLogger.Log($"[GuardianAltarDungeon] duplicate start ignored cid={cid} run={existing.RunId}");
@@ -159,6 +160,8 @@ namespace DfoServer.Network.Handlers.Dungeon
                         if (progress.CharacterId != cid)
                             throw new InvalidOperationException("Guardian progress belongs to a different character.");
                         plan = _definition().CreateStartPlan(command.DungeonId, command.Difficulty, progress);
+                        if (plan.IsSurvival != command.SurvivalSelector)
+                            throw new InvalidOperationException("Guardian selector shape does not match its resource stage mode.");
                     }
                     catch (Exception ex) when (ex is InvalidOperationException or InvalidDataException or IOException or SqliteException
                         or OverflowException or ArgumentException)

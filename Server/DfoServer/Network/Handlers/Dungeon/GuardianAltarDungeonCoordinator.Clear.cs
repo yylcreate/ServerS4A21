@@ -52,44 +52,82 @@ namespace DfoServer.Network.Handlers.Dungeon
                 && run.Instance.TryGetRoom(snapshot.Identity.Room.RoomInstanceId, out var room)
                 && room.IsCurrentLoadingGeneration(snapshot.LoadingGeneration);
             if (!snapshot.IsReady || snapshot.IsClosed || !Current()) return;
+            var plan = run.Instance.Mechanisms.GuardianAltar;
             var fact = combat.TerminalFact;
             if (fact == null)
             {
                 if (snapshot.Paused) return;
+                if (plan.IsSurvival && combat.TryReserveRoundAdvance(snapshot.Identity,
+                        snapshot.LoadingGeneration, snapshot.ActiveMilliseconds, out var advance))
+                {
+                    try
+                    {
+                        bool RoundCurrent() => Current() && combat.IsCurrent(advance)
+                            && !energy.ReadSnapshot(_monotonicMilliseconds()).Paused;
+                        var body = GuardianAltarDungeonPacketBuilder.BuildSurvivalRound(advance.NextRoundPlan);
+                        if (!await SendClearFrameAsync(session, NotiPacketTypeA21.ADVANCE_ALTAR_START_MAP,
+                                body, RoundCurrent)) return;
+                        if (combat.TryMarkRoundProjected(advance,
+                                energy.ReadSnapshot(_monotonicMilliseconds()).ActiveMilliseconds))
+                        {
+                            FileLogger.Log($"[GuardianAltarSurvival] round projected cid={session.Player.CharacterId} "
+                                + $"run={run.RunId}/{run.RunGeneration} completed={advance.CompletedRound} "
+                                + $"round={advance.NextRoundPlan.RoundNumber} map={advance.NextRoundPlan.MapId} "
+                                + $"sameRoom={snapshot.Identity.Room.RoomInstanceId} loading={snapshot.LoadingGeneration}");
+                            ScheduleCombat(session, run, energy.ReadSnapshot(_monotonicMilliseconds()));
+                        }
+                    }
+                    catch (Exception exception)
+                    {
+                        FileLogger.Log($"[GuardianAltarSurvival] round projection deferred run={run.RunId}: {exception.Message}");
+                        if (Current()) ScheduleCombat(session, run,
+                            energy.ReadSnapshot(_monotonicMilliseconds()), WaveRetryMilliseconds);
+                    }
+                    return;
+                }
                 combat.TryComplete(snapshot.Identity, snapshot.LoadingGeneration, snapshot.ActiveMilliseconds, out fact);
             }
             if (fact == null || fact.Result == GuardianAltarTerminalResult.Aborted
                 || !fact.Identity.Equals(snapshot.Identity) || fact.LoadingGeneration != snapshot.LoadingGeneration)
                 return;
             var presentation = combat.Presentation;
-            if (!presentation.TryBind(fact)) return;
+            if (!presentation.TryBind(fact, plan.IsSurvival)) return;
             // A terminal combat cannot resume natural energy or consume it.
             energy.TrySetPaused(fact.Identity, fact.LoadingGeneration, true, _monotonicMilliseconds(), out _);
             try
             {
-                var plan = run.Instance.Mechanisms.GuardianAltar;
                 var commit = presentation.CommitResult;
                 InventoryLease lease = null;
-                if (fact.Result == GuardianAltarTerminalResult.Succeeded)
+                if (fact.Result == GuardianAltarTerminalResult.Succeeded || plan.IsSurvival)
                 {
                     if (!InventoryContext.TryGetLease(session.Player.CharacterId, out lease)
                         || !lease.IsOwnedBy(session.SessionId) || !Current())
                         throw new InvalidOperationException("Guardian clear has no current owned inventory lease.");
                     if (commit == null)
                     {
-                        var effectId = new DungeonEffectId(fact.EventId,
-                            DungeonPersistentEffectKinds.GuardianAltarClearCommit, DungeonEffectScope.Player, run.RunId);
-                        if (_persistentEffects == null || plan.ClearPlan == null)
+                        var effectId = new DungeonEffectId(fact.EventId, plan.IsSurvival
+                            ? DungeonPersistentEffectKinds.GuardianAltarSurvivalCommit
+                            : DungeonPersistentEffectKinds.GuardianAltarClearCommit, DungeonEffectScope.Player, run.RunId);
+                        if (_persistentEffects == null || (!plan.IsSurvival && plan.ClearPlan == null))
                             throw new InvalidOperationException("Guardian clear owner or frozen resource plan is missing.");
-                        if (!_persistentEffects.TryApplyGuardianAltarClear(effectId, session.Player.CharacterId,
+                        string error;
+                        var applied = plan.IsSurvival
+                            ? _persistentEffects.TryApplyGuardianAltarSurvival(effectId, session.Player.CharacterId,
+                                session.Account.AccountId, lease, session.SessionId,
+                                new GuardianAltarSurvivalCommitPlan(plan.Progress.Header.RidableId, plan.DungeonId,
+                                    plan.SurvivalRounds.Count, fact.ClearedRounds,
+                                    plan.SurvivalRewards.GetRewards(fact.ClearedRounds)), Current, out commit, out error)
+                            : _persistentEffects.TryApplyGuardianAltarClear(effectId, session.Player.CharacterId,
                                 session.Account.AccountId, lease, session.SessionId, plan.ClearPlan, Current,
-                                out commit, out var error))
+                                out commit, out error);
+                        if (!applied)
                             throw new InvalidOperationException("Guardian durable clear failed: " + error);
                         if (!Current() || !presentation.TryCommit(commit)) return;
                         run.Effects.ProjectCommitted(effectId);
                         FileLogger.Log($"[GuardianAltarClear] committed cid={session.Player.CharacterId} "
                             + $"run={run.RunId}/{run.RunGeneration} dungeon={plan.DungeonId} difficulty={plan.Difficulty} "
-                            + $"event={fact.EventId:N} stars={commit.StarsGained} mailed={commit.MailedRewardCount}");
+                            + $"event={fact.EventId:N} stars={commit.StarsGained} mailed={commit.MailedRewardCount} "
+                            + $"survival={plan.IsSurvival} rounds={commit.ClearedRounds} best={commit.BestRound}");
                     }
                     bool OwnedCurrent() => Current()
                         && InventoryContext.IsCurrentLease(lease, session.SessionId, session.Player.CharacterId);
@@ -117,8 +155,10 @@ namespace DfoServer.Network.Handlers.Dungeon
                     if (!presentation.ClearProjectionSent)
                     {
                         var body = GuardianAltarClearBodyBuilder.BuildClearStage(
-                            new GuardianAltarClearHeader(0, 0, 0, false, plan.DungeonId, plan.Difficulty, commit.StarsGained),
-                            plan.ClearPlan.Rewards.Select(x => new GuardianAltarClearRewardRow(0, x.ItemId, x.Count)).ToArray(),
+                            new GuardianAltarClearHeader(plan.IsSurvival ? 1 : 0, commit.ClearedRounds,
+                                commit.BestRound, commit.Improved, plan.DungeonId, plan.Difficulty, commit.StarsGained),
+                            (plan.IsSurvival ? plan.SurvivalRewards.GetRewards(commit.ClearedRounds) : plan.ClearPlan.Rewards)
+                                .Select(x => new GuardianAltarClearRewardRow(0, x.ItemId, x.Count)).ToArray(),
                             commit.NewPurchases, Array.Empty<GuardianAltarAchievement>());
                         if (!await SendClearFrameAsync(session, NotiPacketTypeA21.ADVANCE_ALTAR_CLEAR_STAGE, body, Current)) return;
                         if (!presentation.TryMarkClearProjectionSent(fact.EventId, _utcNow().UtcDateTime)) return;
@@ -126,7 +166,7 @@ namespace DfoServer.Network.Handlers.Dungeon
                 }
                 if (!presentation.EplpProjectionSent)
                 {
-                    if (fact.Result == GuardianAltarTerminalResult.Succeeded
+                    if ((fact.Result == GuardianAltarTerminalResult.Succeeded || plan.IsSurvival)
                         && _utcNow().UtcDateTime < presentation.EplpDeadlineUtc)
                     {
                         ScheduleClearContinuation(session, run, fact, presentation.EplpDeadlineUtc);
@@ -135,7 +175,7 @@ namespace DfoServer.Network.Handlers.Dungeon
                     var progress = commit?.ProgressSnapshot ?? plan.Progress;
                     var available = (long)progress.Header.FreeTickets + progress.Header.SecondaryTickets > 0 ? 1 : 0;
                     var body = GuardianAltarClearBodyBuilder.BuildEplpState(
-                        fact.Result == GuardianAltarTerminalResult.Succeeded ? 3 : 0, available);
+                        fact.Result == GuardianAltarTerminalResult.Succeeded || plan.IsSurvival ? 3 : 0, available);
                     if (!await SendClearFrameAsync(session, NotiPacketTypeA21.ADVANCE_ALTAR_EPLP_STATE, body, Current)) return;
                     if (!presentation.TryMarkEplpProjectionSent(fact.EventId, _utcNow().UtcDateTime)) return;
                     FileLogger.Log($"[GuardianAltarClear] eplp projected cid={session.Player.CharacterId} "

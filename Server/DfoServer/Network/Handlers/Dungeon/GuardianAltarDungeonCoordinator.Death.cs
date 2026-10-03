@@ -44,7 +44,8 @@ namespace DfoServer.Network.Handlers.Dungeon
                         return;
                     FileLogger.Log($"[GuardianAltarClear] character death cid={player.CharacterId} "
                         + $"run={run.RunId}/{run.RunGeneration} result={fact.Result} event={fact.EventId:N}");
-                    // Failed terminal presentation has no clear/reward commit.
+                    // Ordinary failure has no reward; survival settles only
+                    // the already completed rounds through its terminal owner.
                     // No fake center sequence or ordinary actor death packet.
                     await TryCompleteWithinTransitionAsync(session, run, Current);
                 });

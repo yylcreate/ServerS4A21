@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Collections.Concurrent;
 using System.IO;
 using System.Globalization;
 using System.Linq;
@@ -26,6 +27,8 @@ namespace DfoServer.Game.Events.GuardianAltar
         private readonly IReadOnlyList<IReadOnlyList<GuardianAltarStageDefinition>> _survivalAreas;
         private readonly Func<int, GuardianAltarClearRewardFile> _clearRewardLoader;
         private readonly GuardianAltarAchievementRewardFile _achievementRewards;
+        private readonly ConcurrentDictionary<int, Lazy<(int RoundCount, GuardianAltarClearRewardFile Reward)>>
+            _survivalClearDefinitions = new();
 
         internal GuardianAltarMenuDefinition(int dailyRefillTicket, int ridableId,
             int firstDungeonId, IEnumerable<GuardianAltarPurchase> initialPurchases,
@@ -280,8 +283,6 @@ namespace DfoServer.Game.Events.GuardianAltar
             if (!ContainsDungeon(dungeonId) || difficulty > 2
                 || !progress.Stages.Any(x => x.DungeonId == dungeonId))
                 throw new InvalidOperationException("Guardian stage is not unlocked or difficulty is invalid.");
-            if (difficulty > progress.Stages.Single(x => x.DungeonId == dungeonId).Progress + 1)
-                throw new InvalidOperationException("Guardian difficulties must be cleared in sequence.");
             if ((long)progress.Header.FreeTickets + progress.Header.SecondaryTickets <= 0)
                 throw new InvalidOperationException("Guardian stage requires an available ticket.");
             if (_dungeonLoader == null || _mapLoader == null)
@@ -294,25 +295,18 @@ namespace DfoServer.Game.Events.GuardianAltar
             if (dungeon == null || !dungeon.IsValid)
                 throw new InvalidDataException(dungeon?.InvalidReason ?? "Guardian DGN is missing.");
             if (dungeon.IsSurvival)
-                throw new InvalidOperationException("Guardian survival combat is not enabled by the start/loading batch.");
-            var difficultyName = new[] { "easy", "medium", "hard" }[difficulty];
-            var selected = dungeon.Maps.Single(x => x.DifficultyName == difficultyName);
-            var map = _mapLoader(selected.MapId)
-                ?? throw new InvalidDataException("Guardian MAP is missing.");
-            var guardianMap = GuardianAltarMapFile.Parse(map);
-            if (!guardianMap.IsValid || map.MonsterCount != map.Monsters.Count
-                || map.MonsterConditionMonsters.Count != 0 || map.ConditionalSummonMonsters.Count != 0)
-                throw new InvalidDataException("Guardian MAP is invalid or has unsupported conditional centers: "
-                    + guardianMap.InvalidReason);
-            var summaries = new List<GuardianAltarPhaseSummary>();
-            var startsAt = 0;
-            foreach (var phase in guardianMap.Phases)
             {
-                var phaseType = phase.Type switch { "normal" => 0, "named" => 1, "boss" => 2,
-                    _ => throw new InvalidDataException("Unknown Guardian phase type.") };
-                summaries.Add(new GuardianAltarPhaseSummary(summaries.Count, startsAt, phaseType));
-                startsAt = checked(startsAt + phase.DurationMilliseconds);
+                if (difficulty != 0 || !GetEligibleSurvivalDungeonIds(progress).Contains(dungeonId))
+                    throw new InvalidOperationException("Guardian survival requires all ordinary area stages at easy or above.");
             }
+            else if (difficulty > progress.Stages.Single(x => x.DungeonId == dungeonId).Progress + 1)
+                throw new InvalidOperationException("Guardian difficulties must be cleared in sequence.");
+            var difficultyName = new[] { "easy", "medium", "hard" }[difficulty];
+            var selected = dungeon.IsSurvival ? null : dungeon.Maps.Single(x => x.DifficultyName == difficultyName);
+            var mapId = dungeon.IsSurvival ? dungeon.SurvivalMapIds[0] : selected.MapId;
+            var mapBasisLevel = dungeon.IsSurvival ? 0 : selected.MapBasisLevel;
+            var guardianMap = LoadCombatMap(mapId, out var map);
+            var summaries = CreatePhaseSummaries(guardianMap);
             var centers = new List<GuardianAltarCenterSpawn>();
             var learnedCenters = new HashSet<int>();
             foreach (var monster in map.Monsters)
@@ -337,10 +331,6 @@ namespace DfoServer.Game.Events.GuardianAltar
             }
             if (guardianMap.CenterIndices.Any(x => !learnedCenters.Contains(x)))
                 throw new InvalidDataException("Guardian MAP has no learned entry for a required center.");
-            if (guardianMap.SummonStartArea == null
-                || guardianMap.Phases.SelectMany(x => x.ActionSelections)
-                    .Any(x => !_summonData.Actions.Any(a => a.Id == x.ActionId)))
-                throw new InvalidDataException("Guardian combat MAP or actor references are invalid.");
             var units = new List<GuardianAltarUnitDefinition>();
             foreach (var slot in progress.Slots.Where(x => x.SlotType == 1 && x.Locked == 0 && x.ResourceId > 0))
             {
@@ -359,7 +349,33 @@ namespace DfoServer.Game.Events.GuardianAltar
                     item.CoolTime, cooldownGroup.ToString(CultureInfo.InvariantCulture)));
             }
             GuardianAltarClearCommitPlan clearPlan = null;
-            if (_clearRewardLoader != null)
+            GuardianAltarClearRewardFile survivalRewards = null;
+            var rounds = new List<GuardianAltarSurvivalRoundPlan>();
+            if (dungeon.IsSurvival)
+            {
+                var survivalDefinition = GetSurvivalClearDefinition(dungeonId).Value;
+                survivalRewards = survivalDefinition.Reward;
+                var frozenMaps = new Dictionary<int, (MapFile Map, GuardianAltarMapFile Combat)>
+                    { [mapId] = (map, guardianMap) };
+                for (var index = 0; index < dungeon.SurvivalMapIds.Count; index++)
+                {
+                    var roundMapId = dungeon.SurvivalMapIds[index];
+                    if (!frozenMaps.TryGetValue(roundMapId, out var frozen))
+                    {
+                        var roundCombat = LoadCombatMap(roundMapId, out var roundMap);
+                        RequireSurvivalRoomContinuity(map, guardianMap, roundMap, roundCombat);
+                        frozen = (roundMap, roundCombat);
+                        frozenMaps.Add(roundMapId, frozen);
+                    }
+                    // Survival's legacy server calculation uses the zero-based
+                    // round as its map basis, not the DGN [basis level] value.
+                    // A21 consumes this existing field; every round retains its
+                    // own phase indices instead of flattening the 99 MAP list.
+                    rounds.Add(new GuardianAltarSurvivalRoundPlan(index + 1, roundMapId, index,
+                        frozen.Combat, CreatePhaseSummaries(frozen.Combat)));
+                }
+            }
+            else if (_clearRewardLoader != null)
             {
                 var reward = _clearRewardLoader(dungeonId);
                 if (reward == null || !reward.IsValid)
@@ -367,9 +383,92 @@ namespace DfoServer.Game.Events.GuardianAltar
                 clearPlan = new GuardianAltarClearCommitPlan(CreateClearProgressPlan(dungeonId, difficulty),
                     reward.Difficulties.Single(x => x.DifficultyName == difficultyName).Items);
             }
-            return new GuardianAltarDungeonStartPlan(dungeonId, difficulty, selected.MapId,
-                selected.MapBasisLevel, guardianMap.TotalDurationMilliseconds, summaries, centers, progress,
-                _energy, guardianMap, _summonData, units, clearPlan);
+            return new GuardianAltarDungeonStartPlan(dungeonId, difficulty, mapId,
+                mapBasisLevel, guardianMap.TotalDurationMilliseconds, summaries, centers, progress,
+                _energy, guardianMap, _summonData, units, clearPlan, rounds, survivalRewards);
+        }
+
+        private GuardianAltarMapFile LoadCombatMap(int mapId, out MapFile map)
+        {
+            map = _mapLoader(mapId) ?? throw new InvalidDataException("Guardian MAP is missing.");
+            var combat = GuardianAltarMapFile.Parse(map);
+            if (!combat.IsValid || map.MonsterCount != map.Monsters.Count
+                || map.MonsterConditionMonsters.Count != 0 || map.ConditionalSummonMonsters.Count != 0
+                || combat.SummonStartArea == null
+                || combat.Phases.SelectMany(x => x.ActionSelections)
+                    .Any(x => !_summonData.Actions.Any(action => action.Id == x.ActionId)))
+                throw new InvalidDataException("Guardian MAP or actor references are invalid: " + combat.InvalidReason);
+            return combat;
+        }
+
+        private static IReadOnlyList<GuardianAltarPhaseSummary> CreatePhaseSummaries(GuardianAltarMapFile map)
+        {
+            var summaries = new List<GuardianAltarPhaseSummary>();
+            var startsAt = 0;
+            foreach (var phase in map.Phases)
+            {
+                var phaseType = phase.Type switch { "normal" => 0, "named" => 1, "boss" => 2,
+                    _ => throw new InvalidDataException("Unknown Guardian phase type.") };
+                summaries.Add(new GuardianAltarPhaseSummary(summaries.Count, startsAt, phaseType));
+                startsAt = checked(startsAt + phase.DurationMilliseconds);
+            }
+            GuardianAltarDungeonStartPlan.ValidatePhases(summaries, map.TotalDurationMilliseconds);
+            return summaries.AsReadOnly();
+        }
+
+        private static void RequireSurvivalRoomContinuity(MapFile initialMap, GuardianAltarMapFile initialCombat,
+            MapFile roundMap, GuardianAltarMapFile roundCombat)
+        {
+            // Later A21 rounds consume only the timeline; the loaded room and
+            // its learned static actors remain those of the first projection.
+            var firstArea = initialCombat.SummonStartArea;
+            var roundArea = roundCombat.SummonStartArea;
+            if (!initialCombat.CenterIndices.SequenceEqual(roundCombat.CenterIndices)
+                || (firstArea.X, firstArea.Y, firstArea.Width, firstArea.Height)
+                    != (roundArea.X, roundArea.Y, roundArea.Width, roundArea.Height)
+                || !initialMap.Monsters.Select(CenterIdentity).SequenceEqual(roundMap.Monsters.Select(CenterIdentity)))
+                throw new InvalidDataException("Guardian survival MAP changes the initial room's static centers or summon area.");
+        }
+
+        private static (int? Monster, int? Npc, int? Level, int? AutoLevel, int? X, int? Y, int? Z, MonsterType Type)
+            CenterIdentity(MonsterInfo monster) => (monster.MonsterId, monster.NpcId, monster.Lv,
+                monster.AutoLv, monster.X, monster.Y, monster.Z, monster.Type);
+
+        private Lazy<(int RoundCount, GuardianAltarClearRewardFile Reward)> GetSurvivalClearDefinition(int dungeonId)
+        {
+            if (!_survivalAreas.Any(area => area.Any(stage => stage.IsSurvival && stage.DungeonId == dungeonId)))
+                throw new InvalidOperationException("Guardian survival DGN is not in the current stage catalog.");
+            return _survivalClearDefinitions.GetOrAdd(dungeonId, id => new Lazy<(int, GuardianAltarClearRewardFile)>(() =>
+            {
+                var dungeon = _dungeonLoader?.Invoke(id);
+                var reward = _clearRewardLoader?.Invoke(id);
+                if (dungeon == null || !dungeon.IsValid || !dungeon.IsSurvival
+                    || dungeon.SurvivalMapIds.Count > short.MaxValue
+                    || reward == null || !reward.IsValid || reward.SurvivalRanges.Count == 0
+                    || reward.SurvivalRanges[0].FirstRound != 1
+                    || reward.SurvivalRanges[^1].LastRound != dungeon.SurvivalMapIds.Count)
+                    throw new InvalidDataException("Guardian survival rounds and rewards do not match the current DGN.");
+                return (dungeon.SurvivalMapIds.Count, reward);
+            }));
+        }
+
+        internal GuardianAltarSurvivalCommitPlan CreateSurvivalCommitPlan(int dungeonId, int clearedRounds)
+        {
+            var definition = GetSurvivalClearDefinition(dungeonId).Value;
+            return new GuardianAltarSurvivalCommitPlan(RidableId, dungeonId, definition.RoundCount,
+                clearedRounds, definition.Reward.GetRewards(clearedRounds));
+        }
+
+        internal void RequireMatchingSurvivalCommitPlan(GuardianAltarSurvivalCommitPlan plan)
+        {
+            if (plan == null || plan.RidableId != RidableId
+                || !_survivalClearDefinitions.TryGetValue(plan.DungeonId, out var cached) || !cached.IsValueCreated)
+                throw new InvalidOperationException("Guardian survival commit has no prepared current resource definition.");
+            var definition = cached.Value;
+            if (plan.RoundCount != definition.RoundCount
+                || !plan.Rewards.Select(x => (x.Kind, x.ItemId, x.Count)).SequenceEqual(
+                    definition.Reward.GetRewards(plan.ClearedRounds).Select(x => (x.Kind, x.ItemId, x.Count))))
+                throw new InvalidOperationException("Guardian survival commit rewards do not match the frozen resource.");
         }
 
         // The current ordinary catalog owns stage order. Neither coordinates,
@@ -444,7 +543,12 @@ namespace DfoServer.Game.Events.GuardianAltar
                 LoadRegisteredMap,
                 GuardianAltarSummonDataFile.Parse(PvfArchiveAccessor.ReadText(
                     "etc/advancealtar/advancealtarsummondata.etc")),
-                id => GuardianAltarClearRewardFile.Parse(DungeonCatalog.GetDungeonFile(id)), achievements);
+                id =>
+                {
+                    var shared = DungeonCatalog.GetDungeonFile(id);
+                    return GuardianAltarDungeonFile.Parse(shared).IsSurvival
+                        ? GuardianAltarClearRewardFile.ParseSurvival(shared) : GuardianAltarClearRewardFile.Parse(shared);
+                }, achievements);
         }
 
         internal static MapFile LoadRegisteredMap(int mapId)

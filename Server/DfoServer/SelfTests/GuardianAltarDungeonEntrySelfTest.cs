@@ -60,6 +60,8 @@ namespace DfoServer.SelfTests
                 Section("Guardian energy coordinator", () => CheckEnergyAsync(Check, definition).GetAwaiter().GetResult());
                 Section("Guardian formal clear resource plans", () => CheckClearPlans(Check, definition));
                 Section("Guardian survival menu unlock eligibility", () => CheckSurvivalUnlockEligibility(Check, definition));
+                Section("Guardian survival start and continuation wire", () => CheckSurvivalPlans(Check, definition));
+                Section("Guardian survival entry and selector boundaries", () => CheckSurvivalEntryAsync(Check, definition).GetAwaiter().GetResult());
                 Section("Guardian dedicated failed settlement", () => CheckFailedClearAsync(Check, definition).GetAwaiter().GetResult());
                 Section("Guardian dedicated character death and coin refusal", () => CheckCharacterDeathAsync(Check, definition).GetAwaiter().GetResult());
                 Section("Guardian result-button selection and exit", () => CheckEplpSelectionAsync(Check, definition).GetAwaiter().GetResult());
@@ -73,7 +75,7 @@ namespace DfoServer.SelfTests
             var good = Request(3511);
             check("observed 15B selector preserves stage and difficulty without hell semantics",
                 GuardianAltarSelectDungeonRequestParser.TryParse(good, out var command)
-                && command.DungeonId == 3511 && command.Difficulty == 0);
+                && command.DungeonId == 3511 && command.Difficulty == 0 && !command.SurvivalSelector);
             foreach (var difficulty in new byte[] { 0, 1, 2 })
                 check($"ordinary Guardian difficulty {difficulty} is representable",
                     GuardianAltarSelectDungeonRequestParser.TryParse(Request(3511, difficulty), out var parsed)

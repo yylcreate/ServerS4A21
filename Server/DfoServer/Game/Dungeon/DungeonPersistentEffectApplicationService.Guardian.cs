@@ -60,6 +60,39 @@ namespace DfoServer.Game.Dungeon
             }
         }
 
+        internal bool TryApplyGuardianAltarSurvival(DungeonEffectId effectId,
+            int characterId, int accountId, InventoryLease lease, Guid ownerSessionId,
+            GuardianAltarSurvivalCommitPlan plan, Func<bool> isCurrent,
+            out GuardianAltarClearCommitResult result, out string error)
+        {
+            result = null;
+            error = null;
+            try
+            {
+                ValidateEffectIdentity(effectId, DungeonPersistentEffectKinds.GuardianAltarSurvivalCommit, characterId);
+                ArgumentNullException.ThrowIfNull(plan);
+                RequireGuardianLiveLease(lease, ownerSessionId, characterId, accountId, isCurrent);
+                GetGuardianAltarProgressService().PrepareSurvivalDefinition(plan);
+                var payload = new GuardianAltarSurvivalEffectPayload
+                {
+                    CharacterId = characterId, AccountId = accountId, RidableId = plan.RidableId,
+                    DungeonId = plan.DungeonId, RoundCount = plan.RoundCount, ClearedRounds = plan.ClearedRounds,
+                    Rewards = plan.Rewards.Select(x => new GuardianAltarClearEffectItem
+                        { ItemId = x.ItemId, Count = x.Count }).ToList(),
+                };
+                RestoreGuardianSurvivalPlan(payload, characterId, accountId);
+                _outbox.Enqueue(CreateDefinition(effectId, characterId, accountId, payload));
+                RequireGuardianLiveLease(lease, ownerSessionId, characterId, accountId, isCurrent);
+                return TryExecuteGuardianAltarClear(_outbox.Get(effectId), lease,
+                    ownerSessionId, isCurrent, requireOwnedLease: true, out result, out error);
+            }
+            catch (Exception exception)
+            {
+                error = exception.Message;
+                return false;
+            }
+        }
+
         private bool TryExecuteGuardianAltarClear(DungeonPersistentEffectRecord initialRecord,
             InventoryLease lease, Guid ownerSessionId, Func<bool> isCurrent, bool requireOwnedLease,
             out GuardianAltarClearCommitResult result, out string error)
@@ -82,12 +115,32 @@ namespace DfoServer.Game.Dungeon
             var committed = false;
             try
             {
-                var payload = DeserializePayload<GuardianAltarClearEffectPayload>(record,
-                    DungeonPersistentEffectKinds.GuardianAltarClearCommit);
-                ValidateGuardianAltarClearPayload(payload, record.CharacterId, record.AccountId);
                 var progressOwner = GetGuardianAltarProgressService();
-                var progressPlan = RestoreGuardianAltarProgressPlan(payload.ProgressPlan);
-                progressOwner.PrepareClearDefinition(progressPlan);
+                GuardianAltarClearEffectPayload payload;
+                GuardianAltarClearProgressPlan progressPlan = null;
+                GuardianAltarSurvivalCommitPlan survivalPlan = null;
+                if (record.EffectId.EffectKind == DungeonPersistentEffectKinds.GuardianAltarSurvivalCommit)
+                {
+                    var survival = DeserializePayload<GuardianAltarSurvivalEffectPayload>(record,
+                        DungeonPersistentEffectKinds.GuardianAltarSurvivalCommit);
+                    survivalPlan = RestoreGuardianSurvivalPlan(survival, record.CharacterId, record.AccountId);
+                    progressOwner.PrepareSurvivalDefinition(survivalPlan);
+                    // Reuse the existing Inventory/overflow transaction with
+                    // the terminal's frozen participant and reward rows.
+                    payload = new GuardianAltarClearEffectPayload
+                    {
+                        CharacterId = survival.CharacterId, AccountId = survival.AccountId,
+                        Rewards = survival.Rewards,
+                    };
+                }
+                else
+                {
+                    payload = DeserializePayload<GuardianAltarClearEffectPayload>(record,
+                        DungeonPersistentEffectKinds.GuardianAltarClearCommit);
+                    ValidateGuardianAltarClearPayload(payload, record.CharacterId, record.AccountId);
+                    progressPlan = RestoreGuardianAltarProgressPlan(payload.ProgressPlan);
+                    progressOwner.PrepareClearDefinition(progressPlan);
+                }
                 var effectiveLease = lease;
                 if (effectiveLease == null)
                 {
@@ -132,8 +185,11 @@ namespace DfoServer.Game.Dungeon
                     using (var connection = _database.OpenConnection())
                     using (var transaction = connection.BeginTransaction(deferred: false))
                     {
-                        var progress = progressOwner.ApplyClearInTransaction(connection, transaction,
-                            payload.CharacterId, payload.AccountId, progressPlan, requireOwnedLease ? isCurrent : null);
+                        var progress = survivalPlan == null
+                            ? progressOwner.ApplyClearInTransaction(connection, transaction,
+                                payload.CharacterId, payload.AccountId, progressPlan, requireOwnedLease ? isCurrent : null)
+                            : progressOwner.ApplySurvivalInTransaction(connection, transaction,
+                                payload.CharacterId, payload.AccountId, survivalPlan, requireOwnedLease ? isCurrent : null);
                         if (overflowRewards.Count > 0)
                         {
                             var overflowSink = GetOverflowRewardSink();
@@ -245,6 +301,7 @@ namespace DfoServer.Game.Dungeon
             return new GuardianAltarClearEffectResult
             {
                 CharacterId = snapshot.CharacterId, StarsGained = progress.StarsGained, FirstClear = progress.FirstClear,
+                ClearedRounds = progress.ClearedRounds, BestRound = progress.BestRound, Improved = progress.Improved,
                 Progress = new GuardianAltarClearEffectSnapshot
                 {
                     Header = snapshot.Header, Stages = snapshot.Stages.ToList(), Purchases = snapshot.Purchases.ToList(),
@@ -265,6 +322,14 @@ namespace DfoServer.Game.Dungeon
                 || persisted.Progress.Slots == null || persisted.Progress.Achievements == null
                 || persisted.NewPurchases == null || persisted.Changes == null)
                 throw new InvalidOperationException("Guardian committed effect result is inconsistent.");
+            if (persisted.ClearedRounds < 0 || persisted.BestRound < persisted.ClearedRounds
+                || persisted.BestRound > short.MaxValue
+                || (record.EffectId.EffectKind == DungeonPersistentEffectKinds.GuardianAltarClearCommit
+                    && (persisted.ClearedRounds != 0 || persisted.BestRound != 0 || persisted.Improved))
+                || (record.EffectId.EffectKind == DungeonPersistentEffectKinds.GuardianAltarSurvivalCommit
+                    && (persisted.StarsGained != 0 || persisted.FirstClear || persisted.NewPurchases.Count != 0
+                        || persisted.BestRound != persisted.Progress.Header.SurvivalBestPhase)))
+                throw new InvalidOperationException("Guardian committed survival result is inconsistent.");
             var snapshot = new GuardianAltarProgressSnapshot(persisted.CharacterId, persisted.Progress.Header,
                 persisted.Progress.Stages, persisted.Progress.Purchases, persisted.Progress.Slots, persisted.Progress.Achievements);
             GuardianAltarProgressValidator.Validate(snapshot);
@@ -276,6 +341,7 @@ namespace DfoServer.Game.Dungeon
             return new GuardianAltarClearCommitResult
             {
                 StarsGained = persisted.StarsGained, FirstClear = persisted.FirstClear, ProgressSnapshot = snapshot,
+                ClearedRounds = persisted.ClearedRounds, BestRound = persisted.BestRound, Improved = persisted.Improved,
                 NewPurchases = persisted.NewPurchases.AsReadOnly(), MailedRewardCount = persisted.MailedRewardCount,
                 Changes = persisted.Changes.Select(x => new InventorySlotMutation((InventoryListType)x.ListType, x.Slot)).ToArray(),
             };

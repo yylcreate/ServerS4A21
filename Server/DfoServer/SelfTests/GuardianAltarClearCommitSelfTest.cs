@@ -43,6 +43,7 @@ namespace DfoServer.SelfTests
             Section("earned survival menu repair and read-only continuation", f => VerifySurvivalMenuRepair(f, Check));
             Section("final ordinary clear survival unlock and rollback", f => VerifySurvivalClearUnlock(f, Check));
             Section("historical ordinary outbox compatibility", f => VerifySurvivalHistoricalEffects(f, Check));
+            Section("survival terminal commit and durable recovery", f => VerifySurvivalTerminalCommit(f, Check));
             Console.WriteLine($"GUARDIAN_ALTAR_CLEAR_COMMIT assertions={assertions} failures={failures}");
             return failures;
         }

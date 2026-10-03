@@ -55,6 +55,9 @@ namespace DfoServer.Game.Events.GuardianAltar
 
     internal sealed class GuardianAltarClearProgressCommitResult
     {
+        internal int ClearedRounds { get; init; }
+        internal int BestRound { get; init; }
+        internal bool Improved { get; init; }
         internal int StarsGained { get; init; }
         internal bool FirstClear { get; init; }
         internal GuardianAltarProgressSnapshot ProgressSnapshot { get; init; }
@@ -64,6 +67,9 @@ namespace DfoServer.Game.Events.GuardianAltar
 
     internal sealed class GuardianAltarClearCommitResult
     {
+        internal int ClearedRounds { get; init; }
+        internal int BestRound { get; init; }
+        internal bool Improved { get; init; }
         internal int StarsGained { get; init; }
         internal bool FirstClear { get; init; }
         internal GuardianAltarProgressSnapshot ProgressSnapshot { get; init; }
@@ -117,6 +123,9 @@ namespace DfoServer.Game.Events.GuardianAltar
 
     internal sealed class GuardianAltarClearEffectResult
     {
+        public int ClearedRounds { get; set; }
+        public int BestRound { get; set; }
+        public bool Improved { get; set; }
         public int CharacterId { get; set; }
         public int StarsGained { get; set; }
         public bool FirstClear { get; set; }

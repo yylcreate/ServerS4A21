@@ -7,7 +7,7 @@ using PvfLib;
 
 namespace DfoServer.SelfTests
 {
-    internal static class GuardianAltarCombatRuntimeSelfTest
+    internal static partial class GuardianAltarCombatRuntimeSelfTest
     {
         internal static int Run()
         {
@@ -38,6 +38,9 @@ namespace DfoServer.SelfTests
             Section("Guardian character death terminal", () => CheckCharacterDeathFailure(Check));
             Section("terminal scope fencing", () => CheckTerminalScope(Check));
             Section("definition admission and close", () => CheckBoundary(Check));
+            Section("survival round authority and projection", () => CheckSurvivalRounds(Check));
+            Section("survival failure, scope and shared energy", () => CheckSurvivalFailureAndClock(Check));
+            Section("current PVF survival sequence", () => CheckRealSurvivalSequence(Check));
             Console.WriteLine($"GUARDIAN_ALTAR_COMBAT_RUNTIME assertions={assertions} failures={failures}");
             return failures;
         }

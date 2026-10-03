@@ -10,6 +10,7 @@ namespace DfoServer.Game.Events.GuardianAltar
         private readonly object _syncRoot = new object();
         private GuardianAltarTerminalFact _fact;
         private GuardianAltarClearCommitResult _commitResult;
+        private bool _survivalResult;
         private bool _inventoryProjectionSent;
         private bool _menuProjectionSent;
         private bool _clearProjectionSent;
@@ -26,18 +27,21 @@ namespace DfoServer.Game.Events.GuardianAltar
         internal DateTime EplpDeadlineUtc { get { lock (_syncRoot) return _eplpDeadlineUtc; } }
         internal DateTime ReturnDeadlineUtc { get { lock (_syncRoot) return _returnDeadlineUtc; } }
 
-        internal bool TryBind(GuardianAltarTerminalFact fact)
+        internal bool TryBind(GuardianAltarTerminalFact fact, bool survivalResult = false)
         {
             if (fact == null || fact.EventId == Guid.Empty || !fact.Identity.IsValid
                 || fact.LoadingGeneration <= 0 || fact.ActiveMilliseconds < 0
+                || fact.ClearedRounds < 0 || fact.ClearedRounds > short.MaxValue
+                || (!survivalResult && fact.ClearedRounds != 0)
                 || string.IsNullOrWhiteSpace(fact.Reason)
                 || fact.Result is not (GuardianAltarTerminalResult.Succeeded or GuardianAltarTerminalResult.Failed))
                 return false;
             lock (_syncRoot)
             {
                 if (_fact != null)
-                    return _fact == fact;
+                    return _fact == fact && _survivalResult == survivalResult;
                 _fact = fact;
+                _survivalResult = survivalResult;
                 return true;
             }
         }
@@ -48,10 +52,15 @@ namespace DfoServer.Game.Events.GuardianAltar
             {
                 if (_fact == null)
                     return false;
-                if (_fact.Result == GuardianAltarTerminalResult.Failed)
+                if (_fact.Result == GuardianAltarTerminalResult.Failed && !_survivalResult)
                     return result == null;
                 if (result == null || result.ProgressSnapshot == null || result.StarsGained < 0
                     || result.MailedRewardCount < 0 || result.Changes == null || result.NewPurchases == null)
+                    return false;
+                if (_survivalResult && (result.ClearedRounds != _fact.ClearedRounds
+                    || result.BestRound < result.ClearedRounds || result.BestRound > short.MaxValue
+                    || result.BestRound != result.ProgressSnapshot.Header.SurvivalBestPhase
+                    || result.StarsGained != 0 || result.FirstClear || result.NewPurchases.Count != 0))
                     return false;
                 if (_commitResult != null)
                     return ReferenceEquals(_commitResult, result);
@@ -105,12 +114,12 @@ namespace DfoServer.Game.Events.GuardianAltar
             {
                 if (!MatchesLocked(eventId) || utcNow.Kind != DateTimeKind.Utc)
                     return false;
-                if (_fact.Result == GuardianAltarTerminalResult.Succeeded
+                if ((_fact.Result == GuardianAltarTerminalResult.Succeeded || _survivalResult)
                     && (!CanProjectSuccessLocked(eventId) || !_clearProjectionSent))
                     return false;
                 if (_eplpProjectionSent)
                     return true;
-                if (_fact.Result == GuardianAltarTerminalResult.Succeeded && utcNow < _eplpDeadlineUtc)
+                if ((_fact.Result == GuardianAltarTerminalResult.Succeeded || _survivalResult) && utcNow < _eplpDeadlineUtc)
                     return false;
                 if (!TryAddSeconds(utcNow, 50, out var deadline))
                     return false;
@@ -124,7 +133,7 @@ namespace DfoServer.Game.Events.GuardianAltar
             => _fact != null && eventId != Guid.Empty && _fact.EventId == eventId;
 
         private bool CanProjectSuccessLocked(Guid eventId)
-            => MatchesLocked(eventId) && _fact.Result == GuardianAltarTerminalResult.Succeeded
+            => MatchesLocked(eventId) && (_fact.Result == GuardianAltarTerminalResult.Succeeded || _survivalResult)
                 && _commitResult != null;
 
         private static bool TryAddSeconds(DateTime utcNow, int seconds, out DateTime deadline)

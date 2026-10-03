@@ -278,6 +278,60 @@ namespace DfoServer.Game.Events.GuardianAltar
             RequireMatchingClearPlan(plan, _definition.Value);
         }
 
+        internal void PrepareSurvivalDefinition(GuardianAltarSurvivalCommitPlan plan)
+        {
+            ArgumentNullException.ThrowIfNull(plan);
+            var definition = _definition.Value;
+            definition.CreateSurvivalCommitPlan(plan.DungeonId, plan.ClearedRounds);
+            definition.RequireMatchingSurvivalCommitPlan(plan);
+        }
+
+        internal GuardianAltarSurvivalCommitPlan CreateSurvivalCommitPlan(int dungeonId, int clearedRounds)
+            => _definition.Value.CreateSurvivalCommitPlan(dungeonId, clearedRounds);
+
+        internal GuardianAltarClearProgressCommitResult ApplySurvivalInTransaction(
+            SqliteConnection connection, SqliteTransaction transaction, int characterId, int accountId,
+            GuardianAltarSurvivalCommitPlan plan, Func<bool> isCurrent = null)
+        {
+            ArgumentNullException.ThrowIfNull(connection);
+            ArgumentNullException.ThrowIfNull(transaction);
+            ArgumentNullException.ThrowIfNull(plan);
+            RequireCurrentGeneration(isCurrent);
+            if (!_definition.IsValueCreated)
+                throw new InvalidOperationException("Guardian survival definition must be prepared before the transaction.");
+            var definition = _definition.Value;
+            definition.RequireMatchingSurvivalCommitPlan(plan);
+            _repository.RequireCharacterOwnership(connection, transaction, characterId, accountId);
+            var before = _repository.Read(connection, transaction, characterId, plan.RidableId);
+            ValidateComplete(before, definition);
+            if (!before.Stages.Any(x => x.DungeonId == plan.DungeonId)
+                || !definition.GetEligibleSurvivalDungeonIds(before).Contains(plan.DungeonId)
+                || before.Header.SurvivalBestPhase > plan.RoundCount)
+                throw new InvalidOperationException("Guardian survival is not earned or its stored best round is invalid.");
+            var header = before.Header;
+            // Survival with no completed round has no configured reward and
+            // consumes no ticket. A rewarded terminal run consumes one only.
+            var consumeTicket = plan.Rewards.Count > 0;
+            if (consumeTicket && (long)header.FreeTickets + header.SecondaryTickets <= 0)
+                throw new InvalidOperationException("Guardian survival reward requires an available ticket.");
+            var best = Math.Max(header.SurvivalBestPhase, plan.ClearedRounds);
+            var afterHeader = header with
+            {
+                FreeTickets = consumeTicket && header.FreeTickets > 0 ? header.FreeTickets - 1 : header.FreeTickets,
+                SecondaryTickets = consumeTicket && header.FreeTickets == 0 ? header.SecondaryTickets - 1 : header.SecondaryTickets,
+                SurvivalBestPhase = checked((short)best),
+            };
+            _repository.UpdateSurvivalHeader(connection, transaction, characterId, header, afterHeader);
+            var after = _repository.Read(connection, transaction, characterId, plan.RidableId);
+            ValidateComplete(after, definition);
+            RequireCurrentGeneration(isCurrent);
+            return new GuardianAltarClearProgressCommitResult
+            {
+                ProgressSnapshot = after, ClearedRounds = plan.ClearedRounds,
+                BestRound = best, Improved = best > header.SurvivalBestPhase,
+            };
+        }
+
         private static void RequireMatchingClearPlan(GuardianAltarClearProgressPlan plan,
             GuardianAltarMenuDefinition definition)
         {

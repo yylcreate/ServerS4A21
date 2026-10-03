@@ -41,9 +41,11 @@ namespace DfoServer.Network.Handlers.Dungeon
             // upgrading cannot cancel a still-current enemy wave.
             var sourceFence = DungeonLoadingCoordinator.CaptureContinuationFence(
                 session, _sessions, run, identity.Room);
+            var sourceRound = combat.CurrentRound;
+            bool RoundFence() => sourceFence() && combat.CurrentRound == sourceRound;
             var handle = _combatClock.ScheduleOneShotAsync(
                 $"guardian-altar:wave:{identity.Run.PartyDungeonInstanceId}:{identity.Run.RunId}:{ticket.Generation}",
-                deadline, _ => OnCombatTimerAsync(session, run, identity, generation, ticket, sourceFence));
+                deadline, _ => OnCombatTimerAsync(session, run, identity, generation, ticket, RoundFence));
             combat.Timers.Attach(ticket, handle);
         }
 
@@ -124,7 +126,8 @@ namespace DfoServer.Network.Handlers.Dungeon
                         }
                         if (SendCurrent() && combat.TryMarkProjected(batch))
                             FileLogger.Log($"[GuardianAltarWave] projected run={run.RunId}/{run.RunGeneration} "
-                                + $"map={run.Instance.Mechanisms.GuardianAltar.MapId} phase={batch.PhaseIndex} wave={batch.WaveIdentity} "
+                                + $"map={combat.CurrentRoundPlan?.MapId ?? run.Instance.Mechanisms.GuardianAltar.MapId} "
+                                + $"round={combat.CurrentRound} phase={batch.PhaseIndex} wave={batch.WaveIdentity} "
                                 + $"actors={batch.Spawns.Count} activeMs={snapshot.ActiveMilliseconds}");
                     }
                     catch (Exception exception)

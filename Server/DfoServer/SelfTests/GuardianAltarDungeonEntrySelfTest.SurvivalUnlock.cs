@@ -48,9 +48,11 @@ namespace DfoServer.SelfTests
                     stages: allEasy.Take(allEasy.Length - 1).Append(new GuardianAltarStage(allEasy[^1].DungeonId, 3))))));
             check("survival unlock leaves the final ordinary frozen NextDungeonIds compatible with existing outbox intents",
                 definition.CreateClearProgressPlan(ordinary[^1].DungeonId, 0).NextDungeonIds.Count == 0);
-            check("a legally unlocked menu row does not silently enable the unimplemented survival combat contract",
-                Throws<InvalidOperationException>(() => definition.CreateStartPlan(survival[0], 0,
-                    Copy(fresh, stages: allEasy.Concat(survival.Select(id => new GuardianAltarStage(id, -1)))))));
+            var survivalPlan = definition.CreateStartPlan(survival[0], 0,
+                Copy(fresh, stages: allEasy.Concat(survival.Select(id => new GuardianAltarStage(id, -1)))));
+            check("a legally unlocked survival row creates its dedicated frozen round contract without ordinary clear rules",
+                survivalPlan.IsSurvival && survivalPlan.SurvivalRounds.Count > 0
+                && survivalPlan.ClearPlan == null && survivalPlan.SurvivalRewards != null);
 
             // This catalog-only fixture retains typed PVF area boundaries and
             // deliberately sparse IDs. Eligibility cannot rely on adjacency,

@@ -40,6 +40,8 @@ namespace DfoServer.Game.Dungeon
             "licensed-dungeon-reward-commit";
         internal const string GuardianAltarClearCommit =
             "guardian-altar-clear-commit";
+        internal const string GuardianAltarSurvivalCommit =
+            "guardian-altar-survival-commit";
     }
 
     internal sealed class SuitableDungeonLuckyStarResult
@@ -917,6 +919,7 @@ namespace DfoServer.Game.Dungeon
                         }
                         break;
                     case DungeonPersistentEffectKinds.GuardianAltarClearCommit:
+                    case DungeonPersistentEffectKinds.GuardianAltarSurvivalCommit:
                         if (TryExecuteGuardianAltarClear(record, lease: null,
                                 ownerSessionId: Guid.Empty, isCurrent: null, requireOwnedLease: false,
                                 out _, out var guardianClearError))

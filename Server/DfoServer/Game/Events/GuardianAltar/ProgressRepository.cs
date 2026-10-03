@@ -137,6 +137,21 @@ WHERE character_id=@cid AND ridable_id=@ridable;",
                 throw new InvalidOperationException("Guardian clear has no current character progress header.");
         }
 
+        internal void UpdateSurvivalHeader(SqliteConnection connection, SqliteTransaction transaction,
+            int characterId, GuardianAltarHeader before, GuardianAltarHeader after)
+        {
+            if (Execute(connection, transaction, @"
+UPDATE character_guardian_altar SET free_tickets=@free,secondary_tickets=@secondary,
+    survival_best_phase=@best,updated_at=CURRENT_TIMESTAMP
+WHERE character_id=@cid AND ridable_id=@ridable AND free_tickets=@previousFree
+    AND secondary_tickets=@previousSecondary AND survival_best_phase=@previousBest;",
+                    ("@cid", characterId), ("@ridable", before.RidableId),
+                    ("@previousFree", before.FreeTickets), ("@previousSecondary", before.SecondaryTickets),
+                    ("@previousBest", before.SurvivalBestPhase), ("@free", after.FreeTickets),
+                    ("@secondary", after.SecondaryTickets), ("@best", after.SurvivalBestPhase)) != 1)
+                throw new InvalidOperationException("Guardian survival header changed before commit.");
+        }
+
         internal void UpdatePurchase(SqliteConnection connection, SqliteTransaction transaction,
             int characterId, int ridableId, GuardianAltarPurchasePlan plan)
         {

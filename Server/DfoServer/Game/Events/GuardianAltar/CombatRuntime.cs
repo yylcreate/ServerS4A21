@@ -18,7 +18,25 @@ namespace DfoServer.Game.Events.GuardianAltar
 
     internal sealed record GuardianAltarTerminalFact(Guid EventId,
         DungeonParticipantRoomIdentity Identity, long LoadingGeneration,
-        long ActiveMilliseconds, GuardianAltarTerminalResult Result, string Reason);
+        long ActiveMilliseconds, GuardianAltarTerminalResult Result, string Reason,
+        int ClearedRounds = 0);
+
+    internal sealed class GuardianAltarRoundAdvanceToken
+    {
+        internal GuardianAltarRoundAdvanceToken(DungeonParticipantRoomIdentity identity,
+            long loadingGeneration, int completedRound, GuardianAltarSurvivalRoundPlan nextRoundPlan)
+        {
+            Identity = identity;
+            LoadingGeneration = loadingGeneration;
+            CompletedRound = completedRound;
+            NextRoundPlan = nextRoundPlan;
+        }
+
+        internal DungeonParticipantRoomIdentity Identity { get; }
+        internal long LoadingGeneration { get; }
+        internal int CompletedRound { get; }
+        internal GuardianAltarSurvivalRoundPlan NextRoundPlan { get; }
+    }
 
     internal sealed class GuardianAltarSpawnBatch
     {
@@ -66,7 +84,9 @@ namespace DfoServer.Game.Events.GuardianAltar
         }
 
         private readonly object _syncRoot = new object();
-        private readonly Phase[] _phases;
+        private Phase[] _phases;
+        private readonly GuardianAltarSurvivalRoundPlan[] _survivalRounds;
+        private readonly Phase[][] _survivalTimelines;
         private readonly Dictionary<int, Entry[]> _actions;
         private readonly Dictionary<ushort, ActorState> _actors = new Dictionary<ushort, ActorState>();
         private readonly HashSet<ushort> _centerSequences;
@@ -89,10 +109,16 @@ namespace DfoServer.Game.Events.GuardianAltar
         private int _pendingProjectionOffset;
         private Guid _lastProjectedReservationId;
         private GuardianAltarTerminalFact _terminalFact;
+        private int _roundIndex;
+        private int _clearedRounds;
+        private long _roundStartsAt;
+        private GuardianAltarRoundAdvanceToken _pendingRoundAdvance;
+        private GuardianAltarRoundAdvanceToken _lastProjectedRoundAdvance;
 
         internal GuardianAltarCombatRuntime(GuardianAltarMapFile map,
             GuardianAltarSummonDataFile summonData, int firstSequence,
-            IEnumerable<ushort> centerSequences = null)
+            IEnumerable<ushort> centerSequences = null,
+            IEnumerable<GuardianAltarSurvivalRoundPlan> survivalRounds = null)
         {
             ArgumentNullException.ThrowIfNull(map);
             ArgumentNullException.ThrowIfNull(summonData);
@@ -113,7 +139,32 @@ namespace DfoServer.Game.Events.GuardianAltar
             var objects = summonData.Objects.ToDictionary(x => x.Id);
             var actions = summonData.Actions.ToDictionary(x => x.Id);
             _actions = new Dictionary<int, Entry[]>();
-            _phases = new Phase[map.Phases.Count];
+            _survivalRounds = (survivalRounds ?? Array.Empty<GuardianAltarSurvivalRoundPlan>()).ToArray();
+            if (_survivalRounds.Length > short.MaxValue
+                || _survivalRounds.Where((round, index) => round == null
+                    || round.RoundNumber != index + 1).Any()
+                || (_survivalRounds.Length > 0 && !ReferenceEquals(_survivalRounds[0].CombatMap, map)))
+                throw new InvalidDataException("Guardian survival rounds do not match their frozen first timeline.");
+            if (_survivalRounds.Length == 0)
+            {
+                _survivalTimelines = Array.Empty<Phase[]>();
+                _phases = CompileTimeline(map, objects, actions);
+            }
+            else
+            {
+                _survivalTimelines = _survivalRounds.Select(round =>
+                    CompileTimeline(round.CombatMap, objects, actions)).ToArray();
+                _phases = _survivalTimelines[0];
+            }
+        }
+
+        private Phase[] CompileTimeline(GuardianAltarMapFile map,
+            IReadOnlyDictionary<int, GuardianAltarSummonObject> objects,
+            IReadOnlyDictionary<int, GuardianAltarSummonAction> actions)
+        {
+            if (map == null || !map.IsValid || map.Phases.Count == 0 || map.Phases.Count > byte.MaxValue + 1)
+                throw new InvalidDataException("Guardian combat round requires a valid representable timeline.");
+            var phases = new Phase[map.Phases.Count];
             long phaseStart = 0;
             for (var index = 0; index < map.Phases.Count; index++)
             {
@@ -146,9 +197,10 @@ namespace DfoServer.Game.Events.GuardianAltar
                         throw new InvalidDataException("Guardian enemy action has no summon entries.");
                     _actions.Add(action.Id, entries.ToArray());
                 }
-                _phases[index] = new Phase(phaseStart, phaseEnd, selections);
+                phases[index] = new Phase(phaseStart, phaseEnd, selections);
                 phaseStart = phaseEnd;
             }
+            return phases;
         }
 
         internal bool BindLoadingRelease(DungeonParticipantRoomIdentity identity, long loadingGeneration)
@@ -170,6 +222,12 @@ namespace DfoServer.Game.Events.GuardianAltar
         internal bool IsClosed { get { lock (_syncRoot) return _closed; } }
         internal bool IsTerminal { get { lock (_syncRoot) return _terminalFact != null || _closed; } }
         internal GuardianAltarTerminalFact TerminalFact { get { lock (_syncRoot) return _terminalFact; } }
+        internal int CurrentRound { get { lock (_syncRoot) return _survivalRounds.Length == 0 ? 0 : _roundIndex + 1; } }
+        internal int ClearedRounds { get { lock (_syncRoot) return _clearedRounds; } }
+        internal GuardianAltarSurvivalRoundPlan CurrentRoundPlan
+        {
+            get { lock (_syncRoot) return _survivalRounds.Length == 0 ? null : _survivalRounds[_roundIndex]; }
+        }
         internal RunTimerRegistry Timers { get; } = new RunTimerRegistry();
         internal GuardianAltarClearPresentationRuntime Presentation { get; } = new GuardianAltarClearPresentationRuntime();
 
@@ -179,13 +237,18 @@ namespace DfoServer.Game.Events.GuardianAltar
             {
                 lock (_syncRoot)
                 {
-                    if (!_bound || _closed || _terminalFact != null || _exhausted || _timelineEnded)
+                    if (!_bound || _closed || _terminalFact != null || _exhausted)
                         return null;
+                    if (_pendingRoundAdvance != null)
+                        return _lastActiveMilliseconds;
+                    if (_timelineEnded)
+                        return _survivalRounds.Length > _roundIndex + 1 && _alive == 0
+                            ? _lastActiveMilliseconds : null;
                     if (_pending != null)
                         return _pending.DueActiveMilliseconds;
                     if (_phaseIndex < 0)
-                        return 0;
-                    var next = _phases[_phaseIndex].End;
+                        return _roundStartsAt;
+                    var next = checked(_roundStartsAt + _phases[_phaseIndex].End);
                     foreach (var entry in _entries)
                         if (!IsFinished(entry) && entry.NextDue < next)
                             next = entry.NextDue;
@@ -207,6 +270,8 @@ namespace DfoServer.Game.Events.GuardianAltar
                     return false;
                 }
                 _lastActiveMilliseconds = Math.Max(_lastActiveMilliseconds, activeMilliseconds);
+                if (_pendingRoundAdvance != null)
+                    return false;
                 if (_pending != null)
                 {
                     batch = _pending;
@@ -224,7 +289,7 @@ namespace DfoServer.Game.Events.GuardianAltar
                 // phase. Enter only the current phase and freeze its choice.
                 var targetPhase = Math.Max(0, _phaseIndex);
                 while (targetPhase < _phases.Length
-                    && _lastActiveMilliseconds >= _phases[targetPhase].End)
+                    && _lastActiveMilliseconds >= checked(_roundStartsAt + _phases[targetPhase].End))
                     targetPhase++;
                 if (targetPhase == _phases.Length)
                 {
@@ -235,7 +300,7 @@ namespace DfoServer.Game.Events.GuardianAltar
                 if (targetPhase != _phaseIndex)
                     EnterPhaseLocked(targetPhase);
 
-                var phaseEnd = _phases[_phaseIndex].End;
+                var phaseEnd = checked(_roundStartsAt + _phases[_phaseIndex].End);
                 var due = phaseEnd;
                 foreach (var entry in _entries)
                     if (!IsFinished(entry) && entry.NextDue < due)
@@ -333,6 +398,62 @@ namespace DfoServer.Game.Events.GuardianAltar
             lock (_syncRoot) return IsPendingLocked(batch);
         }
 
+        // Later survival START_MAP frames change only the client timeline.
+        // Keep the actual Room, loading generation, centers, sequence space
+        // and energy clock. A completed round is a combat fact, while the
+        // next timeline remains blocked until its transport write completes.
+        internal bool TryReserveRoundAdvance(DungeonParticipantRoomIdentity identity,
+            long loadingGeneration, long activeMilliseconds, out GuardianAltarRoundAdvanceToken token)
+        {
+            lock (_syncRoot)
+            {
+                token = null;
+                if (!MatchesLocked(identity, loadingGeneration) || activeMilliseconds < 0
+                    || _survivalRounds.Length == 0)
+                    return false;
+                _lastActiveMilliseconds = Math.Max(_lastActiveMilliseconds, activeMilliseconds);
+                if (_pendingRoundAdvance != null)
+                {
+                    token = _pendingRoundAdvance;
+                    return true;
+                }
+                if (!RecordClearedRoundLocked() || _roundIndex + 1 == _survivalRounds.Length)
+                    return false;
+                token = new GuardianAltarRoundAdvanceToken(_identity, _generation,
+                    _clearedRounds, _survivalRounds[_roundIndex + 1]);
+                _pendingRoundAdvance = token;
+                return true;
+            }
+        }
+
+        internal bool IsCurrent(GuardianAltarRoundAdvanceToken token)
+        {
+            lock (_syncRoot) return IsPendingRoundLocked(token);
+        }
+
+        internal bool TryMarkRoundProjected(GuardianAltarRoundAdvanceToken token, long activeMilliseconds)
+        {
+            lock (_syncRoot)
+            {
+                if (activeMilliseconds < 0 || token == null)
+                    return false;
+                if (!IsPendingRoundLocked(token))
+                    return ReferenceEquals(token, _lastProjectedRoundAdvance)
+                        && MatchesLocked(token.Identity, token.LoadingGeneration);
+                _lastActiveMilliseconds = Math.Max(_lastActiveMilliseconds, activeMilliseconds);
+                _roundStartsAt = _lastActiveMilliseconds;
+                _roundIndex++;
+                _phases = _survivalTimelines[_roundIndex];
+                _phaseIndex = -1;
+                _timelineEnded = false;
+                _entries = Array.Empty<EntryState>();
+                _lastProjectedReservationId = Guid.Empty;
+                _lastProjectedRoundAdvance = token;
+                _pendingRoundAdvance = null;
+                return true;
+            }
+        }
+
         // Friendly units reserve from this same instance sequence space. Their
         // own unit owner registers them; they never count as living enemies.
         internal bool TryAllocateSequence(DungeonParticipantRoomIdentity identity, long loadingGeneration,
@@ -341,7 +462,8 @@ namespace DfoServer.Game.Events.GuardianAltar
             lock (_syncRoot)
             {
                 sequenceId = 0;
-                if (!MatchesLocked(identity, loadingGeneration) || _nextSequence > short.MaxValue)
+                if (!MatchesLocked(identity, loadingGeneration) || _pendingRoundAdvance != null
+                    || _nextSequence > short.MaxValue)
                     return false;
                 sequenceId = (ushort)_nextSequence++;
                 return true;
@@ -392,10 +514,14 @@ namespace DfoServer.Game.Events.GuardianAltar
                 }
                 _lastActiveMilliseconds = Math.Max(_lastActiveMilliseconds, activeMilliseconds);
                 if (!_timelineEnded || _pending != null || _alive != 0 || _exhausted
-                    || _centerSequences.Count == 0 || _deadCenters.Count == _centerSequences.Count)
+                    || _pendingRoundAdvance != null || _centerSequences.Count == 0
+                    || _deadCenters.Count == _centerSequences.Count
+                    || (_survivalRounds.Length > 0 && _roundIndex + 1 != _survivalRounds.Length))
                     return false;
+                RecordClearedRoundLocked();
                 fact = new GuardianAltarTerminalFact(Guid.NewGuid(), _identity, _generation,
-                    _lastActiveMilliseconds, GuardianAltarTerminalResult.Succeeded, "all-phases-and-enemies-complete");
+                    _lastActiveMilliseconds, GuardianAltarTerminalResult.Succeeded, "all-phases-and-enemies-complete",
+                    _clearedRounds);
                 _terminalFact = fact;
                 created = true;
             }
@@ -432,11 +558,13 @@ namespace DfoServer.Game.Events.GuardianAltar
                     return fact.Result == GuardianAltarTerminalResult.Failed;
                 }
                 _lastActiveMilliseconds = Math.Max(_lastActiveMilliseconds, activeMilliseconds);
+                RecordClearedRoundLocked();
                 _deadCenters.Add(sequenceId);
                 if (_deadCenters.Count != _centerSequences.Count)
                     return true;
                 fact = new GuardianAltarTerminalFact(Guid.NewGuid(), _identity, _generation,
-                    _lastActiveMilliseconds, GuardianAltarTerminalResult.Failed, "all-failure-centers-defeated");
+                    _lastActiveMilliseconds, GuardianAltarTerminalResult.Failed, "all-failure-centers-defeated",
+                    _clearedRounds);
                 _terminalFact = fact;
                 created = true;
             }
@@ -460,8 +588,10 @@ namespace DfoServer.Game.Events.GuardianAltar
                     return fact.Result == GuardianAltarTerminalResult.Failed;
                 }
                 _lastActiveMilliseconds = Math.Max(_lastActiveMilliseconds, activeMilliseconds);
+                RecordClearedRoundLocked();
                 fact = new GuardianAltarTerminalFact(Guid.NewGuid(), _identity, _generation,
-                    _lastActiveMilliseconds, GuardianAltarTerminalResult.Failed, "guardian-character-death");
+                    _lastActiveMilliseconds, GuardianAltarTerminalResult.Failed, "guardian-character-death",
+                    _clearedRounds);
                 _terminalFact = fact;
                 created = true;
             }
@@ -476,13 +606,16 @@ namespace DfoServer.Game.Events.GuardianAltar
             {
                 if (_closed)
                     return;
+                RecordClearedRoundLocked();
                 if (_bound && _terminalFact == null)
                     _terminalFact = new GuardianAltarTerminalFact(Guid.NewGuid(), _identity, _generation,
-                        _lastActiveMilliseconds, GuardianAltarTerminalResult.Aborted, "instance-closed");
+                        _lastActiveMilliseconds, GuardianAltarTerminalResult.Aborted, "instance-closed",
+                        _clearedRounds);
                 _closed = true;
                 _pending = null;
                 _pendingEntries = null;
                 _pendingProjectionOffset = 0;
+                _pendingRoundAdvance = null;
                 _entries = Array.Empty<EntryState>();
                 _actors.Clear();
                 _alive = 0;
@@ -506,7 +639,7 @@ namespace DfoServer.Game.Events.GuardianAltar
                 : _actions[chosen.ActionId].Select(x => new EntryState
                 {
                     Definition = x,
-                    NextDue = phase.Start + x.FirstDelay,
+                    NextDue = checked(_roundStartsAt + phase.Start + x.FirstDelay),
                 }).ToArray();
         }
 
@@ -519,6 +652,21 @@ namespace DfoServer.Game.Events.GuardianAltar
         private bool MatchesScopeLocked(DungeonParticipantRoomIdentity identity, long loadingGeneration)
             => _bound && !_closed && identity.IsValid && _identity.Equals(identity)
                 && _generation == loadingGeneration;
+
+        private bool RecordClearedRoundLocked()
+        {
+            if (_survivalRounds.Length == 0 || !_bound || _closed || _terminalFact != null
+                || !_timelineEnded || _pending != null || _alive != 0 || _exhausted
+                || _centerSequences.Count == 0 || _deadCenters.Count == _centerSequences.Count)
+                return false;
+            _clearedRounds = Math.Max(_clearedRounds, _roundIndex + 1);
+            return true;
+        }
+
+        private bool IsPendingRoundLocked(GuardianAltarRoundAdvanceToken token)
+            => token != null && ReferenceEquals(token, _pendingRoundAdvance)
+                && MatchesLocked(token.Identity, token.LoadingGeneration)
+                && token.CompletedRound == _roundIndex + 1;
 
         private bool IsPendingLocked(GuardianAltarSpawnBatch batch)
             => batch != null && MatchesLocked(batch.Identity, batch.ProviderGeneration)

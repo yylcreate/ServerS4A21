@@ -7,7 +7,7 @@ using PvfLib;
 
 namespace DfoServer.SelfTests
 {
-    internal static class GuardianAltarDungeonDefinitionSelfTest
+    internal static partial class GuardianAltarDungeonDefinitionSelfTest
     {
         private const string DungeonHeader = "[dungeon type]\n`advance altar`\n";
         private const string OrdinaryRows =
@@ -36,6 +36,7 @@ namespace DfoServer.SelfTests
             Section("typed shared-root projections", () => CheckSharedProjections(Check));
             Section("DGN fail-closed validation", () => CheckInvalidDungeons(Check));
             Section("MAP fail-closed validation", () => CheckInvalidMaps(Check));
+            Section("frozen survival rounds retain independent phase contracts", () => CheckSurvivalRoundDefinitions(Check));
             Console.WriteLine($"GUARDIAN_ALTAR_DUNGEON_DEFINITION assertions={assertions} failures={failures}");
             return failures;
         }

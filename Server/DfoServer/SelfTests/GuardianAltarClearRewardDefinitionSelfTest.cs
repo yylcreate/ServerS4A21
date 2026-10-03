@@ -6,7 +6,7 @@ using PvfLib;
 
 namespace DfoServer.SelfTests
 {
-    internal static class GuardianAltarClearRewardDefinitionSelfTest
+    internal static partial class GuardianAltarClearRewardDefinitionSelfTest
     {
         private const string Row = "`normal` 2749211 4";
 
@@ -29,6 +29,8 @@ namespace DfoServer.SelfTests
             Section("current formal PVF ordinary rewards", () => CheckRealResources(Check));
             Section("ordered immutable reward definitions", () => CheckValidDefinitions(Check));
             Section("malformed rewards publish no partial definitions", () => CheckInvalidDefinitions(Check));
+            Section("current formal PVF survival interval rewards", () => CheckRealSurvivalRewards(Check));
+            Section("survival interval ownership and malformed resources", () => CheckSurvivalRewardValidation(Check));
             Console.WriteLine($"GUARDIAN_ALTAR_CLEAR_REWARD_DEFINITION assertions={assertions} failures={failures}");
             return failures;
         }
