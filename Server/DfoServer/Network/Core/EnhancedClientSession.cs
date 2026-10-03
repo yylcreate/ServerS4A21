@@ -34,6 +34,22 @@ namespace DfoServer.Network
 
         public GameSession GameSession { get; set; }
 
+        // Only a pending client projection. Ordinary skill/item ownership stays
+        // in the existing repositories and the session-owned InventoryLease.
+        private GuardianAltarControlProjectionSource _guardianAltarControls;
+        internal GuardianAltarControlProjectionSource GuardianAltarControls
+        {
+            get => Volatile.Read(ref _guardianAltarControls);
+            set => Volatile.Write(ref _guardianAltarControls, value);
+        }
+
+        internal bool TryCompleteGuardianControlsRestore(GuardianAltarControlProjectionSource source)
+            => ReferenceEquals(Interlocked.CompareExchange(ref _guardianAltarControls, null, source), source);
+
+        internal sealed record GuardianAltarControlProjectionSource(
+            GameSession Generation, AccountRecord Account, int CharacterId, int AccountId, ushort UserId,
+            DfoServer.Game.Dungeon.DungeonRunIdentity RunIdentity, long SelectionGeneration);
+
         // 玩家当前打开的收集箱 PVF [Index] 值(0388请求体末尾字节, 见 CollectionBoxHandler)
         public int SelectedCollectionBoxIndex { get; set; }
 

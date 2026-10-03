@@ -108,6 +108,35 @@ namespace DfoServer.Network.Handlers.Dungeon
                 secondGrow);
         }
 
+        internal async Task<bool> RestoreGuardianControlsAsync(
+            EnhancedClientSession session, Func<bool> current)
+        {
+            ArgumentNullException.ThrowIfNull(current);
+            if (!current() || !InventoryContext.TryGetOwnedLease(session.SessionId,
+                    session.Player.CharacterId, out var lease))
+                return false;
+            var state = LoadSyncedSkillState(session.Player.CharacterId, session.Player.Level, persist: false);
+            if (state.Points == null || !current())
+                return false;
+            var prepared = false;
+            var skillPacket = GamePacketEnvelopeBuilder.Build(0,
+                (ushort)NotiPacketTypeA21.SKILLINFO, SkillInfoBodyBuilder.BuildFrom(state.Skills));
+            bool OwnedCurrent() => current() && InventoryContext.IsCurrentLease(
+                lease, session.SessionId, session.Player.CharacterId);
+            await session.SendPreparedPacketBatchAsync(() =>
+            {
+                if (!OwnedCurrent())
+                    return Array.Empty<byte[]>();
+                prepared = true;
+                return new[] { skillPacket };
+            });
+            if (!prepared || !OwnedCurrent())
+                return false;
+            var itemsSent = await InventoryRefreshSender.TrySendOwnedItemListRefresh(
+                session, lease, InventoryListType.Main, OwnedCurrent);
+            return itemsSent && OwnedCurrent();
+        }
+
         internal bool TryGetSkillPointProtocolState(
             EnhancedClientSession session,
             bool persist,

@@ -74,6 +74,7 @@ namespace DfoServer.Network.Handlers
             _dungeonGiveupPartyDeparture;
         private Func<Task> _publishTownPartyLists;
         private Func<EnhancedClientSession, byte, byte, Task> _raidTownAreaChanged;
+        private Func<EnhancedClientSession, Func<bool>, Task<bool>> _restoreGuardianControls;
 
         private readonly InventoryRefreshSender _refresh;
 
@@ -141,6 +142,10 @@ namespace DfoServer.Network.Handlers
         {
             _raidTownAreaChanged = handler;
         }
+
+        internal void ConfigureGuardianControlsRestore(
+            Func<EnhancedClientSession, Func<bool>, Task<bool>> restore)
+            => _restoreGuardianControls = restore ?? throw new ArgumentNullException(nameof(restore));
 
         // 构建某在线会话玩家的完整 USERINFO subtype1（属性/装备/当前频道技能）。
         // 同屏时仅推 subtype0(精简外观)客户端能渲染但判定"对方不在城镇/不可邀请"; self 进游戏收的是 subtype0+subtype1
@@ -393,6 +398,45 @@ namespace DfoServer.Network.Handlers
                 return;
 
             PersistPosition(session, forceImmediate: true, source: "set_user_area");
+            // AREA_USERS has already switched the client from the activity to
+            // Town. Rebinding normal controls before this point is ignored by
+            // the client's active Guardian override.
+            await TryRestoreGuardianControlsAsync(session, projectionGuard);
+        }
+
+        private async Task TryRestoreGuardianControlsAsync(
+            EnhancedClientSession session, TownProjectionGuard guard)
+        {
+            var source = session.GuardianAltarControls;
+            if (source == null)
+                return;
+            bool Current() => CanContinueTownProjection(session, guard)
+                && ReferenceEquals(session.GuardianAltarControls, source)
+                && ReferenceEquals(session.GameSession, source.Generation)
+                && ReferenceEquals(session.Account, source.Account)
+                && session.Player.CharacterId == source.CharacterId
+                && session.Account?.AccountId == source.AccountId
+                && session.Player.UserId == source.UserId
+                && SessionDirectory.IsTownPresence(session.Player)
+                && session.Player.CurrentDungeonSelection == null && !session.Player.DungeonSelectionPending
+                && session.Player.CurrentDungeonRunGeneration == source.RunIdentity.RunGeneration
+                && session.Player.CurrentDungeonSelectionGeneration == source.SelectionGeneration
+                && (_sessions == null || (_sessions.TryGet(source.CharacterId, out var current)
+                    && ReferenceEquals(current, session)));
+            if (!Current())
+                return;
+            var restore = _restoreGuardianControls;
+            if (restore == null || !await restore(session, Current))
+            {
+                if (Current())
+                    throw new InvalidOperationException("Guardian normal controls projection is incomplete.");
+                return;
+            }
+            if (Current() && session.TryCompleteGuardianControlsRestore(source))
+            {
+                FileLogger.Log($"[GuardianAltarEntry] normal controls restored cid={source.CharacterId} "
+                    + $"run={source.RunIdentity.RunId}/{source.RunIdentity.RunGeneration}");
+            }
         }
 
         // 进本离开城镇的 USER_AREA 远程移除见 TownAreaRosterDepartureNotifier。

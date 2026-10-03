@@ -3,6 +3,8 @@ using System.Globalization;
 using System.Linq;
 using DfoServer.Game.DailyReset;
 using DfoServer.Infrastructure;
+using DfoServer.Game.Inventory;
+using DfoServer.Game.Mailbox;
 using Microsoft.Data.Sqlite;
 
 namespace DfoServer.Game.Events.GuardianAltar
@@ -11,25 +13,27 @@ namespace DfoServer.Game.Events.GuardianAltar
     // use the caller's inventory/outbox transaction; socket projections and
     // combat state remain with the Guardian coordinator/runtime.
     internal sealed class GuardianAltarProgressService : IGuardianAltarProgressService,
-        IGuardianAltarPurchaseService, IGuardianAltarSlotService
+        IGuardianAltarPurchaseService, IGuardianAltarSlotService, IGuardianAltarAchievementService
     {
         private readonly IGameDatabase _database;
         private readonly DailyResetService _dailyReset;
         private readonly Lazy<GuardianAltarMenuDefinition> _definition;
         private readonly GuardianAltarProgressRepository _repository = new();
+        private readonly MailboxService _mailbox;
 
         internal GuardianAltarProgressService(IGameDatabase database, DailyResetService dailyReset,
-            GuardianAltarMenuDefinition definition)
+            GuardianAltarMenuDefinition definition, MailboxService mailbox = null)
             : this(database, dailyReset, definition == null
-                ? throw new ArgumentNullException(nameof(definition)) : () => definition)
+                ? throw new ArgumentNullException(nameof(definition)) : () => definition, mailbox)
         {
         }
 
         internal GuardianAltarProgressService(IGameDatabase database, DailyResetService dailyReset,
-            Func<GuardianAltarMenuDefinition> definitionLoader)
+            Func<GuardianAltarMenuDefinition> definitionLoader, MailboxService mailbox = null)
         {
             _database = database ?? throw new ArgumentNullException(nameof(database));
             _dailyReset = dailyReset ?? throw new ArgumentNullException(nameof(dailyReset));
+            _mailbox = mailbox;
             ArgumentNullException.ThrowIfNull(definitionLoader);
             _definition = new Lazy<GuardianAltarMenuDefinition>(() => definitionLoader()
                 ?? throw new InvalidOperationException("Guardian menu definition loader returned no definition."));
@@ -145,6 +149,67 @@ namespace DfoServer.Game.Events.GuardianAltar
                 ValidateComplete(after, definition);
                 RequireCurrentGeneration(isCurrent);
                 return new GuardianAltarSlotResult(true, after, plan.Updated, !plan.IsReplay);
+            });
+        }
+
+        public GuardianAltarAchievementResult ClaimAchievement(int characterId, int accountId,
+            int achievementType, Func<bool> isCurrent = null)
+        {
+            if (characterId <= 0 || accountId <= 0)
+                throw new ArgumentOutOfRangeException(nameof(characterId));
+            var definition = _definition.Value;
+            var reward = definition.GetAchievementReward(achievementType);
+            // Item metadata, stack splitting and complete equipment cores use
+            // the existing item owner outside the SQLite write transaction.
+            System.Collections.Generic.List<MailboxSendAttachmentRequest> attachments = null;
+            var prepared = reward != null && MailboxInventoryOverflowRewardSink.TryBuildAttachmentRequests(
+                reward.Items.Select(x => InventoryRewardGrantRequest.Create(x.ItemId, x.Count,
+                    ItemCreateReason.MailAttachment)).ToArray(), out attachments)
+                && attachments.Count > 0 && attachments.Count <= 10;
+            return _database.Write((connection, transaction) =>
+            {
+                RequireCurrentGeneration(isCurrent);
+                _repository.RequireCharacterOwnership(connection, transaction, characterId, accountId);
+                var before = _repository.Read(connection, transaction, characterId, definition.RidableId);
+                ValidateComplete(before, definition);
+                if (reward == null)
+                    return new GuardianAltarAchievementResult(false, false, before, "unknown achievement");
+                if (before.Achievements.Any(x => x.AchievementId == achievementType && x.Claimed == 1))
+                {
+                    RequireCurrentGeneration(isCurrent);
+                    return new GuardianAltarAchievementResult(true, false, before);
+                }
+                if (!definition.IsAchievementEligible(before, reward))
+                {
+                    RequireCurrentGeneration(isCurrent);
+                    return new GuardianAltarAchievementResult(false, false, before, "achievement condition is not met");
+                }
+                if (!prepared || _mailbox == null)
+                    throw new InvalidOperationException("Guardian achievement mail authority or attachments are unavailable.");
+                RequireCurrentGeneration(isCurrent);
+                _repository.MarkAchievementClaimed(connection, transaction, characterId,
+                    definition.RidableId, achievementType);
+                var sent = _mailbox.SendSystemMails(connection, transaction, new[]
+                {
+                    new MailboxSendRequest
+                    {
+                        SenderCharacterId = characterId, SenderAccountId = accountId,
+                        SenderName = "DNF管理员", ReceiverCharacterId = characterId, ReceiverAccountId = accountId,
+                        Title = reward.PostalTitle, Text = reward.PostalLetter,
+                        MailType = 1, SourceProtocol = 0, Unlimited = true,
+                        AuditActor = "guardian-altar", AuditReason = $"achievement {achievementType}",
+                        IdempotencyKey = $"guardian-achievement-v1:{characterId}:{definition.RidableId}:{achievementType}",
+                        Attachments = attachments,
+                    }
+                });
+                // GameDatabase.Write commits normal returns. A delivery failure
+                // must throw so claimed state and every mail row roll back.
+                if (!sent.Success)
+                    throw new InvalidOperationException("Guardian achievement mail failed: " + sent.Error);
+                var after = _repository.Read(connection, transaction, characterId, definition.RidableId);
+                ValidateComplete(after, definition);
+                RequireCurrentGeneration(isCurrent);
+                return new GuardianAltarAchievementResult(true, true, after);
             });
         }
 

@@ -56,6 +56,9 @@ namespace DfoServer.Game.Events.GuardianAltar
         bool Changed, string RejectionReason = null);
     internal sealed record GuardianAltarAchievement(int AchievementId, byte Claimed);
 
+    internal sealed record GuardianAltarAchievementResult(bool Accepted, bool Changed,
+        GuardianAltarProgressSnapshot Progress, string RejectionReason = null);
+
     // Domain values, never an opaque wire blob. A snapshot is obtained in the
     // same transaction that initializes/refills the character-owned record.
     internal sealed class GuardianAltarProgressSnapshot
@@ -101,6 +104,12 @@ namespace DfoServer.Game.Events.GuardianAltar
     {
         GuardianAltarSlotResult SetSlot(int characterId, int accountId,
             GuardianAltarSlotRequest request, Func<bool> isCurrent = null);
+    }
+
+    internal interface IGuardianAltarAchievementService
+    {
+        GuardianAltarAchievementResult ClaimAchievement(int characterId, int accountId,
+            int achievementType, Func<bool> isCurrent = null);
     }
 
     internal static class GuardianAltarProgressValidator

@@ -227,6 +227,11 @@ namespace DfoServer.Network.Handlers.Dungeon
                         // the dedicated stage/map projection starts its loading.
                         session.Player.UserState = 1;
                         room.TryActivate();
+                        // Mark the possible client override before the batch is
+                        // written, so a partial START_MAP write can also restore.
+                        session.GuardianAltarControls = new EnhancedClientSession.GuardianAltarControlProjectionSource(
+                            session.GameSession, session.Account, cid, accountId, uid, identity,
+                            session.Player.CurrentDungeonSelectionGeneration);
                         projected = true;
                         return new[]
                         {

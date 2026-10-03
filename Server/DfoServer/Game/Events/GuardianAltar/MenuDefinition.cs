@@ -24,6 +24,7 @@ namespace DfoServer.Game.Events.GuardianAltar
         private readonly GuardianAltarSummonDataFile _summonData;
         private readonly IReadOnlyList<GuardianAltarStageDefinition> _orderedStages;
         private readonly Func<int, GuardianAltarClearRewardFile> _clearRewardLoader;
+        private readonly GuardianAltarAchievementRewardFile _achievementRewards;
 
         internal GuardianAltarMenuDefinition(int dailyRefillTicket, int ridableId,
             int firstDungeonId, IEnumerable<GuardianAltarPurchase> initialPurchases,
@@ -37,7 +38,8 @@ namespace DfoServer.Game.Events.GuardianAltar
             GuardianAltarEnergyConfigFile energy = null,
             GuardianAltarSummonDataFile summonData = null,
             IEnumerable<GuardianAltarStageDefinition> orderedStages = null,
-            Func<int, GuardianAltarClearRewardFile> clearRewardLoader = null)
+            Func<int, GuardianAltarClearRewardFile> clearRewardLoader = null,
+            GuardianAltarAchievementRewardFile achievementRewards = null)
         {
             if (dailyRefillTicket < 0 || ridableId <= 0 || firstDungeonId <= 0)
                 throw new ArgumentOutOfRangeException(nameof(dailyRefillTicket));
@@ -59,6 +61,11 @@ namespace DfoServer.Game.Events.GuardianAltar
                 .Where(x => !x.IsSurvival).OrderBy(x => x.AreaId).ThenBy(x => x.DistrictId)
                 .ThenBy(x => x.StageOrder).ToArray());
             _clearRewardLoader = clearRewardLoader;
+            if (achievementRewards != null && (!achievementRewards.IsValid
+                || achievementRewards.Rewards.Any(x => !_knownAchievementIds.Contains(x.Type)
+                    || x.ClearCount > _orderedStages.Count)))
+                throw new InvalidDataException("Guardian achievement rewards do not match the current stage catalog.");
+            _achievementRewards = achievementRewards;
             ValidateProgress(new GuardianAltarProgressSnapshot(1,
                 new GuardianAltarHeader(ridableId, dailyRefillTicket, 0, 0, 0, 0, 0, 0, 0, 0),
                 new[] { new GuardianAltarStage(firstDungeonId, -1) },
@@ -71,8 +78,29 @@ namespace DfoServer.Game.Events.GuardianAltar
         internal IReadOnlyList<GuardianAltarPurchase> InitialPurchases { get; }
         internal IReadOnlyList<GuardianAltarSlot> InitialSlots { get; }
         internal IReadOnlyList<GuardianAltarShopEntry> ShopEntries => _shopEntries;
+        internal IReadOnlyList<GuardianAltarAchievementReward> AchievementRewards
+            => _achievementRewards?.Rewards ?? Array.Empty<GuardianAltarAchievementReward>();
 
         internal bool ContainsDungeon(int dungeonId) => _knownDungeonIds.Contains(dungeonId);
+
+        internal GuardianAltarAchievementReward GetAchievementReward(int type)
+            => AchievementRewards.SingleOrDefault(x => x.Type == type);
+
+        internal bool IsAchievementEligible(GuardianAltarProgressSnapshot progress,
+            GuardianAltarAchievementReward reward)
+        {
+            ValidateProgress(progress);
+            if (reward == null || !ReferenceEquals(GetAchievementReward(reward.Type), reward))
+                return false;
+            if (progress.Stages.Any(x => _orderedStages.Any(stage => stage.DungeonId == x.DungeonId)
+                && x.Progress > 2))
+                throw new InvalidOperationException("Guardian ordinary difficulty progress is invalid.");
+            // Current A21 149E9C0 counts distinct ordinary stage rows whose
+            // highest cleared difficulty is >= the resource threshold. It
+            // does not count repeated clears or the separate survival vector.
+            return progress.Stages.Count(x => x.Progress >= reward.Difficulty
+                && _orderedStages.Any(stage => stage.DungeonId == x.DungeonId)) >= reward.ClearCount;
+        }
 
         internal bool TryCreatePurchasePlan(GuardianAltarProgressSnapshot progress,
             GuardianAltarPurchaseRequest request, out GuardianAltarPurchasePlan plan,
@@ -330,17 +358,20 @@ namespace DfoServer.Game.Events.GuardianAltar
                 ?? throw new InvalidDataException("Guardian ridable has no registered stage map.");
             var stages = GuardianAltarStageMapFile.Parse(PvfArchiveAccessor.ReadText(
                 "stagemap/" + entry.FilePath));
-            var achievementIds = GuardianAltarConfigFile.ParseAchievementIds(
-                PvfArchiveAccessor.ReadText("etc/advancealtar/advancealtarachievementreward.etc"));
+            var achievements = GuardianAltarAchievementRewardFile.Parse(
+                PvfArchiveAccessor.ReadText("etc/advancealtar/advancealtarachievementreward.etc"),
+                PvfArchiveAccessor.ReadText("etc/hardcodetexttag_chn.etc"));
+            if (!achievements.IsValid)
+                throw new InvalidDataException(achievements.InvalidReason);
             return Create(config, stages, id =>
                 DungeonCatalog.LoadDungeonList().GetById(id) != null
                 && !string.IsNullOrWhiteSpace(DungeonCatalog.GetDungeonFile(id)?.AdvanceAltarType),
-                achievementIds,
+                achievements.Rewards.Select(x => x.Type),
                 id => GuardianAltarDungeonFile.Parse(DungeonCatalog.GetDungeonFile(id)),
                 LoadRegisteredMap,
                 GuardianAltarSummonDataFile.Parse(PvfArchiveAccessor.ReadText(
                     "etc/advancealtar/advancealtarsummondata.etc")),
-                id => GuardianAltarClearRewardFile.Parse(DungeonCatalog.GetDungeonFile(id)));
+                id => GuardianAltarClearRewardFile.Parse(DungeonCatalog.GetDungeonFile(id)), achievements);
         }
 
         internal static MapFile LoadRegisteredMap(int mapId)
@@ -356,7 +387,8 @@ namespace DfoServer.Game.Events.GuardianAltar
             Func<int, GuardianAltarDungeonFile> dungeonLoader = null,
             Func<int, MapFile> mapLoader = null,
             GuardianAltarSummonDataFile summonData = null,
-            Func<int, GuardianAltarClearRewardFile> clearRewardLoader = null)
+            Func<int, GuardianAltarClearRewardFile> clearRewardLoader = null,
+            GuardianAltarAchievementRewardFile achievementRewards = null)
         {
             ArgumentNullException.ThrowIfNull(config);
             ArgumentNullException.ThrowIfNull(stageMap);
@@ -405,7 +437,8 @@ namespace DfoServer.Game.Events.GuardianAltar
                 ridable.Entries.SelectMany(x => x.Levels.Select(level =>
                     new GuardianAltarPurchase(x.ShopType, x.ResourceId, level.Level, level.Price))),
                 knownAchievementIds, ridable.Entries, dungeonLoader, mapLoader,
-                GuardianAltarEnergyConfigFile.Parse(config), summonData, stageMap.Stages, clearRewardLoader);
+                GuardianAltarEnergyConfigFile.Parse(config), summonData, stageMap.Stages, clearRewardLoader,
+                achievementRewards);
         }
     }
 }

@@ -184,6 +184,9 @@ namespace DfoServer.Network.Handlers
             Func<EnhancedClientSession, DungeonRunIdentity, Task> projection)
             => _services.TownReturn.ConfigureTownPresenceProjection(projection);
 
+        internal Task<bool> RestoreGuardianControlsAsync(EnhancedClientSession session, Func<bool> current)
+            => _services.ProgressNotifications.RestoreGuardianControlsAsync(session, current);
+
         internal void ConfigureRejectedPartySelectionReturn(
             Func<EnhancedClientSession, DungeonSelectionContext, Task> callback)
             => _entry.ConfigureRejectedPartySelectionReturn(callback);

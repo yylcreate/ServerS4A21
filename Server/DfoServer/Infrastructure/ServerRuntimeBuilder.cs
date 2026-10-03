@@ -809,7 +809,8 @@ namespace DfoServer.Infrastructure
 
             var guardianDefinition = new Lazy<GuardianAltarMenuDefinition>(GuardianAltarMenuDefinition.Load);
             var guardianProgress = new GuardianAltarProgressService(core.Database,
-                core.DailyResetService, () => guardianDefinition.Value);
+                core.DailyResetService, () => guardianDefinition.Value,
+                inventory.MailboxService);
             core.DungeonPersistentEffects.BindGuardianAltarProgressService(guardianProgress);
             var guardianAltarOpening = new GuardianAltarOpeningCoordinator(
                 core.EventManager.GuardianAltarOpening,

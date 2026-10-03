@@ -165,6 +165,17 @@ WHERE character_id=@cid AND ridable_id=@ridable AND slot_type=@type AND slot_ind
                 throw new InvalidOperationException("Guardian slot changed before commit.");
         }
 
+        internal void MarkAchievementClaimed(SqliteConnection connection, SqliteTransaction transaction,
+            int characterId, int ridableId, int achievementType)
+        {
+            if (Execute(connection, transaction, @"
+INSERT INTO character_guardian_altar_achievements(character_id,ridable_id,achievement_id,claimed)
+VALUES(@cid,@ridable,@type,1)
+ON CONFLICT(character_id,ridable_id,achievement_id) DO UPDATE SET claimed=1 WHERE claimed=0;",
+                ("@cid", characterId), ("@ridable", ridableId), ("@type", achievementType)) != 1)
+                throw new InvalidOperationException("Guardian achievement changed before its mail commit.");
+        }
+
         internal void SpendAvailableStars(SqliteConnection connection, SqliteTransaction transaction,
             int characterId, int ridableId, int previousAvailable, int cost)
         {

@@ -9,13 +9,19 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using DfoServer.Game.Accounts;
+using DfoServer.Game.CharacterData;
 using DfoServer.Game.Characters;
 using DfoServer.Game.Dungeon;
+using DfoServer.Game.Inventory;
+using DfoServer.Game.Progression;
 using DfoServer.Game.SelectCharacter;
 using DfoServer.Game.Session;
+using DfoServer.Game.Skills;
 using DfoServer.Infrastructure;
 using DfoServer.Network;
+using DfoServer.Network.Builders;
 using DfoServer.Network.Handlers;
+using DfoServer.Network.Handlers.Dungeon;
 using Microsoft.Data.Sqlite;
 
 namespace DfoServer.SelfTests
@@ -48,6 +54,9 @@ namespace DfoServer.SelfTests
             Section("stale and queued scope", () => VerifyScopeAsync(Check));
             Section("account write scope", () => VerifyAccountWriteScopeAsync(Check));
             Section("missing account character and retry", () => VerifyMissingCharacterAsync(Check));
+            Section("real normal controls restore", () => VerifyControlsRestoreAsync(Check));
+            Section("normal controls failure and retry", () => VerifyControlsRetryAsync(Check));
+            Section("normal controls source and send fences", () => VerifyControlsFencesAsync(Check));
             Console.WriteLine($"GUARDIAN_ALTAR_MENU_TOWN_PROJECTION assertions={assertions} failures={failures}");
             return failures;
         }
@@ -248,6 +257,237 @@ namespace DfoServer.SelfTests
                 && fixture.GuardianRows() == 0 && fixture.AccountHonorExp() == 0);
         }
 
+        private static async Task VerifyControlsRestoreAsync(Action<string, bool> check)
+        {
+            using var fixture = new Fixture();
+            fixture.ConfigureRealControls();
+            var lease = fixture.RegisterControlsInventory();
+            var originalSkills = SkillInfoBodyBuilder.BuildFrom(fixture.Progress.LoadSkills(fixture.Record.CharacterId));
+            var expectedSkills = SkillInfoBodyBuilder.BuildFrom(fixture.Projector.LoadSyncedSkillState(
+                fixture.Record.CharacterId, fixture.Record.Level, persist: false).Skills);
+            byte[] expectedItems;
+            lock (lease.SyncRoot)
+                expectedItems = ItemListPacketBuilder.BuildItemSpaceListBody(lease.Inventory, InventoryListType.Main);
+            var source = fixture.MarkControlsSource();
+            fixture.RejectSkillWrites();
+            var completed = await fixture.Town.ProjectGuardianMenuReturnAsync(
+                fixture.Session, fixture.CaptureFence()).WaitAsync(Timeout);
+            var packets = await fixture.DrainAsync();
+            var expectedTypes = TownTypes(true, true).ToList();
+            expectedTypes.InsertRange(4, new[] { (ushort)NotiPacketTypeA21.SKILLINFO, (ushort)NotiPacketTypeA21.ITEM_LIST });
+            check("real Town restores normal controls after AREA_USERS and self appearance before account state",
+                completed && packets.Select(Type).SequenceEqual(expectedTypes)
+                && fixture.Session.GuardianAltarControls == null);
+            var skillPacket = packets.Single(x => Type(x) == (ushort)NotiPacketTypeA21.SKILLINFO);
+            check("SKILLINFO rebinds both persisted skill pages through the real sync owner",
+                skillPacket.AsSpan(HeaderLength).SequenceEqual(expectedSkills)
+                && ReadSkillRows(skillPacket.AsSpan(HeaderLength).ToArray()).SequenceEqual(
+                    SkillRows(fixture.Progress.LoadSkills(fixture.Record.CharacterId))));
+            check("normal Main ITEM_LIST restores the actual owned inventory and quick item configuration",
+                packets.Single(x => Type(x) == (ushort)NotiPacketTypeA21.ITEM_LIST).AsSpan(HeaderLength).SequenceEqual(expectedItems)
+                && fixture.ReadPersistedItemCount() == 7 && lease.Inventory.GetItem(InventoryListType.Main, 3)?.Count == 7);
+            check("normal controls projection cannot persist derived mirrors or rewrite saved skill slots",
+                originalSkills.SequenceEqual(SkillInfoBodyBuilder.BuildFrom(fixture.Progress.LoadSkills(fixture.Record.CharacterId)))
+                && !fixture.Session.TryCompleteGuardianControlsRestore(source));
+            completed = await fixture.Town.ProjectGuardianMenuReturnAsync(
+                fixture.Session, fixture.CaptureFence()).WaitAsync(Timeout);
+            var repeated = await fixture.DrainAsync();
+            check("a later unmarked Town arrival retains its ordinary packets without repeating control restore",
+                completed && repeated.Select(Type).SequenceEqual(TownTypes(true, true)));
+        }
+
+        private static async Task VerifyControlsRetryAsync(Action<string, bool> check)
+        {
+            foreach (var failure in new[] { "missing owned lease", "skill read" })
+            {
+                using var fixture = new Fixture();
+                fixture.ConfigureRealControls();
+                if (failure == "skill read") fixture.RegisterControlsInventory();
+                var source = fixture.MarkControlsSource();
+                if (failure == "skill read") fixture.Sql("ALTER TABLE character_skills RENAME TO held_guardian_skills;");
+                Exception error;
+                try
+                {
+                    error = await ObserveAsync(() => fixture.Town.ProjectGuardianMenuReturnAsync(
+                        fixture.Session, fixture.CaptureFence()));
+                }
+                finally
+                {
+                    if (failure == "skill read") fixture.Sql("ALTER TABLE held_guardian_skills RENAME TO character_skills;");
+                }
+                var partial = await fixture.DrainAsync();
+                check(failure + " remains an observable failure and keeps the pending restore source",
+                    error != null && ReferenceEquals(fixture.Session.GuardianAltarControls, source)
+                    && !partial.Any(x => Type(x) == (ushort)NotiPacketTypeA21.SKILLINFO
+                        || Type(x) == (ushort)NotiPacketTypeA21.ITEM_LIST));
+                if (failure == "missing owned lease") fixture.RegisterControlsInventory();
+                var completed = await fixture.Town.ProjectGuardianMenuReturnAsync(
+                    fixture.Session, fixture.CaptureFence()).WaitAsync(Timeout);
+                var retry = await fixture.DrainAsync();
+                check(failure + " recovery reprojects through real repositories and clears only the completed source",
+                    completed && fixture.Session.GuardianAltarControls == null
+                    && retry.Count(x => Type(x) == (ushort)NotiPacketTypeA21.SKILLINFO) == 1
+                    && retry.Count(x => Type(x) == (ushort)NotiPacketTypeA21.ITEM_LIST) == 1
+                    && fixture.ReadPersistedItemCount() == 7);
+            }
+            using (var fixture = new Fixture())
+            {
+                fixture.ConfigureRealControls();
+                fixture.RegisterControlsInventory();
+                var source = fixture.MarkControlsSource();
+                // Shutdown disconnects the real local socket. The session's
+                // Stream getter fails in TcpClient.GetStream before WriteAsync;
+                // neither that failure nor retry may complete the pending source.
+                fixture.Session.TcpClient.Client.Shutdown(SocketShutdown.Send);
+                var error = await ObserveAsync(() => fixture.Projector.RestoreGuardianControlsAsync(
+                    fixture.Session, () => ReferenceEquals(fixture.Session.GuardianAltarControls, source)));
+                Console.WriteLine("[GuardianAltarMenuTownProjection] Shutdown(Send) restore failure: " + error);
+                check("a disconnected real transport fails at GetStream without restoring controls or clearing the source",
+                    error is InvalidOperationException && !fixture.Session.TcpClient.Connected
+                    && error.StackTrace?.Contains("TcpClient.GetStream", StringComparison.Ordinal) == true
+                    && fixture.PeerAvailableBytes == 0
+                    && ReferenceEquals(fixture.Session.GuardianAltarControls, source));
+                error = await ObserveAsync(() => fixture.Projector.RestoreGuardianControlsAsync(
+                    fixture.Session, () => ReferenceEquals(fixture.Session.GuardianAltarControls, source)));
+                check("retry on the same disconnected transport fails at GetStream without completing the source",
+                    error is InvalidOperationException && !fixture.Session.TcpClient.Connected
+                    && error.StackTrace?.Contains("TcpClient.GetStream", StringComparison.Ordinal) == true
+                    && fixture.PeerAvailableBytes == 0
+                    && ReferenceEquals(fixture.Session.GuardianAltarControls, source));
+            }
+        }
+
+        private static async Task VerifyControlsFencesAsync(Action<string, bool> check)
+        {
+            foreach (var stale in new[] { "generation", "account", "uid", "run epoch", "selection epoch" })
+            {
+                using var fixture = new Fixture();
+                fixture.ConfigureRealControls();
+                fixture.RegisterControlsInventory();
+                var source = fixture.MarkControlsSource();
+                fixture.Session.GuardianAltarControls = stale switch {
+                    "generation" => source with { Generation = null },
+                    "account" => source with { Account = new AccountRecord { AccountId = fixture.Record.AccountId } },
+                    "uid" => source with { UserId = 0 },
+                    "run epoch" => source with { RunIdentity = new DungeonRunIdentity(1, 1, source.RunIdentity.RunGeneration + 1) },
+                    _ => source with { SelectionGeneration = source.SelectionGeneration + 1 }
+                };
+                var pendingSource = fixture.Session.GuardianAltarControls;
+                var completed = await fixture.Town.ProjectGuardianMenuReturnAsync(
+                    fixture.Session, fixture.CaptureFence()).WaitAsync(Timeout);
+                var packets = await fixture.DrainAsync();
+                check("stale control " + stale + " emits no restore while ordinary Town remains available",
+                    completed && packets.Select(Type).SequenceEqual(TownTypes(true, true))
+                    && ReferenceEquals(fixture.Session.GuardianAltarControls, pendingSource));
+            }
+            using (var fixture = new Fixture())
+            {
+                fixture.RegisterControlsInventory();
+                var source = fixture.MarkControlsSource();
+                var entered = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+                var sendGateHeld = false;
+                fixture.Town.ConfigureGuardianControlsRestore(async (session, current) =>
+                {
+                    await fixture.SendGate.WaitAsync();
+                    sendGateHeld = true;
+                    entered.TrySetResult(true);
+                    return await fixture.Projector.RestoreGuardianControlsAsync(session, current);
+                });
+                var pending = fixture.Town.ProjectGuardianMenuReturnAsync(fixture.Session, fixture.CaptureFence());
+                EnhancedClientSession.GuardianAltarControlProjectionSource replacement;
+                try
+                {
+                    await entered.Task.WaitAsync(Timeout);
+                    replacement = source with { };
+                    fixture.Session.GuardianAltarControls = replacement;
+                    check("real skill restore waits on the actual send lock after the town roster", !pending.IsCompleted);
+                }
+                finally { if (sendGateHeld) fixture.SendGate.Release(); }
+                await pending.WaitAsync(Timeout);
+                var packets = await fixture.DrainAsync();
+                check("send-lock source replacement suppresses old skill and Main frames without clearing the new source",
+                    !packets.Any(x => Type(x) == (ushort)NotiPacketTypeA21.SKILLINFO
+                        || Type(x) == (ushort)NotiPacketTypeA21.ITEM_LIST)
+                    && ReferenceEquals(fixture.Session.GuardianAltarControls, replacement)
+                    && !fixture.Session.TryCompleteGuardianControlsRestore(source));
+            }
+            using (var fixture = new Fixture())
+            {
+                var lease = fixture.RegisterControlsInventory();
+                var source = fixture.MarkControlsSource();
+                await fixture.SendGate.WaitAsync();
+                Task<bool> pending;
+                EnhancedClientSession.GuardianAltarControlProjectionSource replacement;
+                try
+                {
+                    pending = InventoryRefreshSender.TrySendOwnedItemListRefresh(fixture.Session,
+                        lease, InventoryListType.Main, () => ReferenceEquals(fixture.Session.GuardianAltarControls, source));
+                    check("the real owned Main refresh waits on the actual send lock", !pending.IsCompleted);
+                    replacement = source with { };
+                    fixture.Session.GuardianAltarControls = replacement;
+                }
+                finally { fixture.SendGate.Release(); }
+                check("owned Main final send fence rejects a replaced source and cannot clear its replacement",
+                    !await pending.WaitAsync(Timeout) && (await fixture.DrainAsync()).Count == 0
+                    && ReferenceEquals(fixture.Session.GuardianAltarControls, replacement)
+                    && !fixture.Session.TryCompleteGuardianControlsRestore(source) && fixture.SendGate.CurrentCount == 1);
+            }
+            using (var fixture = new Fixture())
+            {
+                fixture.RegisterControlsInventory();
+                var source = fixture.MarkControlsSource();
+                EnhancedClientSession.GuardianAltarControlProjectionSource replacement = null;
+                fixture.Town.ConfigureGuardianControlsRestore(async (session, current) =>
+                {
+                    var restored = await fixture.Projector.RestoreGuardianControlsAsync(session, current);
+                    replacement = source with { };
+                    session.GuardianAltarControls = replacement;
+                    return restored;
+                });
+                await fixture.Town.ProjectGuardianMenuReturnAsync(fixture.Session, fixture.CaptureFence()).WaitAsync(Timeout);
+                var packets = await fixture.DrainAsync();
+                check("a replacement published after real restore cannot be cleared by the old completion checkpoint",
+                    packets.Count(x => Type(x) == (ushort)NotiPacketTypeA21.SKILLINFO) == 1
+                    && packets.Count(x => Type(x) == (ushort)NotiPacketTypeA21.ITEM_LIST) == 1
+                    && replacement != null && ReferenceEquals(fixture.Session.GuardianAltarControls, replacement)
+                    && !fixture.Session.TryCompleteGuardianControlsRestore(source));
+            }
+        }
+
+        private static IEnumerable<string> SkillRows(SkillInfoSnapshot skills)
+            => skills.Pages.SelectMany((page, index) => page.Entries.Select(entry =>
+                $"{index}:{entry.Slot}:{entry.SkillId}:{entry.Level}:{Convert.ToHexString(entry.ExtraValues.ToArray())}"));
+
+        private static IReadOnlyList<string> ReadSkillRows(byte[] body)
+        {
+            using var reader = new BinaryReader(new MemoryStream(body));
+            var rows = new List<string>();
+            for (var page = 0; page < 2; page++)
+            {
+                reader.ReadUInt16();
+                var count = reader.ReadByte();
+                for (var index = 0; index < count; index++)
+                {
+                    var slot = reader.ReadByte();
+                    var id = reader.ReadUInt16();
+                    var level = reader.ReadByte();
+                    var extra = reader.ReadBytes(reader.ReadByte());
+                    rows.Add($"{page}:{slot}:{id}:{level}:{Convert.ToHexString(extra)}");
+                }
+            }
+            reader.ReadUInt16();
+            reader.ReadUInt16();
+            if (reader.BaseStream.Position != reader.BaseStream.Length)
+                throw new InvalidDataException("Restored SKILLINFO did not contain exactly two pages and two tails.");
+            return rows;
+        }
+
+        private static async Task<Exception> ObserveAsync(Func<Task> action)
+        {
+            try { await action().WaitAsync(Timeout); return null; }
+            catch (Exception exception) { return exception; }
+        }
+
         private static ushort[] TownTypes(bool includeAccount, bool includeHonor)
         {
             var types = new List<ushort>
@@ -274,7 +514,10 @@ namespace DfoServer.SelfTests
             internal CharacterRecord Record { get; }
             internal EnhancedClientSession Session { get; }
             internal TownHandler Town { get; }
+            internal SqliteCharacterProgressRepository Progress { get; }
+            internal DungeonProgressNotificationProjector Projector { get; }
             internal SemaphoreSlim SendGate { get; }
+            internal int PeerAvailableBytes => _peer.Available;
             internal int PartyPublicationCount { get; private set; }
 
             internal Fixture(byte level = (byte)ExpTableProvider.MaxLevel)
@@ -345,6 +588,10 @@ namespace DfoServer.SelfTests
                         PartyPublicationCount++;
                         return Task.CompletedTask;
                     });
+                    Progress = new SqliteCharacterProgressRepository(Database);
+                    Projector = new DungeonProgressNotificationProjector(Database.ConnectionString, Records,
+                        new SqliteSubtype1Repository(Database), Progress, new SqliteSubtype0FieldsRepository(Database),
+                        new HonorLevelSyncService(Records, Database), new AccountExperienceProgressService(Records, Database), Sessions);
                 }
                 catch
                 {
@@ -368,6 +615,67 @@ namespace DfoServer.SelfTests
                     && !player.DungeonSelectionPending && player.CurrentDungeonRunGeneration == runGeneration
                     && player.CurrentDungeonSelectionGeneration == selectionGeneration;
             }
+
+            internal void ConfigureRealControls()
+                => Town.ConfigureGuardianControlsRestore(Projector.RestoreGuardianControlsAsync);
+
+            internal EnhancedClientSession.GuardianAltarControlProjectionSource MarkControlsSource()
+            {
+                var generation = Session.Player.CurrentDungeonRunGeneration;
+                if (generation == 0) generation = Session.Player.NextDungeonRunGeneration();
+                // Synthetic ended-run identity only. Restore authority comes
+                // from the real session epochs, repositories and owned lease.
+                var source = new EnhancedClientSession.GuardianAltarControlProjectionSource(Session.GameSession,
+                    Session.Account, Record.CharacterId, Record.AccountId, Session.Player.UserId,
+                    new DungeonRunIdentity(62021, 62021, generation), Session.Player.CurrentDungeonSelectionGeneration);
+                Session.GuardianAltarControls = source;
+                return source;
+            }
+
+            internal InventoryLease RegisterControlsInventory()
+            {
+                var catalog = CharacterSkillProfile.BuildSnapshot(Record.Job, 0, 0, Record.Level);
+                var known = catalog.Pages[0].Entries.First(entry => SkillDataProvider.GetSkill(Record.Job, entry.SkillId)
+                    is { IsActive: true } skill && skill.IsAvailableFor(0, 0));
+                var saved = new SkillInfoSnapshot();
+                foreach (var slot in new byte[] { 5, 9 })
+                {
+                    var page = new SkillInfoPageSnapshot();
+                    page.Entries.Add(new SkillInfoEntrySnapshot { Slot = slot, SkillId = known.SkillId, Level = known.Level });
+                    saved.Pages.Add(page);
+                }
+                Progress.SaveSkillProgress(Record.CharacterId, saved);
+                InventoryService inventory;
+                using (var connection = Database.OpenConnection())
+                    inventory = InventoryService.LoadFromDb(connection, Record.CharacterId, Record.AccountId, Database);
+                var item = ItemCore.Create(ItemCore.KindConsumable, 1031);
+                item.Count = 7;
+                inventory.SetItem(InventoryListType.Main, 3, item);
+                var lease = InventoryContext.Register(Session.SessionId, Record.CharacterId, inventory);
+                if (!OnlineInventoryMutationCommitCoordinator.TryCommit(lease, "selftest-guardian-normal-controls"))
+                    throw new InvalidOperationException("The real controls fixture inventory could not be committed.");
+                return lease;
+            }
+
+            internal int ReadPersistedItemCount()
+            {
+                using var connection = Database.OpenConnection();
+                return InventoryService.LoadFromDb(connection, Record.CharacterId, Record.AccountId, Database).CountMainItem(1031);
+            }
+
+            internal void RejectSkillWrites()
+            {
+                foreach (var operation in new[] { "INSERT", "UPDATE", "DELETE" })
+                    Sql($"CREATE TRIGGER reject_restore_{operation} BEFORE {operation} ON character_skills BEGIN SELECT RAISE(ABORT,'restore must remain read-only'); END;");
+            }
+
+            internal void Sql(string sql) => Database.Write((connection, transaction) =>
+            {
+                using var command = connection.CreateCommand();
+                command.Transaction = transaction;
+                command.CommandText = sql;
+                command.ExecuteNonQuery();
+            });
 
             internal async Task<List<byte[]>> DrainAsync()
             {
@@ -402,6 +710,7 @@ namespace DfoServer.SelfTests
 
             public void Dispose()
             {
+                InventoryContext.Unregister(Session.SessionId, Record.CharacterId);
                 Session?.Close();
                 _peer.Dispose();
                 DeleteDatabase();

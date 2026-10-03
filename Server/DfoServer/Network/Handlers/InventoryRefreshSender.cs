@@ -254,11 +254,17 @@ namespace DfoServer.Network.Handlers
                 return false;
             }
 
-            await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(
-                0x00,
-                0x000D,
-                body));
-            return true;
+            var prepared = false;
+            var packet = GamePacketEnvelopeBuilder.Build(0x00, (ushort)NotiPacketTypeA21.ITEM_LIST, body);
+            await session.SendPreparedPacketBatchAsync(() =>
+            {
+                if (!InventoryContext.IsCurrentLease(expectedLease, session.SessionId, player.CharacterId)
+                    || !projectionGuard())
+                    return Array.Empty<byte[]>();
+                prepared = true;
+                return new[] { packet };
+            });
+            return prepared;
         }
 
         public Task SendUpdateItemList(EnhancedClientSession session, InventoryListType itemSpace, short slotIndex)

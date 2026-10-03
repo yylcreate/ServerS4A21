@@ -117,6 +117,9 @@ namespace DfoServer.Network.Handlers
             handlers[(ushort)CmdPacketTypeA21.ADVANCE_ALTAR_SET_SLOT] =
                 (session, header, body) => HandleSetSlotAsync(
                     session, header, body, hasActiveTrade, mercenaryRestrictions);
+            handlers[(ushort)CmdPacketTypeA21.ADVANCE_ALTAR_GET_ACHIEVEMENT_REWARD] =
+                (session, header, body) => HandleAchievementRewardAsync(
+                    session, header, body, hasActiveTrade, mercenaryRestrictions);
         }
 
         internal void ConfigureDungeonEntry(DungeonHandler dungeon,
