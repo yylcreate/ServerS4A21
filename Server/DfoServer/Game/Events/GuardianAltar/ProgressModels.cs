@@ -42,6 +42,18 @@ namespace DfoServer.Game.Events.GuardianAltar
         short PreviousLevel, short NewLevel, bool Changed, string RejectionReason = null);
     internal sealed record GuardianAltarSlot(byte Locked, int SlotType,
         byte SlotIndex, int ResourceId);
+
+    internal readonly record struct GuardianAltarSlotRequest(
+        int RidableId, bool Equip, int SlotType, byte SlotIndex, int ResourceId);
+
+    internal sealed record GuardianAltarSlotPlan(GuardianAltarSlot Previous, GuardianAltarSlot Updated)
+    {
+        internal bool IsReplay => Previous == Updated;
+    }
+
+    internal sealed record GuardianAltarSlotResult(
+        bool Accepted, GuardianAltarProgressSnapshot Progress, GuardianAltarSlot Slot,
+        bool Changed, string RejectionReason = null);
     internal sealed record GuardianAltarAchievement(int AchievementId, byte Claimed);
 
     // Domain values, never an opaque wire blob. A snapshot is obtained in the
@@ -81,6 +93,14 @@ namespace DfoServer.Game.Events.GuardianAltar
     {
         GuardianAltarPurchaseResult Buy(int characterId, int accountId,
             GuardianAltarPurchaseRequest request, Func<bool> isCurrent = null);
+    }
+
+    // This capability belongs to the existing durable progress owner, not
+    // to combat runtime or a second menu cache.
+    internal interface IGuardianAltarSlotService
+    {
+        GuardianAltarSlotResult SetSlot(int characterId, int accountId,
+            GuardianAltarSlotRequest request, Func<bool> isCurrent = null);
     }
 
     internal static class GuardianAltarProgressValidator

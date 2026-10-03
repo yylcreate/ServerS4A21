@@ -268,6 +268,9 @@ namespace DfoServer.SelfTests
             if (!sparse.IsValid) throw new InvalidDataException(sparse.InvalidReason);
             var sparseDefinition = new GuardianAltarMenuDefinition(definition.DailyRefillTicket, definition.RidableId,
                 9001, definition.InitialPurchases, definition.InitialSlots, new[] { 9001, 12001, 7001 },
+                knownPurchases: definition.ShopEntries.SelectMany(shop => shop.Levels.Select(level =>
+                    new GuardianAltarPurchase(shop.ShopType, shop.ResourceId, level.Level, level.Price))),
+                shopEntries: definition.ShopEntries,
                 orderedStages: sparse.Stages);
             check("next ordinary stage follows sparse catalog row order rather than DungeonId plus one",
                 sparseDefinition.CreateClearProgressPlan(9001, 0).NextDungeonIds.SequenceEqual(new[] { 12001 })

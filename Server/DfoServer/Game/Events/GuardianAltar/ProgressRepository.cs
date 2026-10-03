@@ -5,7 +5,7 @@ using Microsoft.Data.Sqlite;
 namespace DfoServer.Game.Events.GuardianAltar
 {
     // SQL only. The progress/effect application owners supply the transaction
-    // shared by menu initialization or an ordinary clear and its rewards.
+    // shared by menu progress operations or an ordinary clear and its rewards.
     internal sealed class GuardianAltarProgressRepository
     {
         internal void ValidateRefillReceipt(SqliteConnection connection, SqliteTransaction transaction,
@@ -149,6 +149,20 @@ WHERE character_id=@cid AND ridable_id=@ridable AND shop_type=@type AND resource
                     ("@previousLevel", plan.Previous.Level), ("@previousPrice", plan.Previous.Price),
                     ("@newLevel", plan.Updated.Level), ("@newPrice", plan.Updated.Price)) != 1)
                 throw new InvalidOperationException("Guardian purchase changed before commit.");
+        }
+
+        internal void UpdateSlot(SqliteConnection connection, SqliteTransaction transaction,
+            int characterId, int ridableId, GuardianAltarSlotPlan plan)
+        {
+            if (Execute(connection, transaction, @"
+UPDATE character_guardian_altar_slots SET resource_id=@new
+WHERE character_id=@cid AND ridable_id=@ridable AND slot_type=@type AND slot_index=@slot
+    AND locked=@locked AND resource_id=@previous;",
+                    ("@cid", characterId), ("@ridable", ridableId),
+                    ("@type", plan.Previous.SlotType), ("@slot", plan.Previous.SlotIndex),
+                    ("@locked", plan.Previous.Locked), ("@previous", plan.Previous.ResourceId),
+                    ("@new", plan.Updated.ResourceId)) != 1)
+                throw new InvalidOperationException("Guardian slot changed before commit.");
         }
 
         internal void SpendAvailableStars(SqliteConnection connection, SqliteTransaction transaction,

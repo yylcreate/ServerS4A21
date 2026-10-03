@@ -14,9 +14,9 @@ using Microsoft.Data.Sqlite;
 
 namespace DfoServer.Network.Handlers
 {
-    // Entry/menu projection only. Dungeon combat, ticket consumption and
+    // Entry/menu application adapter. Dungeon combat, ticket consumption and
     // rewards are not owned by this coordinator.
-    internal sealed class GuardianAltarOpeningCoordinator : IDisposable
+    internal sealed partial class GuardianAltarOpeningCoordinator : IDisposable
     {
         private readonly GuardianAltarOpeningService _service;
         private readonly ISessionDirectory _sessions;
@@ -113,6 +113,9 @@ namespace DfoServer.Network.Handlers
                     session, header, body, hasActiveTrade, mercenaryRestrictions);
             handlers[(ushort)CmdPacketTypeA21.ADVANCE_ALTAR_BUY_ITEM] =
                 (session, header, body) => HandleBuyItemAsync(
+                    session, header, body, hasActiveTrade, mercenaryRestrictions);
+            handlers[(ushort)CmdPacketTypeA21.ADVANCE_ALTAR_SET_SLOT] =
+                (session, header, body) => HandleSetSlotAsync(
                     session, header, body, hasActiveTrade, mercenaryRestrictions);
         }
 

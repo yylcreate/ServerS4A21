@@ -70,6 +70,7 @@ namespace DfoServer.Game.Events.GuardianAltar
         internal int FirstDungeonId { get; }
         internal IReadOnlyList<GuardianAltarPurchase> InitialPurchases { get; }
         internal IReadOnlyList<GuardianAltarSlot> InitialSlots { get; }
+        internal IReadOnlyList<GuardianAltarShopEntry> ShopEntries => _shopEntries;
 
         internal bool ContainsDungeon(int dungeonId) => _knownDungeonIds.Contains(dungeonId);
 
@@ -128,6 +129,46 @@ namespace DfoServer.Game.Events.GuardianAltar
             plan = new GuardianAltarPurchasePlan(previous,
                 new GuardianAltarPurchase(request.ShopType, request.ResourceId,
                     target.Level, target.Price), cost);
+            return true;
+        }
+
+        internal bool TryCreateSlotPlan(GuardianAltarProgressSnapshot progress,
+            GuardianAltarSlotRequest request, out GuardianAltarSlotPlan plan, out string rejectionReason)
+        {
+            plan = null;
+            rejectionReason = null;
+            ValidateProgress(progress);
+            if (request.RidableId != RidableId || request.SlotType < 1 || request.SlotType > 2
+                || request.SlotIndex > 5 || request.ResourceId <= 0)
+            {
+                rejectionReason = "invalid slot or resource";
+                return false;
+            }
+            var slot = progress.Slots.Single(x => x.SlotType == request.SlotType
+                && x.SlotIndex == request.SlotIndex);
+            var learned = progress.Purchases.SingleOrDefault(x => x.ShopType == request.SlotType - 1
+                && x.ResourceId == request.ResourceId);
+            var shop = _shopEntries.SingleOrDefault(x => x.ShopType == request.SlotType - 1
+                && x.ResourceId == request.ResourceId);
+            if (slot.Locked != 0 || learned == null || learned.Level <= 0
+                || shop == null || !shop.IsSettableSlot
+                || shop.Levels.Count(x => x.Level == learned.Level && x.Price == learned.Price) != 1)
+            {
+                rejectionReason = "slot is locked or resource cannot be deployed";
+                return false;
+            }
+            var otherDeployment = progress.Slots.Any(x => x.SlotType == request.SlotType
+                && x.SlotIndex != request.SlotIndex && x.ResourceId == request.ResourceId);
+            // The menu sender chooses an empty, unlocked slot when equipping;
+            // an already deployed resource generates an explicit unequip.
+            // Do not overwrite another resource or migrate a second slot.
+            if (otherDeployment || (slot.ResourceId != 0 && slot.ResourceId != request.ResourceId))
+            {
+                rejectionReason = "resource no longer belongs to the requested slot";
+                return false;
+            }
+            plan = new GuardianAltarSlotPlan(slot,
+                slot with { ResourceId = request.Equip ? request.ResourceId : 0 });
             return true;
         }
 
@@ -260,6 +301,23 @@ namespace DfoServer.Game.Events.GuardianAltar
                 || snapshot.Purchases.Any(x => !_knownPurchases.Contains((x.ShopType, x.ResourceId, x.Level, x.Price)))
                 || snapshot.Achievements.Any(x => !_knownAchievementIds.Contains(x.AchievementId)))
                 throw new InvalidOperationException("Guardian progress does not match the current PVF catalog.");
+
+            var deployed = snapshot.Slots.Where(x => x.ResourceId > 0).ToArray();
+            if (deployed.GroupBy(x => (x.SlotType, x.ResourceId)).Any(group => group.Count() != 1))
+                throw new InvalidOperationException("Guardian resource is deployed in more than one slot.");
+            foreach (var slot in deployed)
+            {
+                var shop = _shopEntries.SingleOrDefault(x => x.ShopType == slot.SlotType - 1
+                    && x.ResourceId == slot.ResourceId);
+                var learned = snapshot.Purchases.Single(x => x.ShopType == slot.SlotType - 1
+                    && x.ResourceId == slot.ResourceId);
+                // Validate persisted deployments on every owner read, not only
+                // the current SET_SLOT request. Passive or changed catalog
+                // entries must never reach menu or frozen combat projections.
+                if (shop == null || !shop.IsSettableSlot
+                    || shop.Levels.Count(x => x.Level == learned.Level && x.Price == learned.Price) != 1)
+                    throw new InvalidOperationException("Guardian deployed resource is not valid in the current PVF catalog.");
+            }
         }
 
         internal static GuardianAltarMenuDefinition Load()

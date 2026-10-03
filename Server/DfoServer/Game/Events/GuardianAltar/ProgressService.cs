@@ -11,7 +11,7 @@ namespace DfoServer.Game.Events.GuardianAltar
     // use the caller's inventory/outbox transaction; socket projections and
     // combat state remain with the Guardian coordinator/runtime.
     internal sealed class GuardianAltarProgressService : IGuardianAltarProgressService,
-        IGuardianAltarPurchaseService
+        IGuardianAltarPurchaseService, IGuardianAltarSlotService
     {
         private readonly IGameDatabase _database;
         private readonly DailyResetService _dailyReset;
@@ -119,6 +119,32 @@ namespace DfoServer.Game.Events.GuardianAltar
                 RequireCurrentGeneration(isCurrent);
                 return new GuardianAltarPurchaseResult(GuardianAltarPurchaseOutcome.Success,
                     after, plan.Previous.Level, plan.Updated.Level, !plan.IsReplay);
+            });
+        }
+
+        public GuardianAltarSlotResult SetSlot(int characterId, int accountId,
+            GuardianAltarSlotRequest request, Func<bool> isCurrent = null)
+        {
+            if (characterId <= 0 || accountId <= 0)
+                throw new ArgumentOutOfRangeException(nameof(characterId));
+            var definition = _definition.Value;
+            return _database.Write((connection, transaction) =>
+            {
+                RequireCurrentGeneration(isCurrent);
+                _repository.RequireCharacterOwnership(connection, transaction, characterId, accountId);
+                var before = _repository.Read(connection, transaction, characterId, definition.RidableId);
+                ValidateComplete(before, definition);
+                if (!definition.TryCreateSlotPlan(before, request, out var plan, out var reason))
+                {
+                    RequireCurrentGeneration(isCurrent);
+                    return new GuardianAltarSlotResult(false, before, null, false, reason);
+                }
+                if (!plan.IsReplay)
+                    _repository.UpdateSlot(connection, transaction, characterId, definition.RidableId, plan);
+                var after = _repository.Read(connection, transaction, characterId, definition.RidableId);
+                ValidateComplete(after, definition);
+                RequireCurrentGeneration(isCurrent);
+                return new GuardianAltarSlotResult(true, after, plan.Updated, !plan.IsReplay);
             });
         }
 

@@ -7,6 +7,7 @@ using DfoServer.Game.Events.GuardianAltar;
 using DfoServer.Infrastructure;
 using DfoServer.Sqlite;
 using Microsoft.Data.Sqlite;
+using PvfLib;
 
 namespace DfoServer.SelfTests
 {
@@ -249,6 +250,7 @@ INSERT INTO character_guardian_altar_achievements VALUES(1,1,17,1);");
             check("invalid resources have no fabricated fallback or orphan role initialization",
                 Throws<InvalidDataException>(() => unavailable.LoadMenu(8, before)) && RoleRowCount(database, 8) == 0);
             VerifyCatalogRejection(database, service, before, check);
+            VerifyDeploymentRejection(database, daily, service, before, check);
             VerifyConstraints(database, check);
             Sql(database, "DELETE FROM characters WHERE character_id=2;");
             check("hard character deletion cascades all five Guardian tables", RoleRowCount(database, 2) == 0
@@ -307,23 +309,56 @@ INSERT INTO character_guardian_altar_achievements VALUES(1,1,17,1);");
                 check("schema rejects invalid role widths, flags, sums and composite owners", Throws<SqliteException>(() => Sql(database, statement)));
         }
 
-        private static GuardianAltarMenuDefinition Definition()
+        private static void VerifyDeploymentRejection(GameDatabase database, DailyResetService daily,
+            GuardianAltarProgressService service, DateTime utcNow, Action<string, bool> check)
         {
-            var slots = Enumerable.Range(0, 6).SelectMany(index => new[]
-            {
-                new GuardianAltarSlot(0, 1, (byte)index, index == 0 ? 101 : 0),
-                new GuardianAltarSlot((byte)(index < 4 ? 0 : 1), 2, (byte)index, index == 0 ? 201 : 0),
-            });
-            var purchases = new[]
-            {
-                new GuardianAltarPurchase(0, 101, 1, 0), new GuardianAltarPurchase(0, 102, 0, 1),
-                new GuardianAltarPurchase(1, 201, 1, 0), new GuardianAltarPurchase(2, 301, 0, 0),
-            };
-            // Fixture-only catalog explicitly permits the progression rows used
-            // by this test; production catalogs still come exclusively from PVF.
-            return new GuardianAltarMenuDefinition(3, 1, 3511, purchases, slots,
-                knownDungeonIds: new[] { 3511, 3512 },
-                knownPurchases: purchases.Concat(new[] { new GuardianAltarPurchase(0, 102, 2, 5) }),
+            var before = service.LoadMenu(2, utcNow);
+            var passiveCatalog = new GuardianAltarProgressService(database, daily, Definition(skillSettable: false));
+            check("persisted learned skill made passive by its typed catalog is rejected before menu projection",
+                Throws<InvalidOperationException>(() => passiveCatalog.LoadMenu(2, utcNow))
+                && Scalar(database, "SELECT resource_id FROM character_guardian_altar_slots WHERE character_id=2 AND slot_type=2 AND slot_index=0;") == 201
+                && Same(before, service.LoadMenu(2, utcNow)));
+            Sql(database, "UPDATE character_guardian_altar_slots SET resource_id=101 WHERE character_id=2 AND slot_type=1 AND slot_index=1;");
+            check("duplicate persisted deployment is rejected without silently removing either slot",
+                Throws<InvalidOperationException>(() => service.LoadMenu(2, utcNow))
+                && Scalar(database, "SELECT COUNT(*) FROM character_guardian_altar_slots WHERE character_id=2 AND slot_type=1 AND resource_id=101;") == 2);
+            Sql(database, "UPDATE character_guardian_altar_slots SET resource_id=0 WHERE character_id=2 AND slot_type=1 AND slot_index=1;");
+            check("explicit repair of the deployment fixture retains purchases, tickets and other durable facts",
+                Same(before, service.LoadMenu(2, utcNow)));
+            var ambiguousCatalog = new GuardianAltarProgressService(database, daily,
+                Definition(ambiguousUnitRow: true));
+            check("ambiguous higher catalog rows of an undeployed resource do not block valid menu progress",
+                Same(before, ambiguousCatalog.LoadMenu(2, utcNow)));
+            Sql(database, "UPDATE character_guardian_altar_purchases SET level=2,price=5 WHERE character_id=2 AND shop_type=0 AND resource_id=102;"
+                + "UPDATE character_guardian_altar_slots SET resource_id=102 WHERE character_id=2 AND slot_type=1 AND slot_index=1;");
+            check("a deployed learned row must resolve one catalog index instead of choosing an ambiguous row",
+                Throws<InvalidOperationException>(() => ambiguousCatalog.LoadMenu(2, utcNow))
+                && Scalar(database, "SELECT resource_id FROM character_guardian_altar_slots WHERE character_id=2 AND slot_type=1 AND slot_index=1;") == 102);
+            Sql(database, "UPDATE character_guardian_altar_purchases SET level=0,price=1 WHERE character_id=2 AND shop_type=0 AND resource_id=102;"
+                + "UPDATE character_guardian_altar_slots SET resource_id=0 WHERE character_id=2 AND slot_type=1 AND slot_index=1;");
+            check("restoring the isolated ambiguous deployment fixture preserves the original complete role",
+                Same(before, service.LoadMenu(2, utcNow)));
+        }
+
+        private static GuardianAltarMenuDefinition Definition(bool skillSettable = true, bool ambiguousUnitRow = false)
+        {
+            // The fixture uses the same typed PvfLib catalog as production.
+            // Its initial slots and all accepted learned rows come from that
+            // owner rather than an empty shop bypass for direct construction.
+            static string Entry(int id, string rows, bool settable = true)
+                => $"[id]\n{id}\n[unlock stage index]\n0\n"
+                    + $"[is settable slot]\n{(settable ? 1 : 0)}\n"
+                    + "[field name]\n`level` `index` `price`\n[/field name]\n[list]\n"
+                    + rows + "[/list]\n[/id]\n";
+            var config = GuardianAltarConfigFile.Parse("[daily refill ticket]\n3\n[/refill ticket]\n",
+                "[ridable id]\n1\n[unit]\n" + Entry(101, "1 101 0\n")
+                    + Entry(102, "0 102 1\n2 102 5\n" + (ambiguousUnitRow ? "2 103 5\n" : ""))
+                    + "[/unit]\n[skill]\n"
+                    + Entry(201, "1 201 0\n", skillSettable) + "[/skill]\n[tower]\n"
+                    + Entry(301, "0 301 0\n") + "[/tower]\n[/ridable id]\n");
+            var stages = GuardianAltarStageMapFile.Parse("[area]\n0\n[district]\n1\n[stage]\n"
+                + "3511 0 0 0\n3512 1 0 0\n[/stage]\n[/area]\n");
+            return GuardianAltarMenuDefinition.Create(config, stages, _ => true,
                 knownAchievementIds: new[] { 17 });
         }
 
