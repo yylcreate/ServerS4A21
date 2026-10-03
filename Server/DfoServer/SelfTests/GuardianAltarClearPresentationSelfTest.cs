@@ -28,6 +28,7 @@ namespace DfoServer.SelfTests
             Section("successful projection order and deadlines", () => CheckSuccess(Check));
             Section("failed direct EPLP", () => CheckFailure(Check));
             Section("survival failure presents committed completed rounds", () => CheckSurvivalFailure(Check));
+            Section("survival terminal boundaries without combat menu refresh", () => CheckSurvivalTerminals(Check));
             Section("projection retry and stale events", () => CheckRetry(Check));
             Section("explicit UTC and deadline overflow", () => CheckClock(Check));
             Console.WriteLine($"GUARDIAN_ALTAR_CLEAR_PRESENTATION assertions={assertions} failures={failures}");
@@ -94,6 +95,8 @@ namespace DfoServer.SelfTests
             var now = Utc();
             runtime.TryBind(fact);
             runtime.TryCommit(Result());
+            check("ordinary success still requires the committed menu projection before CLEAR",
+                runtime.RequiresMenuProjection);
             check("successful menu, clear and EPLP projections wait for the earlier checkpoint",
                 !runtime.TryMarkMenuProjectionSent(fact.EventId)
                 && !runtime.TryMarkClearProjectionSent(fact.EventId, now)
@@ -135,6 +138,7 @@ namespace DfoServer.SelfTests
             var fact = Fact(GuardianAltarTerminalResult.Failed);
             var now = Utc();
             runtime.TryBind(fact);
+            check("ordinary failure does not require a successful menu projection", !runtime.RequiresMenuProjection);
             check("failure needs no reward commit and cannot acquire a successful result",
                 runtime.TryCommit(null) && !runtime.TryCommit(Result()) && runtime.CommitResult == null);
             check("failure cannot record inventory, menu or clear projections",
@@ -169,9 +173,11 @@ namespace DfoServer.SelfTests
                 && !runtime.TryMarkEplpProjectionSent(fact.EventId, now));
             check("survival result preserves the frozen score and rejects an ordinary successful star result",
                 !runtime.TryCommit(Result()) && runtime.TryCommit(result)
-                && runtime.TryMarkInventoryProjectionSent(fact.EventId)
+                && !runtime.RequiresMenuProjection
                 && !runtime.TryMarkClearProjectionSent(fact.EventId, now)
-                && runtime.TryMarkMenuProjectionSent(fact.EventId)
+                && runtime.TryMarkInventoryProjectionSent(fact.EventId)
+                && !runtime.TryMarkMenuProjectionSent(fact.EventId)
+                && !runtime.MenuProjectionSent
                 && runtime.TryMarkClearProjectionSent(fact.EventId, now));
             check("survival result has the existing clear-to-EPLP deadline and repeats do not restart it",
                 !runtime.TryMarkEplpProjectionSent(fact.EventId, now.AddMilliseconds(3999))
@@ -180,6 +186,45 @@ namespace DfoServer.SelfTests
                 && runtime.TryMarkEplpProjectionSent(fact.EventId, now.AddSeconds(4))
                 && runtime.TryMarkEplpProjectionSent(fact.EventId, now.AddSeconds(5))
                 && runtime.ReturnDeadlineUtc == now.AddSeconds(54));
+        }
+
+        private static void CheckSurvivalTerminals(Action<string, bool> check)
+        {
+            foreach (var (terminal, rounds, best) in new[] {
+                (GuardianAltarTerminalResult.Failed, 0, 6),
+                (GuardianAltarTerminalResult.Failed, 6, 6),
+                (GuardianAltarTerminalResult.Succeeded, 99, 99) })
+            {
+                var runtime = new GuardianAltarClearPresentationRuntime();
+                var fact = Fact() with { Result = terminal, ClearedRounds = rounds };
+                var progress = Progress();
+                var commit = new GuardianAltarClearCommitResult
+                {
+                    ClearedRounds = rounds, BestRound = best, Improved = rounds == 99,
+                    ProgressSnapshot = new GuardianAltarProgressSnapshot(progress.CharacterId,
+                        progress.Header with { SurvivalBestPhase = checked((short)best) },
+                        progress.Stages, progress.Purchases, progress.Slots, progress.Achievements),
+                };
+                var now = Utc();
+                check($"survival {terminal}/{rounds} requires its committed result and inventory before CLEAR",
+                    runtime.TryBind(fact, survivalResult: true)
+                    && !runtime.RequiresMenuProjection && !runtime.TryMarkMenuProjectionSent(fact.EventId)
+                    && !runtime.TryMarkClearProjectionSent(fact.EventId, now)
+                    && runtime.TryCommit(commit)
+                    && !runtime.TryMarkClearProjectionSent(fact.EventId, now)
+                    && runtime.TryMarkInventoryProjectionSent(fact.EventId)
+                    && runtime.TryMarkClearProjectionSent(fact.EventId, now));
+                check($"survival {terminal}/{rounds} cannot invent a menu checkpoint or restart result deadlines",
+                    !runtime.TryMarkMenuProjectionSent(fact.EventId) && !runtime.MenuProjectionSent
+                    && !runtime.TryMarkClearProjectionSent(Guid.NewGuid(), now)
+                    && runtime.TryMarkClearProjectionSent(fact.EventId, now.AddSeconds(2))
+                    && runtime.EplpDeadlineUtc == now.AddSeconds(4)
+                    && !runtime.TryMarkEplpProjectionSent(fact.EventId, now.AddSeconds(3))
+                    && runtime.TryMarkEplpProjectionSent(fact.EventId, now.AddSeconds(4))
+                    && runtime.TryMarkEplpProjectionSent(fact.EventId, now.AddSeconds(20))
+                    && runtime.ReturnDeadlineUtc == now.AddSeconds(54)
+                    && ReferenceEquals(runtime.CommitResult, commit));
+            }
         }
 
         private static void CheckRetry(Action<string, bool> check)

@@ -64,6 +64,7 @@ namespace DfoServer.SelfTests
                 Section("Guardian survival entry and selector boundaries", () => CheckSurvivalEntryAsync(Check, definition).GetAwaiter().GetResult());
                 Section("Guardian dedicated failed settlement", () => CheckFailedClearAsync(Check, definition).GetAwaiter().GetResult());
                 Section("Guardian dedicated character death and coin refusal", () => CheckCharacterDeathAsync(Check, definition).GetAwaiter().GetResult());
+                Section("Guardian survival death durable result and projection", () => CheckSurvivalDeathAsync(Check, definition).GetAwaiter().GetResult());
                 Section("Guardian result-button selection and exit", () => CheckEplpSelectionAsync(Check, definition).GetAwaiter().GetResult());
             }
             Console.WriteLine($"GUARDIAN_ALTAR_DUNGEON_ENTRY assertions={assertions} failures={failures}");

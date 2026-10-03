@@ -146,7 +146,12 @@ namespace DfoServer.Network.Handlers.Dungeon
                         }
                         if (!presentation.TryMarkInventoryProjectionSent(fact.EventId)) return;
                     }
-                    if (!presentation.MenuProjectionSent)
+                    // UPDATE_RIDABLE rebuilds the menu, purchases and deployed
+                    // controls. Survival has no unlock/purchase/star changes;
+                    // its result and available tickets are in CLEAR/EPLP.
+                    // Read the committed menu on the next real START_GAME,
+                    // instead of rebuilding those controls on a dead actor.
+                    if (presentation.RequiresMenuProjection && !presentation.MenuProjectionSent)
                     {
                         if (!await SendClearFrameAsync(session, NotiPacketTypeA21.ADVANCE_ALTAR_UPDATE_RIDABLE,
                                 GuardianAltarMenuBodyBuilder.BuildUpdateRidable(commit.ProgressSnapshot, 0), Current)) return;

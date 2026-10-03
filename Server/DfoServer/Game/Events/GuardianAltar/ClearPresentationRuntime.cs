@@ -21,6 +21,9 @@ namespace DfoServer.Game.Events.GuardianAltar
         internal GuardianAltarTerminalFact Fact { get { lock (_syncRoot) return _fact; } }
         internal GuardianAltarClearCommitResult CommitResult { get { lock (_syncRoot) return _commitResult; } }
         internal bool InventoryProjectionSent { get { lock (_syncRoot) return _inventoryProjectionSent; } }
+        // Ordinary clear unlocks stages and purchases. Survival exposes score
+        // through CLEAR and reads the committed menu on the next START_GAME.
+        internal bool RequiresMenuProjection { get { lock (_syncRoot) return _fact?.Result == GuardianAltarTerminalResult.Succeeded && !_survivalResult; } }
         internal bool MenuProjectionSent { get { lock (_syncRoot) return _menuProjectionSent; } }
         internal bool ClearProjectionSent { get { lock (_syncRoot) return _clearProjectionSent; } }
         internal bool EplpProjectionSent { get { lock (_syncRoot) return _eplpProjectionSent; } }
@@ -84,7 +87,7 @@ namespace DfoServer.Game.Events.GuardianAltar
         {
             lock (_syncRoot)
             {
-                if (!CanProjectSuccessLocked(eventId) || !_inventoryProjectionSent)
+                if (!CanProjectSuccessLocked(eventId) || _survivalResult || !_inventoryProjectionSent)
                     return false;
                 _menuProjectionSent = true;
                 return true;
@@ -95,7 +98,8 @@ namespace DfoServer.Game.Events.GuardianAltar
         {
             lock (_syncRoot)
             {
-                if (!CanProjectSuccessLocked(eventId) || !_inventoryProjectionSent || !_menuProjectionSent
+                if (!CanProjectSuccessLocked(eventId) || !_inventoryProjectionSent
+                    || (!_survivalResult && !_menuProjectionSent)
                     || utcNow.Kind != DateTimeKind.Utc)
                     return false;
                 if (_clearProjectionSent)
