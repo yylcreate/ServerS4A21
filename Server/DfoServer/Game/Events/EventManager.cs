@@ -1,5 +1,6 @@
 using System;
 using DfoServer.Game.Events.DailyAttendanceAnytime;
+using DfoServer.Game.Events.FatigueAcceleration;
 using DfoServer.Game.Events.Joust;
 using DfoServer.Game.Events.PcRoomTimePoint;
 using DfoServer.Game.Events.TotalAttendance;
@@ -15,12 +16,18 @@ namespace DfoServer.Game.Events
         {
             Database = database ?? throw new ArgumentNullException(nameof(database));
             _repository = new GameEventRepository(Database);
+            FatigueAccelerationEntry = new FatigueAccelerationEntryService(Database);
         }
 
         internal IGameDatabase Database { get; }
 
+        internal FatigueAccelerationEntryService FatigueAccelerationEntry { get; }
+
         internal void Initialize()
         {
+            FatigueAccelerationEntry.Initialize(Environment.GetEnvironmentVariable(
+                FatigueAccelerationEntryService.EntryEnvironmentVariable));
+
             var joustConfig = JoustConfigProvider.Instance;
             joustConfig.Warmup();
             new JoustRepository(Database)

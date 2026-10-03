@@ -866,7 +866,10 @@ namespace DfoServer.Infrastructure
                 eventTotalAttendanceHandler,
                 new NpcFavorHandler(
                     core.Database,
-                    inventory.InventoryRefreshSender));
+                    inventory.InventoryRefreshSender),
+                new EventFatigueAccelerationHandler(
+                    core.EventManager.FatigueAccelerationEntry,
+                    world.CharacterTransitions));
         }
 
         internal CharacterSessionLifecycleCoordinator
