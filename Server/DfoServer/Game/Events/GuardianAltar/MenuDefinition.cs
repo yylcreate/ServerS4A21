@@ -23,6 +23,7 @@ namespace DfoServer.Game.Events.GuardianAltar
         private readonly GuardianAltarEnergyConfigFile _energy;
         private readonly GuardianAltarSummonDataFile _summonData;
         private readonly IReadOnlyList<GuardianAltarStageDefinition> _orderedStages;
+        private readonly IReadOnlyList<IReadOnlyList<GuardianAltarStageDefinition>> _survivalAreas;
         private readonly Func<int, GuardianAltarClearRewardFile> _clearRewardLoader;
         private readonly GuardianAltarAchievementRewardFile _achievementRewards;
 
@@ -57,9 +58,16 @@ namespace DfoServer.Game.Events.GuardianAltar
             _mapLoader = mapLoader;
             _energy = energy;
             _summonData = summonData;
-            _orderedStages = Array.AsReadOnly((orderedStages ?? Array.Empty<GuardianAltarStageDefinition>())
+            var stages = (orderedStages ?? Array.Empty<GuardianAltarStageDefinition>()).ToArray();
+            _orderedStages = Array.AsReadOnly(stages
                 .Where(x => !x.IsSurvival).OrderBy(x => x.AreaId).ThenBy(x => x.DistrictId)
                 .ThenBy(x => x.StageOrder).ToArray());
+            _survivalAreas = Array.AsReadOnly(stages.GroupBy(x => x.AreaId).OrderBy(x => x.Key)
+                .Where(area => area.Any(x => x.IsSurvival))
+                .Select(area => (IReadOnlyList<GuardianAltarStageDefinition>)Array.AsReadOnly(area.ToArray())).ToArray());
+            if (_survivalAreas.Any(area => !area.Any(x => !x.IsSurvival)
+                    || area.Any(x => !_knownDungeonIds.Contains(x.DungeonId))))
+                throw new InvalidDataException("Guardian survival area lacks its registered ordinary stage prerequisites.");
             _clearRewardLoader = clearRewardLoader;
             if (achievementRewards != null && (!achievementRewards.IsValid
                 || achievementRewards.Rewards.Any(x => !_knownAchievementIds.Contains(x.Type)
@@ -82,6 +90,22 @@ namespace DfoServer.Game.Events.GuardianAltar
             => _achievementRewards?.Rewards ?? Array.Empty<GuardianAltarAchievementReward>();
 
         internal bool ContainsDungeon(int dungeonId) => _knownDungeonIds.Contains(dungeonId);
+
+        internal IReadOnlyList<int> GetEligibleSurvivalDungeonIds(GuardianAltarProgressSnapshot progress)
+        {
+            ValidateProgress(progress);
+            var cleared = progress.Stages.ToDictionary(x => x.DungeonId, x => x.Progress);
+            if (_orderedStages.Any(stage => cleared.TryGetValue(stage.DungeonId, out var difficulty) && difficulty > 2))
+                throw new InvalidOperationException("Guardian ordinary difficulty progress is invalid.");
+            // Current A21 text requires every ordinary stage at easy or above.
+            // Survival is area-level PVF data; a missing/unplayed stage cannot
+            // count, and an already present survival row is not a prerequisite.
+            return Array.AsReadOnly(_survivalAreas
+                .Where(area => area.Where(x => !x.IsSurvival).All(stage =>
+                    cleared.TryGetValue(stage.DungeonId, out var difficulty) && difficulty >= 0))
+                .SelectMany(area => area.Where(x => x.IsSurvival).OrderBy(x => x.StageOrder))
+                .Select(stage => stage.DungeonId).ToArray());
+        }
 
         internal GuardianAltarAchievementReward GetAchievementReward(int type)
             => AchievementRewards.SingleOrDefault(x => x.Type == type);

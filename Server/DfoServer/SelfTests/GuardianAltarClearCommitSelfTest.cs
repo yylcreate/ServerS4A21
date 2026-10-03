@@ -14,7 +14,7 @@ using PvfLib;
 
 namespace DfoServer.SelfTests
 {
-    internal static class GuardianAltarClearCommitSelfTest
+    internal static partial class GuardianAltarClearCommitSelfTest
     {
         internal static int Run()
         {
@@ -40,6 +40,9 @@ namespace DfoServer.SelfTests
             Section("current participant fences", f => VerifyFences(f, Check));
             Section("atomic rollback and registered recovery", f => VerifyRollbackAndRecovery(f, Check));
             Section("full inventory rewards use the same mailbox transaction", f => VerifyOverflow(f, Check));
+            Section("earned survival menu repair and read-only continuation", f => VerifySurvivalMenuRepair(f, Check));
+            Section("final ordinary clear survival unlock and rollback", f => VerifySurvivalClearUnlock(f, Check));
+            Section("historical ordinary outbox compatibility", f => VerifySurvivalHistoricalEffects(f, Check));
             Console.WriteLine($"GUARDIAN_ALTAR_CLEAR_COMMIT assertions={assertions} failures={failures}");
             return failures;
         }
@@ -262,9 +265,9 @@ namespace DfoServer.SelfTests
                 effects.BindGuardianAltarProgressService(owner ?? Progress);
                 return effects;
             }
-            internal GuardianAltarClearCommitPlan Plan(byte difficulty)
+            internal GuardianAltarClearCommitPlan Plan(byte difficulty, int dungeonId = 0)
             {
-                var dgn = Definition.FirstDungeonId;
+                var dgn = dungeonId > 0 ? dungeonId : Definition.FirstDungeonId;
                 var rewards = GuardianAltarClearRewardFile.Parse(DungeonCatalog.GetDungeonFile(dgn));
                 if (!rewards.IsValid) throw new InvalidDataException(rewards.InvalidReason);
                 return new GuardianAltarClearCommitPlan(Definition.CreateClearProgressPlan(dgn, difficulty),

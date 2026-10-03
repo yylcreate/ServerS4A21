@@ -57,10 +57,13 @@ namespace DfoServer.Game.Events.GuardianAltar
                 _repository.ValidateRefillReceipt(connection, transaction, characterId, refillKey);
                 _repository.TryInitialize(connection, transaction, characterId, definition);
 
-                // Validate existing facts before normalization. Reopening a menu
-                // must not silently recreate missing purchases, slots or stages.
+                // Validate owned facts before deriving an earned unlock.
+                // Missing ordinary rows, purchases and slots are not recreated.
                 var existing = _repository.Read(connection, transaction, characterId, definition.RidableId);
                 ValidateComplete(existing, definition);
+                if (TryUnlockEligibleSurvivalStages(connection, transaction, existing, definition))
+                    _repository.UpdateClearHeader(connection, transaction, characterId,
+                        existing.Header with { MenuHintFlag = 1 });
                 if (!_dailyReset.TryGetCounter(connection, transaction, characterId, refillKey,
                         DailyResetService.PeriodDay, utcNow, out var receipt))
                     throw new InvalidOperationException("Guardian refill anchor is older than persisted daily state.");
@@ -329,6 +332,11 @@ namespace DfoServer.Game.Events.GuardianAltar
                     if (_repository.TryUnlockPurchase(connection, transaction, characterId, plan.RidableId, purchase))
                         purchases.Add(purchase);
             }
+            // Keep the accepted ordinary NextDungeonIds/outbox plan unchanged.
+            // Derive survival eligibility from this transaction's persisted
+            // stage facts, including this clear, independently of firstClear.
+            unlocked |= TryUnlockEligibleSurvivalStages(connection, transaction,
+                _repository.Read(connection, transaction, characterId, plan.RidableId), definition);
             var afterHeader = header with
             {
                 FreeTickets = header.FreeTickets > 0 ? header.FreeTickets - 1 : 0,
@@ -348,6 +356,16 @@ namespace DfoServer.Game.Events.GuardianAltar
                 NewPurchases = purchases.AsReadOnly(),
                 ProgressSnapshot = after,
             };
+        }
+
+        private bool TryUnlockEligibleSurvivalStages(SqliteConnection connection, SqliteTransaction transaction,
+            GuardianAltarProgressSnapshot progress, GuardianAltarMenuDefinition definition)
+        {
+            var changed = false;
+            foreach (var dungeonId in definition.GetEligibleSurvivalDungeonIds(progress))
+                changed |= _repository.TryUnlockStage(connection, transaction,
+                    progress.CharacterId, progress.Header.RidableId, dungeonId);
+            return changed;
         }
 
         private static void ValidateComplete(GuardianAltarProgressSnapshot snapshot,
