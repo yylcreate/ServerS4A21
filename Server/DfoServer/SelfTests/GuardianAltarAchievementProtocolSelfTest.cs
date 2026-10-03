@@ -46,7 +46,8 @@ namespace DfoServer.SelfTests
                 var definition = GuardianAltarMenuDefinition.Load();
                 Section("registered achievement authority", () => VerifyAdmissionAsync(definition, Check));
                 Section("committed result projection", () => VerifyResultsAsync(definition, Check));
-                Section("ACK and mailbox retry", () => VerifyTransportAsync(definition, Check));
+                Section("ACK, menu update and mailbox retry", () => VerifyTransportAsync(definition, Check));
+                Section("post-claim menu restriction and retry", () => VerifyMenuProjectionAsync(definition, Check));
                 Section("queued and final-source fencing", () => VerifyFencesAsync(definition, Check));
             }
             catch (Exception exception) { Check("current Guardian PVF: " + exception, false); }
@@ -135,19 +136,41 @@ namespace DfoServer.SelfTests
             using (var fixture = new Fixture(definition))
             {
                 fixture.Open();
+                check("fresh client achievement vector has no synthesized claim rows", fixture.ClientAchievements.Count == 0);
                 await fixture.DispatchAsync();
-                check("success projects the committed type before the mailbox alarm in separate send prepares",
+                check("success projects ACK, the committed menu snapshot and alarm in three separate send prepares",
                     fixture.Claims.Calls == 1 && fixture.Claims.Changes == 1
-                    && fixture.Packets.Count == 2 && IsAccepted(fixture.Packets[0], 1)
-                    && IsAlarm(fixture.Packets[1]) && fixture.Prepares == 2 && !fixture.Claims.CalledInPrepare);
+                    && fixture.Packets.Count == 3 && IsAccepted(fixture.Packets[0], 1)
+                    && IsUpdate(fixture.Packets[1]) && IsAlarm(fixture.Packets[2])
+                    && fixture.Prepares == 3 && !fixture.Claims.CalledInPrepare);
+                check("ACK cannot append an absent claim row, while UPDATE inserts the committed claimed row",
+                    fixture.ClientRowsAfterWrite.Count == 3 && fixture.ClientRowsAfterWrite[0].Count == 0
+                    && fixture.ClientRowsAfterWrite[1].TryGetValue(1, out var claimed) && claimed == 1
+                    && fixture.ClientRowsAfterWrite[2].SequenceEqual(fixture.ClientRowsAfterWrite[1]));
+                check("UPDATE independently consumes the owner's complete header and all seven arrays",
+                    fixture.Packets.Count == 3 && SameSnapshot(ReadUpdate(fixture.Packets[1],
+                        fixture.Session.Player.CharacterId), fixture.Claims.LastResult.Progress));
                 check("claim receives the current character and account without refilling menu state or starting a run",
                     fixture.Claims.LastCharacterId == fixture.Session.Player.CharacterId && fixture.Claims.LastAccountId == 11
                     && fixture.Menu.Reads == 0 && fixture.Session.Player.CurrentRun == null
                     && fixture.Session.Player.CurrentDungeonSelection == null);
                 await fixture.DispatchAsync();
-                check("an accepted already-committed receipt reprojects success and alarm without a second owner mutation",
-                    fixture.Claims.Calls == 2 && fixture.Claims.Changes == 1 && fixture.Packets.Count == 4
-                    && IsAccepted(fixture.Packets[2], 1) && IsAlarm(fixture.Packets[3]));
+                check("accepted Changed=false reprojects ACK, the full snapshot and alarm without a second owner mutation",
+                    fixture.Claims.Calls == 2 && fixture.Claims.Changes == 1 && fixture.Packets.Count == 6
+                    && !fixture.Claims.LastResult.Changed && IsAccepted(fixture.Packets[3], 1)
+                    && fixture.Packets[4].SequenceEqual(fixture.Packets[1]) && IsAlarm(fixture.Packets[5])
+                    && fixture.Menu.Reads == 0 && fixture.Prepares == 6);
+                await fixture.DispatchAsync(Body(2));
+                check("claiming another type publishes all previous claims instead of replacing the achievement vector with a delta",
+                    fixture.Claims.Changes == 2 && fixture.Packets.Count == 9
+                    && IsAccepted(fixture.Packets[6], 2)
+                    && SameSnapshot(ReadUpdate(fixture.Packets[7], fixture.Session.Player.CharacterId), fixture.Claims.LastResult.Progress)
+                    && fixture.ClientAchievements.Count == 2 && fixture.ClientAchievements[1] == 1
+                    && fixture.ClientAchievements[2] == 1 && IsAlarm(fixture.Packets[8]));
+                await fixture.DispatchAsync();
+                check("a later replay of the first type retains the complete multi-claim snapshot",
+                    fixture.Claims.Changes == 2 && fixture.Packets.Count == 12 && !fixture.Claims.LastResult.Changed
+                    && fixture.Packets[10].SequenceEqual(fixture.Packets[7]) && fixture.Menu.Reads == 0);
             }
             foreach (var result in new[] { "rejected", "null", "wrong character", "missing committed claim", "invalid snapshot", "SQLite failure" })
             {
@@ -163,28 +186,61 @@ namespace DfoServer.SelfTests
 
         private static async Task VerifyTransportAsync(GuardianAltarMenuDefinition definition, Action<string, bool> check)
         {
-            foreach (var failedWrite in new[] { 0, 1 })
+            foreach (var failedWrite in new[] { 0, 1, 2 })
             {
                 using var fixture = new Fixture(definition);
                 fixture.Open();
                 fixture.FailWriteNumber = failedWrite;
                 await fixture.DispatchAsync();
-                check((failedWrite == 0 ? "ACK" : "mailbox alarm") + " transport failure cannot undo the owner's committed claim",
-                    fixture.Claims.Changes == 1 && fixture.Packets.Count == failedWrite && fixture.SendGate.CurrentCount == 1);
+                var phase = failedWrite switch { 0 => "ACK", 1 => "UPDATE", _ => "mailbox alarm" };
+                check(phase + " transport failure cannot undo the owner's committed claim",
+                    fixture.Claims.Changes == 1 && fixture.Packets.Count == failedWrite
+                    && fixture.Prepares == failedWrite + 1 && fixture.SendGate.CurrentCount == 1
+                    && fixture.ClientAchievements.Count == (failedWrite == 2 ? 1 : 0));
                 fixture.FailWriteNumber = -1;
                 await fixture.DispatchAsync();
-                check("recovered transport retries committed success then alarm without another delivery: " + failedWrite,
-                    fixture.Claims.Changes == 1 && IsAccepted(fixture.Packets[^2], 1) && IsAlarm(fixture.Packets[^1]));
+                check("recovered " + phase + " retries the complete ACK/UPDATE/alarm chain without another delivery",
+                    fixture.Claims.Calls == 2 && fixture.Claims.Changes == 1 && !fixture.Claims.LastResult.Changed
+                    && fixture.Packets.Count == failedWrite + 3 && IsAccepted(fixture.Packets[^3], 1)
+                    && IsUpdate(fixture.Packets[^2]) && IsAlarm(fixture.Packets[^1])
+                    && fixture.ClientAchievements.TryGetValue(1, out var claimed) && claimed == 1
+                    && fixture.Menu.Reads == 0 && fixture.SendGate.CurrentCount == 1);
             }
-            foreach (var change in new[] { "GameSession", "run", "selection", "account object" })
+            foreach (var afterFrame in new[] { 0, 1, 2 })
+            foreach (var change in new[] { "GameSession", "run epoch", "selection epoch", "run", "selection",
+                "account", "account object", "uid", "character", "directory" })
             {
                 using var fixture = new Fixture(definition);
                 fixture.Open();
+                fixture.AfterWriteNumber = afterFrame;
                 fixture.AfterWrite = () => ChangeSource(fixture, change);
                 await fixture.DispatchAsync();
-                check("replacement " + change + " after the ACK suppresses the old mailbox alarm without copying or reverting claim",
-                    fixture.Claims.Changes == 1 && fixture.Packets.Count == 1 && IsAccepted(fixture.Packets[0], 1)
-                    && fixture.SendGate.CurrentCount == 1);
+                check("replacement " + change + " after frame " + afterFrame
+                    + (afterFrame == 2 ? " preserves the completed projection" : " suppresses remaining old-source projections"),
+                    fixture.Claims.Changes == 1 && fixture.Packets.Count == afterFrame + 1
+                    && IsAccepted(fixture.Packets[0], 1)
+                    && (afterFrame == 0 || IsUpdate(fixture.Packets[1]))
+                    && (afterFrame < 2 || IsAlarm(fixture.Packets[2]))
+                    && fixture.Menu.Reads == 0 && fixture.SendGate.CurrentCount == 1);
+            }
+            foreach (var replacementKind in new[] { "GameSession", "directory" })
+            {
+                using var fixture = new Fixture(definition);
+                fixture.Open();
+                var replacement = fixture.Session;
+                fixture.AfterWrite = () =>
+                {
+                    if (replacementKind == "directory") replacement = fixture.ReplaceDirectorySession();
+                    else fixture.Session.GameSession = GameSessionIdentity();
+                };
+                await fixture.DispatchAsync();
+                check(replacementKind + " replacement does not receive the old callback's UPDATE or alarm",
+                    fixture.Packets.Count == 1 && fixture.Claims.Changes == 1);
+                await fixture.DispatchAsync(requestSession: replacement);
+                check("a new request from the current " + replacementKind + " reloads and projects the existing claim",
+                    fixture.Claims.Calls == 2 && fixture.Claims.Changes == 1 && fixture.Packets.Count == 4
+                    && !fixture.Claims.LastResult.Changed && IsAccepted(fixture.Packets[1], 1)
+                    && IsUpdate(fixture.Packets[2]) && IsAlarm(fixture.Packets[3]) && fixture.Menu.Reads == 0);
             }
             using (var fixture = new Fixture(definition))
             {
@@ -193,6 +249,47 @@ namespace DfoServer.SelfTests
                 await fixture.DispatchAsync();
                 check("a disposed owner cannot claim or project using its registered callback",
                     fixture.Claims.Calls == 0 && fixture.Packets.Count == 0);
+            }
+        }
+
+        private static async Task VerifyMenuProjectionAsync(GuardianAltarMenuDefinition definition, Action<string, bool> check)
+        {
+            foreach (var restriction in new[] { "closed", "revision", "mercenary SQL", "mercenary", "trade" })
+            {
+                using var fixture = new Fixture(definition);
+                fixture.Open();
+                fixture.AfterWrite = () =>
+                {
+                    if (restriction == "mercenary SQL") fixture.Mercenary.Error = new SqliteException("injected update restriction failure", 5);
+                    else if (restriction == "mercenary") fixture.Mercenary.Assigned = true;
+                    else ChangeSource(fixture, restriction);
+                };
+                await fixture.DispatchAsync();
+                check(restriction + " after ACK suppresses UPDATE while allowing the committed mail notification",
+                    fixture.Claims.Changes == 1 && fixture.Packets.Count == 2 && IsAccepted(fixture.Packets[0], 1)
+                    && IsAlarm(fixture.Packets[1]) && fixture.Prepares == 3
+                    && fixture.ClientAchievements.Count == 0 && fixture.Menu.Reads == 0 && fixture.SendGate.CurrentCount == 1);
+                if (restriction == "closed") fixture.Open();
+                fixture.Mercenary.Error = null;
+                fixture.Mercenary.Assigned = false;
+                fixture.Trading = false;
+                await fixture.DispatchAsync();
+                check("a fresh legal request after " + restriction + " reprojects the claimed menu without awarding again",
+                    fixture.Claims.Calls == 2 && fixture.Claims.Changes == 1 && !fixture.Claims.LastResult.Changed
+                    && fixture.Packets.Count == 5 && IsAccepted(fixture.Packets[2], 1)
+                    && IsUpdate(fixture.Packets[3]) && IsAlarm(fixture.Packets[4])
+                    && fixture.ClientAchievements.TryGetValue(1, out var claimed) && claimed == 1 && fixture.Menu.Reads == 0);
+            }
+            using (var fixture = new Fixture(definition))
+            {
+                fixture.Open();
+                fixture.AfterWriteNumber = 1;
+                fixture.AfterWrite = () => fixture.Service.Close();
+                await fixture.DispatchAsync();
+                check("closing the activity after UPDATE does not suppress an identity-current committed mail alarm",
+                    fixture.Claims.Changes == 1 && fixture.Packets.Count == 3
+                    && IsAccepted(fixture.Packets[0], 1) && IsUpdate(fixture.Packets[1]) && IsAlarm(fixture.Packets[2])
+                    && fixture.ClientAchievements.TryGetValue(1, out var claimed) && claimed == 1 && fixture.Menu.Reads == 0);
             }
         }
 
@@ -270,6 +367,7 @@ namespace DfoServer.SelfTests
                     break;
                 case "trade": fixture.Trading = true; break;
                 case "closed": fixture.Service.Close(); break;
+                case "revision": fixture.ChangeWindow(); break;
                 default: throw new ArgumentOutOfRangeException(nameof(change));
             }
         }
@@ -283,7 +381,7 @@ namespace DfoServer.SelfTests
             { Reads++; return Snapshot(characterId, Array.Empty<GuardianAltarAchievement>()); }
             protected GuardianAltarProgressSnapshot Snapshot(int characterId, IEnumerable<GuardianAltarAchievement> achievements)
                 => new(characterId, new GuardianAltarHeader(Definition.RidableId, Definition.DailyRefillTicket,
-                        0, 0, 0, 0, 0, 0, 0, 0), new[] { new GuardianAltarStage(Definition.FirstDungeonId, -1) },
+                        2, 7, 9, 10, 11, 1, 0x12345678, 1), new[] { new GuardianAltarStage(Definition.FirstDungeonId, -1) },
                     Definition.InitialPurchases, Definition.InitialSlots, achievements);
         }
 
@@ -301,6 +399,7 @@ namespace DfoServer.SelfTests
             internal Action DuringClaim;
             internal Exception Error;
             internal string ResultMode;
+            internal GuardianAltarAchievementResult LastResult;
             internal ClaimStub(GuardianAltarMenuDefinition definition) : base(definition) { }
             public GuardianAltarAchievementResult ClaimAchievement(int characterId, int accountId,
                 int achievementType, Func<bool> isCurrent = null)
@@ -318,9 +417,10 @@ namespace DfoServer.SelfTests
                 var changed = accepted && _committed.Add((characterId, achievementType));
                 if (changed) Changes++;
                 var claims = accepted && ResultMode != "missing committed claim"
-                    ? new[] { new GuardianAltarAchievement(achievementType, ResultMode == "invalid snapshot" ? (byte)2 : (byte)1) }
+                    ? _committed.Where(x => x.CharacterId == characterId)
+                        .Select(x => new GuardianAltarAchievement(x.Type, ResultMode == "invalid snapshot" ? (byte)2 : (byte)1)).ToArray()
                     : Array.Empty<GuardianAltarAchievement>();
-                return new GuardianAltarAchievementResult(accepted, changed,
+                return LastResult = new GuardianAltarAchievementResult(accepted, changed,
                     Snapshot(characterId + (ResultMode == "wrong character" ? 1 : 0), claims),
                     accepted ? null : "fixture domain rejection");
             }
@@ -329,7 +429,8 @@ namespace DfoServer.SelfTests
         private sealed class MercenaryStub : IMercenaryRestrictionService
         {
             internal bool Assigned;
-            public bool IsAssigned(int characterId) => Assigned;
+            internal Exception Error;
+            public bool IsAssigned(int characterId) => Error != null ? throw Error : Assigned;
             public bool CanDelete(int characterId) => !Assigned;
             public bool CanMutateAppearance(int characterId) => !Assigned;
             public bool CanEnterContent(int characterId) => !Assigned;
@@ -348,6 +449,8 @@ namespace DfoServer.SelfTests
             internal readonly MenuStub Menu;
             internal readonly EnhancedClientSession Session;
             internal readonly List<byte[]> Packets = new();
+            internal readonly Dictionary<int, byte> ClientAchievements = new();
+            internal readonly List<Dictionary<int, byte>> ClientRowsAfterWrite = new();
             private readonly List<EnhancedClientSession> _ownedSessions = new();
             private readonly DateTimeOffset _now = new(2026, 10, 3, 10, 0, 0, TimeSpan.Zero);
             private bool _preparing;
@@ -357,6 +460,7 @@ namespace DfoServer.SelfTests
             internal bool Trading;
             internal Action BeforePrepare;
             internal Action AfterWrite;
+            internal int AfterWriteNumber;
             internal Fixture(GuardianAltarMenuDefinition definition, bool capability = true)
             {
                 Claims = new ClaimStub(definition) { InPrepare = () => _preparing };
@@ -369,6 +473,7 @@ namespace DfoServer.SelfTests
                 Session = CreateSession();
             }
             internal void Open() => Service.SetWindow(_now, _now.AddMinutes(5));
+            internal void ChangeWindow() => Service.SetWindow(_now, _now.AddMinutes(6));
             private EnhancedClientSession CreateSession()
             {
                 var session = new EnhancedClientSession(new TcpClient(), new GamePacketHeader());
@@ -385,13 +490,14 @@ namespace DfoServer.SelfTests
                 Sessions.Register(session.Player.CharacterId, session);
                 return session;
             }
-            internal void ReplaceDirectorySession() => CreateSession();
-            internal Task DispatchAsync(byte[] body = null, byte command = 1, ushort? type = null)
+            internal EnhancedClientSession ReplaceDirectorySession() => CreateSession();
+            internal Task DispatchAsync(byte[] body = null, byte command = 1, ushort? type = null,
+                EnhancedClientSession requestSession = null)
             {
                 if (!Registry.TryGetValue((ushort)CmdPacketTypeA21.ADVANCE_ALTAR_GET_ACHIEVEMENT_REWARD, out var handler))
                     throw new InvalidOperationException("achievement handler not registered");
                 body ??= Body(1);
-                return handler(Session, new GamePacketHeader { cmd = command,
+                return handler(requestSession ?? Session, new GamePacketHeader { cmd = command,
                     type = type ?? (ushort)CmdPacketTypeA21.ADVANCE_ALTAR_GET_ACHIEVEMENT_REWARD,
                     length = checked((uint)(14 + body.Length)) }, body).WaitAsync(Timeout);
             }
@@ -405,11 +511,37 @@ namespace DfoServer.SelfTests
                     finally { _preparing = false; }
                 }, packet =>
                 {
-                    if (_writeNumber++ == FailWriteNumber) throw new IOException("injected achievement transport failure");
+                    var writeNumber = _writeNumber++;
+                    if (writeNumber == FailWriteNumber) throw new IOException("injected achievement transport failure");
                     Packets.Add(packet.ToArray());
-                    var after = AfterWrite; AfterWrite = null; after?.Invoke();
+                    ProjectClientAchievements(packet, session.Player.CharacterId);
+                    ClientRowsAfterWrite.Add(new Dictionary<int, byte>(ClientAchievements));
+                    if (writeNumber == AfterWriteNumber)
+                    {
+                        var after = AfterWrite; AfterWrite = null; after?.Invoke();
+                    }
                     return Task.CompletedTask;
                 });
+            private void ProjectClientAchievements(byte[] packet, int characterId)
+            {
+                if (packet.Length == 24 && packet[0] == 1
+                    && BinaryPrimitives.ReadUInt16LittleEndian(packet.AsSpan(1, 2))
+                        == (ushort)CmdPacketTypeA21.ADVANCE_ALTAR_GET_ACHIEVEMENT_REWARD
+                    && packet[15] == 1 && BinaryPrimitives.ReadInt32LittleEndian(packet.AsSpan(16, 4)) == 0)
+                {
+                    // Current A21 146B0B0 only marks an existing five-byte row.
+                    // It cannot insert the first claim into an empty vector.
+                    var type = BinaryPrimitives.ReadInt32LittleEndian(packet.AsSpan(20, 4));
+                    if (ClientAchievements.ContainsKey(type)) ClientAchievements[type] = 1;
+                }
+                else if (IsUpdate(packet))
+                {
+                    var snapshot = ReadUpdate(packet, characterId);
+                    ClientAchievements.Clear();
+                    foreach (var achievement in snapshot.Achievements)
+                        ClientAchievements.Add(achievement.AchievementId, achievement.Claimed);
+                }
+            }
             public void Dispose()
             {
                 Coordinator.Dispose();
@@ -435,6 +567,65 @@ namespace DfoServer.SelfTests
         private static bool IsAlarm(byte[] packet) => packet[0] == 0
             && BitConverter.ToUInt16(packet, 1) == (ushort)NotiPacketTypeA21.MAILBOX_ALARM
             && packet.AsSpan(15).SequenceEqual(MailboxHandler.BuildMailboxAlarmNotification(1));
+        private static bool IsUpdate(byte[] packet) => packet.Length >= 49 && packet[0] == 0
+            && BinaryPrimitives.ReadUInt16LittleEndian(packet.AsSpan(1, 2))
+                == (ushort)NotiPacketTypeA21.ADVANCE_ALTAR_UPDATE_RIDABLE
+            && BinaryPrimitives.ReadInt32LittleEndian(packet.AsSpan(3, 4)) == packet.Length;
+        private static GuardianAltarProgressSnapshot ReadUpdate(byte[] packet, int characterId)
+        {
+            if (!IsUpdate(packet) || packet[15] != 0)
+                throw new InvalidDataException("Expected the current NOTI menu snapshot with its raw zero prefix.");
+            var offset = 16;
+            int Int32() { var value = BinaryPrimitives.ReadInt32LittleEndian(packet.AsSpan(offset, 4)); offset += 4; return value; }
+            uint UInt32() { var value = BinaryPrimitives.ReadUInt32LittleEndian(packet.AsSpan(offset, 4)); offset += 4; return value; }
+            short Int16() { var value = BinaryPrimitives.ReadInt16LittleEndian(packet.AsSpan(offset, 2)); offset += 2; return value; }
+            byte Byte() => packet[offset++];
+            int Count(int rowWidth)
+            {
+                var count = UInt32();
+                if (count > (uint)((packet.Length - offset) / rowWidth))
+                    throw new InvalidDataException("Truncated menu snapshot array.");
+                return checked((int)count);
+            }
+            // Independent consumer: no call back into the production writer.
+            var header = new GuardianAltarHeader(Int32(), Int32(), Int32(), Int32(), Int32(), Int32(),
+                Int16(), Int16(), UInt32(), Byte());
+            var stages = new List<GuardianAltarStage>();
+            var stageCount = Count(8);
+            for (var index = 0; index < stageCount; index++) stages.Add(new GuardianAltarStage(Int32(), Int32()));
+            var purchases = new List<GuardianAltarPurchase>();
+            for (var type = 0; type <= 2; type++)
+            {
+                var count = Count(12);
+                for (var index = 0; index < count; index++)
+                {
+                    var purchase = new GuardianAltarPurchase(Int32(), Int32(), Int16(), Int16());
+                    if (purchase.ShopType != type) throw new InvalidDataException("Menu purchase is in the wrong vector.");
+                    purchases.Add(purchase);
+                }
+            }
+            var slots = new List<GuardianAltarSlot>();
+            for (var type = 1; type <= 2; type++)
+            {
+                var count = Count(10);
+                for (var index = 0; index < count; index++)
+                {
+                    var slot = new GuardianAltarSlot(Byte(), Int32(), Byte(), Int32());
+                    if (slot.SlotType != type) throw new InvalidDataException("Menu slot is in the wrong vector.");
+                    slots.Add(slot);
+                }
+            }
+            var achievements = new List<GuardianAltarAchievement>();
+            var achievementCount = Count(5);
+            for (var index = 0; index < achievementCount; index++)
+                achievements.Add(new GuardianAltarAchievement(Int32(), Byte()));
+            if (offset != packet.Length) throw new InvalidDataException("Menu update has an unconsumed tail.");
+            return new GuardianAltarProgressSnapshot(characterId, header, stages, purchases, slots, achievements);
+        }
+        private static bool SameSnapshot(GuardianAltarProgressSnapshot left, GuardianAltarProgressSnapshot right)
+            => left.CharacterId == right.CharacterId && left.Header == right.Header
+                && left.Stages.SequenceEqual(right.Stages) && left.Purchases.SequenceEqual(right.Purchases)
+                && left.Slots.SequenceEqual(right.Slots) && left.Achievements.SequenceEqual(right.Achievements);
         private static DungeonTownReturnAnchor Anchor(EnhancedClientSession session)
             => new(session.Player.CurTownId, session.Player.CurAreaId, 0, 0, 5, 0);
         private static GameSession GameSessionIdentity()

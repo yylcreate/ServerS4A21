@@ -1,4 +1,5 @@
 using System;
+using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -12,7 +13,10 @@ using DfoServer.Game.Accounts;
 using DfoServer.Game.CharacterData;
 using DfoServer.Game.Characters;
 using DfoServer.Game.Dungeon;
+using DfoServer.Game.DailyReset;
+using DfoServer.Game.Events.GuardianAltar;
 using DfoServer.Game.Inventory;
+using DfoServer.Game.Mercenary;
 using DfoServer.Game.Progression;
 using DfoServer.Game.SelectCharacter;
 using DfoServer.Game.Session;
@@ -55,6 +59,9 @@ namespace DfoServer.SelfTests
             Section("account write scope", () => VerifyAccountWriteScopeAsync(Check));
             Section("missing account character and retry", () => VerifyMissingCharacterAsync(Check));
             Section("real normal controls restore", () => VerifyControlsRestoreAsync(Check));
+            Section("actual menu and direct return controls", () => VerifyDirectMenuControlsAsync(Check));
+            Section("rejected actual menu controls source", () => VerifyRejectedMenuControlsAsync(Check));
+            Section("actual Guardian run giveup and reopened menu", () => VerifyRunGiveupControlsAsync(Check));
             Section("normal controls failure and retry", () => VerifyControlsRetryAsync(Check));
             Section("normal controls source and send fences", () => VerifyControlsFencesAsync(Check));
             Console.WriteLine($"GUARDIAN_ALTAR_MENU_TOWN_PROJECTION assertions={assertions} failures={failures}");
@@ -257,6 +264,183 @@ namespace DfoServer.SelfTests
                 && fixture.GuardianRows() == 0 && fixture.AccountHonorExp() == 0);
         }
 
+        private static async Task VerifyDirectMenuControlsAsync(Action<string, bool> check)
+        {
+            using var fixture = new Fixture();
+            fixture.ConfigureRealControls();
+            var lease = fixture.RegisterControlsInventory();
+            fixture.ConfigureMenuOwner();
+            var player = fixture.Session.Player;
+            var originalSkills = SkillInfoBodyBuilder.BuildFrom(fixture.Progress.LoadSkills(fixture.Record.CharacterId));
+            var expectedSkills = SkillInfoBodyBuilder.BuildFrom(fixture.Projector.LoadSyncedSkillState(
+                fixture.Record.CharacterId, fixture.Record.Level, persist: false).Skills);
+            byte[] expectedItems;
+            lock (lease.SyncRoot)
+                expectedItems = ItemListPacketBuilder.BuildItemSpaceListBody(lease.Inventory, InventoryListType.Main);
+            await fixture.MenuAsync();
+            var menuPackets = await fixture.DrainAsync();
+            var source = fixture.Session.GuardianAltarControls;
+            var progress = fixture.ReadGuardianProgress();
+            check("actual successful START_GAME registers a menu controls source at the unmodified zero epochs",
+                menuPackets.Count == 1 && menuPackets[0][0] == 1
+                && Type(menuPackets[0]) == (ushort)CmdPacketTypeA21.ADVANCE_ALTAR_START_GAME
+                && menuPackets[0].AsSpan(HeaderLength).SequenceEqual(GuardianAltarMenuBodyBuilder.Build(progress))
+                && source != null && ReferenceEquals(source.Generation, fixture.Session.GameSession)
+                && ReferenceEquals(source.Account, fixture.Session.Account) && source.CharacterId == player.CharacterId
+                && source.AccountId == fixture.Record.AccountId && source.UserId == player.UserId
+                && source.RunGeneration == 0 && source.SelectionGeneration == 0
+                && player.CurrentDungeonRunGeneration == 0 && player.CurrentDungeonSelectionGeneration == 0
+                && player.CurrentRun == null && player.CurrentDungeonSelection == null);
+            fixture.RejectSkillWrites();
+            var consumed = await fixture.ReturnFromMenuAsync();
+            var packets = await fixture.DrainAsync();
+            check("actual direct menu BACK_2_VILLAGE writes ACK then Town roster then normal controls before account state",
+                consumed && packets.Select(Type).SequenceEqual(MenuControlsTypes())
+                && packets[0].AsSpan(HeaderLength).SequenceEqual(new byte[] { 1 })
+                && fixture.Session.GuardianAltarControls == null);
+            check("direct menu restore contains the actual synced skill pages and current owned Main data",
+                packets.Single(x => Type(x) == (ushort)NotiPacketTypeA21.SKILLINFO).AsSpan(HeaderLength).SequenceEqual(expectedSkills)
+                && packets.Single(x => Type(x) == (ushort)NotiPacketTypeA21.ITEM_LIST).AsSpan(HeaderLength).SequenceEqual(expectedItems)
+                && fixture.ReadPersistedItemCount() == 7 && lease.Inventory.GetItem(InventoryListType.Main, 3)?.Count == 7);
+            check("direct menu return preserves durable progression, skill slots and both source epochs",
+                SameGuardianProgress(progress, fixture.ReadGuardianProgress())
+                && originalSkills.SequenceEqual(SkillInfoBodyBuilder.BuildFrom(fixture.Progress.LoadSkills(fixture.Record.CharacterId)))
+                && player.CurrentRun == null && player.CurrentDungeonSelection == null
+                && player.CurrentDungeonRunGeneration == 0 && player.CurrentDungeonSelectionGeneration == 0
+                && !fixture.Session.TryCompleteGuardianControlsRestore(source));
+            consumed = await fixture.ReturnFromMenuAsync();
+            packets = await fixture.DrainAsync();
+            check("a duplicate completed direct menu return only replays its ACK without normal controls or another grant",
+                consumed && packets.Count == 1 && Type(packets[0]) == (ushort)CmdPacketTypeA21.BACK_2_VILLAGE
+                && packets[0].AsSpan(HeaderLength).SequenceEqual(new byte[] { 1 })
+                && fixture.Session.GuardianAltarControls == null && SameGuardianProgress(progress, fixture.ReadGuardianProgress()));
+            await fixture.MenuAsync();
+            menuPackets = await fixture.DrainAsync();
+            var renewed = fixture.Session.GuardianAltarControls;
+            check("reopening the actual menu establishes a new pending source even at the same session epochs",
+                menuPackets.Count == 1 && Type(menuPackets[0]) == (ushort)CmdPacketTypeA21.ADVANCE_ALTAR_START_GAME
+                && renewed != null && !ReferenceEquals(renewed, source)
+                && renewed.RunGeneration == 0 && renewed.SelectionGeneration == 0);
+            consumed = await fixture.ReturnFromMenuAsync();
+            packets = await fixture.DrainAsync();
+            check("the reopened menu direct return restores controls again and clears only its completed source",
+                consumed && packets.Select(Type).SequenceEqual(MenuControlsTypes())
+                && fixture.Session.GuardianAltarControls == null && !fixture.Session.TryCompleteGuardianControlsRestore(renewed)
+                && SameGuardianProgress(progress, fixture.ReadGuardianProgress()) && fixture.ReadPersistedItemCount() == 7);
+        }
+
+        private static async Task VerifyRejectedMenuControlsAsync(Action<string, bool> check)
+        {
+            foreach (var restriction in new[] { "closed", "malformed", "level" })
+            {
+                using var fixture = new Fixture();
+                fixture.ConfigureRealControls();
+                fixture.ConfigureMenuOwner(open: restriction != "closed");
+                if (restriction == "level") fixture.Session.Player.Level = 49;
+                await fixture.MenuAsync(restriction == "malformed" ? new byte[] { 1 } : Array.Empty<byte>());
+                var packets = await fixture.DrainAsync();
+                var expectedBody = Convert.FromHexString(restriction switch
+                {
+                    "closed" => "0101000000",
+                    "level" => "0104000000",
+                    "malformed" => "0004",
+                    _ => throw new InvalidOperationException("Unknown menu rejection test case.")
+                });
+                check("rejected actual " + restriction + " menu does not register controls or initialize Guardian progress",
+                    packets.Count == 1 && packets[0][0] == 1
+                    && Type(packets[0]) == (ushort)CmdPacketTypeA21.ADVANCE_ALTAR_START_GAME
+                    && packets[0].AsSpan(HeaderLength).SequenceEqual(expectedBody) && fixture.Session.GuardianAltarControls == null
+                    && fixture.GuardianRows() == 0 && fixture.Session.Player.CurrentRun == null
+                    && fixture.Session.Player.CurrentDungeonRunGeneration == 0);
+                check("rejected actual " + restriction + " menu cannot authorize a direct Town or controls projection",
+                    !await fixture.ReturnFromMenuAsync() && (await fixture.DrainAsync()).Count == 0);
+            }
+            using (var fixture = new Fixture())
+            {
+                fixture.ConfigureMenuOwner();
+                await fixture.MenuAsync();
+                await fixture.DrainAsync();
+                var source = fixture.Session.GuardianAltarControls;
+                fixture.Session.Player.Level = 49;
+                await fixture.MenuAsync();
+                var packets = await fixture.DrainAsync();
+                check("a later rejected actual menu preserves the existing pending controls source",
+                    packets.Count == 1 && packets[0].AsSpan(HeaderLength).SequenceEqual(Convert.FromHexString("0104000000"))
+                    && source != null
+                    && ReferenceEquals(fixture.Session.GuardianAltarControls, source));
+            }
+        }
+
+        private static async Task VerifyRunGiveupControlsAsync(Action<string, bool> check)
+        {
+            using var fixture = new Fixture();
+            fixture.ConfigureRealControls();
+            fixture.RegisterControlsInventory();
+            fixture.ConfigureMenuOwner();
+            await fixture.MenuAsync();
+            await fixture.DrainAsync();
+            var menuSource = fixture.Session.GuardianAltarControls;
+            var progress = fixture.ReadGuardianProgress();
+            var admitted = await fixture.StartGuardianStageAsync();
+            var starts = await fixture.DrainAsync();
+            var run = fixture.Session.Player.CurrentRun;
+            var source = fixture.Session.GuardianAltarControls;
+            check("actual PVF Guardian SELECT creates a real run and replaces the menu source before dedicated START_MAP",
+                admitted && run != null && run.Instance.Mechanisms.GuardianAltar != null
+                && starts.Select(Type).SequenceEqual(new[] { (ushort)NotiPacketTypeA21.USER_STATE,
+                    (ushort)NotiPacketTypeA21.ADVANCE_ALTAR_STAGE_INFO, (ushort)NotiPacketTypeA21.ADVANCE_ALTAR_START_MAP })
+                && source != null && !ReferenceEquals(source, menuSource) && source.RunGeneration == run.RunGeneration
+                && source.RunGeneration == fixture.Session.Player.CurrentDungeonRunGeneration);
+            if (run == null || source == null)
+                throw new InvalidOperationException("The actual Guardian owner did not create the test run and source.");
+            var runGeneration = run.RunGeneration;
+            var selectionGeneration = fixture.Session.Player.CurrentDungeonSelectionGeneration;
+            await fixture.Town.Handle_ENUM_CMDPACKET_GIVEUP_GAME(fixture.Session, new GamePacketHeader { cmd = 1,
+                type = (ushort)CmdPacketTypeA21.GIVEUP_GAME, length = 14 }, Array.Empty<byte>()).WaitAsync(Timeout);
+            var packets = await fixture.DrainAsync();
+            var types = packets.Select(Type).ToList();
+            var rosterIndex = types.IndexOf((ushort)NotiPacketTypeA21.AREA_USERS);
+            var skillIndex = types.IndexOf((ushort)NotiPacketTypeA21.SKILLINFO);
+            var itemIndex = types.IndexOf((ushort)NotiPacketTypeA21.ITEM_LIST);
+            check("actual run GIVEUP uses the existing ending and Town owners and restores both controls after the roster",
+                packets.Count > 0 && Type(packets[0]) == (ushort)CmdPacketTypeA21.GIVEUP_GAME
+                && packets[0].AsSpan(HeaderLength).SequenceEqual(new byte[] { 1 })
+                && rosterIndex >= 0 && skillIndex > rosterIndex && itemIndex > skillIndex
+                && types.Count(x => x == (ushort)NotiPacketTypeA21.SKILLINFO) == 1
+                && types.Count(x => x == (ushort)NotiPacketTypeA21.ITEM_LIST) == 1
+                && fixture.Session.Player.CurrentRun == null && fixture.Session.GuardianAltarControls == null);
+            check("actual GIVEUP does not advance epochs, spend tickets or fabricate a clear reward",
+                fixture.Session.Player.CurrentDungeonRunGeneration == runGeneration
+                && fixture.Session.Player.CurrentDungeonSelectionGeneration == selectionGeneration
+                && SameGuardianProgress(progress, fixture.ReadGuardianProgress())
+                && fixture.ReadPersistedItemCount() == 7 && !fixture.Session.TryCompleteGuardianControlsRestore(source));
+            await fixture.MenuAsync();
+            await fixture.DrainAsync();
+            var renewed = fixture.Session.GuardianAltarControls;
+            check("the actual menu after GIVEUP creates a source although the previous run source was already cleared",
+                renewed != null && !ReferenceEquals(renewed, source) && renewed.RunGeneration == runGeneration
+                && renewed.SelectionGeneration == selectionGeneration && fixture.Session.Player.CurrentRun == null);
+            var consumed = await fixture.ReturnFromMenuAsync();
+            packets = await fixture.DrainAsync();
+            check("direct BACK from the reopened post-GIVEUP menu restores controls again through real Town and owned inventory",
+                consumed && packets.Select(Type).SequenceEqual(MenuControlsTypes())
+                && fixture.Session.GuardianAltarControls == null && SameGuardianProgress(progress, fixture.ReadGuardianProgress())
+                && fixture.ReadPersistedItemCount() == 7);
+        }
+
+        private static ushort[] MenuControlsTypes()
+        {
+            var types = TownTypes(true, true).ToList();
+            types.InsertRange(4, new[] { (ushort)NotiPacketTypeA21.SKILLINFO, (ushort)NotiPacketTypeA21.ITEM_LIST });
+            types.Insert(0, (ushort)CmdPacketTypeA21.BACK_2_VILLAGE);
+            return types.ToArray();
+        }
+
+        private static bool SameGuardianProgress(GuardianAltarProgressSnapshot left, GuardianAltarProgressSnapshot right)
+            => left.CharacterId == right.CharacterId && left.Header == right.Header
+                && left.Stages.SequenceEqual(right.Stages) && left.Purchases.SequenceEqual(right.Purchases)
+                && left.Slots.SequenceEqual(right.Slots) && left.Achievements.SequenceEqual(right.Achievements);
+
         private static async Task VerifyControlsRestoreAsync(Action<string, bool> check)
         {
             using var fixture = new Fixture();
@@ -369,7 +553,7 @@ namespace DfoServer.SelfTests
                     "generation" => source with { Generation = null },
                     "account" => source with { Account = new AccountRecord { AccountId = fixture.Record.AccountId } },
                     "uid" => source with { UserId = 0 },
-                    "run epoch" => source with { RunIdentity = new DungeonRunIdentity(1, 1, source.RunIdentity.RunGeneration + 1) },
+                    "run epoch" => source with { RunGeneration = source.RunGeneration + 1 },
                     _ => source with { SelectionGeneration = source.SelectionGeneration + 1 }
                 };
                 var pendingSource = fixture.Session.GuardianAltarControls;
@@ -509,6 +693,16 @@ namespace DfoServer.SelfTests
             private readonly string _directory = Path.Combine(Path.GetTempPath(), "guardian-menu-town-" + Guid.NewGuid().ToString("N"));
             private readonly TcpClient _peer = new();
             internal readonly SessionDirectory Sessions = new((_, _) => true);
+            internal readonly DungeonInstanceRegistry Instances = new();
+            private readonly GameCommandRegistry _menuRegistry = new();
+            private readonly GuardianAltarOpeningService _opening = new();
+            private readonly DateTimeOffset _menuNow = new(2026, 10, 3, 10, 0, 0, TimeSpan.Zero);
+            private GuardianAltarOpeningCoordinator _menuOwner;
+            private GuardianAltarDungeonCoordinator _guardianEntry;
+            private CharacterTransitionCoordinator _menuTransitions;
+            private DungeonTownReturnCoordinator _townReturn;
+            internal GuardianAltarMenuDefinition MenuDefinition { get; private set; }
+            internal GuardianAltarProgressService GuardianProgress { get; private set; }
             internal GameDatabase Database { get; }
             internal SqliteCharacterRepository Records { get; }
             internal CharacterRecord Record { get; }
@@ -582,7 +776,7 @@ namespace DfoServer.SelfTests
                         BindingFlags.NonPublic | BindingFlags.Instance)?.GetValue(Session)
                         ?? throw new InvalidOperationException("The real session send lock was not found."));
                     Town = new TownHandler(Records, selectDataSource: null, partyManager: null, sessions: Sessions,
-                        refresh: null, dungeonInstances: null, raidManager: null, database: Database);
+                        refresh: null, dungeonInstances: Instances, raidManager: null, database: Database);
                     Town.ConfigureTownPartyListPublisher(() =>
                     {
                         PartyPublicationCount++;
@@ -622,14 +816,63 @@ namespace DfoServer.SelfTests
             internal EnhancedClientSession.GuardianAltarControlProjectionSource MarkControlsSource()
             {
                 var generation = Session.Player.CurrentDungeonRunGeneration;
-                if (generation == 0) generation = Session.Player.NextDungeonRunGeneration();
-                // Synthetic ended-run identity only. Restore authority comes
-                // from the real session epochs, repositories and owned lease.
+                // Unit-level source fencing uses the current session epochs;
+                // complete menu/start registration is exercised separately.
                 var source = new EnhancedClientSession.GuardianAltarControlProjectionSource(Session.GameSession,
                     Session.Account, Record.CharacterId, Record.AccountId, Session.Player.UserId,
-                    new DungeonRunIdentity(62021, 62021, generation), Session.Player.CurrentDungeonSelectionGeneration);
+                    generation, Session.Player.CurrentDungeonSelectionGeneration);
                 Session.GuardianAltarControls = source;
                 return source;
+            }
+
+            internal void ConfigureMenuOwner(bool open = true)
+            {
+                MenuDefinition = GuardianAltarMenuDefinition.Load();
+                GuardianProgress = new GuardianAltarProgressService(Database, new DailyResetService(Database), MenuDefinition);
+                _menuTransitions = new CharacterTransitionCoordinator(Sessions);
+                _menuOwner = new GuardianAltarOpeningCoordinator(_opening, Sessions, _menuTransitions,
+                    clock: null, utcNow: () => _menuNow, progress: GuardianProgress);
+                _menuRegistry.RegisterGroup("guardian-real-menu-town", group =>
+                    _menuOwner.RegisterEntryHandlers(group, _ => false, new MercenaryStub()));
+                _townReturn = new DungeonTownReturnCoordinator(Instances, Projector, Sessions);
+                _townReturn.ConfigureTownPresenceProjection(Town.ProjectDungeonTownPresenceAsync);
+                if (open) _opening.SetWindow(_menuNow, _menuNow.AddMinutes(5));
+            }
+
+            internal Task MenuAsync(byte[] body = null)
+            {
+                if (!_menuRegistry.TryGetValue((ushort)CmdPacketTypeA21.ADVANCE_ALTAR_START_GAME, out var handler))
+                    throw new InvalidOperationException("The actual menu owner was not configured.");
+                body ??= Array.Empty<byte>();
+                return handler(Session, new GamePacketHeader { cmd = 1,
+                    type = (ushort)CmdPacketTypeA21.ADVANCE_ALTAR_START_GAME,
+                    length = checked((uint)(14 + body.Length)) }, body).WaitAsync(Timeout);
+            }
+
+            internal Task<bool> ReturnFromMenuAsync()
+                => _menuOwner.TryHandleMenuReturnAsync(Session, new GamePacketHeader { cmd = 1,
+                    type = (ushort)CmdPacketTypeA21.BACK_2_VILLAGE, length = 14 },
+                    Array.Empty<byte>(), Town.ProjectGuardianMenuReturnAsync).WaitAsync(Timeout);
+
+            internal GuardianAltarProgressSnapshot ReadGuardianProgress()
+                => GuardianProgress.LoadMenu(Record.CharacterId, _menuNow.UtcDateTime);
+
+            internal Task<bool> StartGuardianStageAsync()
+            {
+                _guardianEntry ??= new GuardianAltarDungeonCoordinator(_opening, GuardianProgress, () => MenuDefinition,
+                    Sessions, _menuTransitions, Instances, _ => false, new MercenaryStub(), _ => false,
+                    (run, room, projectionId) =>
+                    {
+                        if (room.RegisterLoadingProjection(run.CaptureIdentity(), projectionId,
+                                new[] { run.CaptureIdentity() }, out _) <= 0)
+                            throw new InvalidOperationException("The actual Guardian loading barrier rejected registration.");
+                    }, async (session, identity) => await _townReturn.ReturnAsync(session, identity), utcNow: () => _menuNow);
+                var body = new byte[15];
+                BinaryPrimitives.WriteInt32LittleEndian(body, MenuDefinition.FirstDungeonId);
+                body[5] = 3;
+                BinaryPrimitives.WriteUInt16LittleEndian(body.AsSpan(7), ushort.MaxValue);
+                return _guardianEntry.TryHandleSelectDungeonAsync(Session, new GamePacketHeader { cmd = 1,
+                    type = (ushort)CmdPacketTypeA21.SELECT_DUNGEON, length = 29 }, body).WaitAsync(Timeout);
             }
 
             internal InventoryLease RegisterControlsInventory()
@@ -710,6 +953,10 @@ namespace DfoServer.SelfTests
 
             public void Dispose()
             {
+                _menuOwner?.Dispose();
+                if (Session?.Player?.CurrentRun != null)
+                    DungeonRunLifecycle.EndRunAsync(Session, DungeonRunEndReason.SessionTeardown,
+                        instanceRegistry: Instances).GetAwaiter().GetResult();
                 InventoryContext.Unregister(Session.SessionId, Record.CharacterId);
                 Session?.Close();
                 _peer.Dispose();
@@ -725,6 +972,14 @@ namespace DfoServer.SelfTests
                 if (Directory.Exists(_directory) && !Directory.EnumerateFileSystemEntries(_directory).Any())
                     Directory.Delete(_directory);
             }
+        }
+
+        private sealed class MercenaryStub : IMercenaryRestrictionService
+        {
+            public bool IsAssigned(int characterId) => false;
+            public bool CanDelete(int characterId) => true;
+            public bool CanMutateAppearance(int characterId) => true;
+            public bool CanEnterContent(int characterId) => true;
         }
     }
 }

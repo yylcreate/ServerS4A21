@@ -419,7 +419,7 @@ namespace DfoServer.Network.Handlers
                 && session.Player.UserId == source.UserId
                 && SessionDirectory.IsTownPresence(session.Player)
                 && session.Player.CurrentDungeonSelection == null && !session.Player.DungeonSelectionPending
-                && session.Player.CurrentDungeonRunGeneration == source.RunIdentity.RunGeneration
+                && session.Player.CurrentDungeonRunGeneration == source.RunGeneration
                 && session.Player.CurrentDungeonSelectionGeneration == source.SelectionGeneration
                 && (_sessions == null || (_sessions.TryGet(source.CharacterId, out var current)
                     && ReferenceEquals(current, session)));
@@ -435,7 +435,7 @@ namespace DfoServer.Network.Handlers
             if (Current() && session.TryCompleteGuardianControlsRestore(source))
             {
                 FileLogger.Log($"[GuardianAltarEntry] normal controls restored cid={source.CharacterId} "
-                    + $"run={source.RunIdentity.RunId}/{source.RunIdentity.RunGeneration}");
+                    + $"runGeneration={source.RunGeneration} selectionGeneration={source.SelectionGeneration}");
             }
         }
 

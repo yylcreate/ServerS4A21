@@ -246,6 +246,14 @@ namespace DfoServer.Network.Handlers
                         {
                             preparedMenu = true;
                             menuReceipt = CaptureMenuProjection(session);
+                            // The menu can retain or replace activity controls
+                            // after an earlier run has already restored them.
+                            // Record possible override before writing; only the
+                            // separate complete-write receipt authorizes exit.
+                            if (menuReceipt != null)
+                                session.GuardianAltarControls = new EnhancedClientSession.GuardianAltarControlProjectionSource(
+                                    generation, menuReceipt.Account, characterId, menuReceipt.AccountId, userId,
+                                    menuReceipt.RunGeneration, menuReceipt.SelectionGeneration);
                             return new[]
                             {
                                 GamePacketEnvelopeBuilder.Build(1,

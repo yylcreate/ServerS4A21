@@ -48,7 +48,7 @@ namespace DfoServer.Network
 
         internal sealed record GuardianAltarControlProjectionSource(
             GameSession Generation, AccountRecord Account, int CharacterId, int AccountId, ushort UserId,
-            DfoServer.Game.Dungeon.DungeonRunIdentity RunIdentity, long SelectionGeneration);
+            long RunGeneration, long SelectionGeneration);
 
         // 玩家当前打开的收集箱 PVF [Index] 值(0388请求体末尾字节, 见 CollectionBoxHandler)
         public int SelectedCollectionBoxIndex { get; set; }

@@ -68,7 +68,8 @@ namespace DfoServer.SelfTests
                 await fixture.MenuAsync();
                 var count = fixture.Packets.Count;
                 check("a rejected START_GAME reply cannot authorize menu return",
-                    !await fixture.ReturnAsync() && fixture.Packets.Count == count && fixture.ProjectionCalls == 0);
+                    !await fixture.ReturnAsync() && fixture.Packets.Count == count && fixture.ProjectionCalls == 0
+                    && fixture.Session.GuardianAltarControls == null);
             }
             foreach (var partial in new[] { false, true })
             {
@@ -78,10 +79,20 @@ namespace DfoServer.SelfTests
                 fixture.FailAfterWrite = partial;
                 await fixture.MenuAsync();
                 var count = fixture.Packets.Count;
+                var pendingSource = fixture.Session.GuardianAltarControls;
+                check((partial ? "an uncertain menu write" : "a failed first menu write")
+                    + " retains only a controls projection source captured before its writer",
+                    pendingSource != null && ReferenceEquals(fixture.SourceAtLastWrite, pendingSource)
+                    && HasCurrentControlsSource(fixture.Session)
+                    && fixture.Session.Player.CurrentRun == null && fixture.Session.Player.CurrentDungeonSelection == null
+                    && pendingSource.RunGeneration == 0 && pendingSource.SelectionGeneration == 0);
                 check((partial ? "an uncertain full-frame write" : "a failed menu write")
                     + " cannot publish a successful menu-return receipt",
                     !await fixture.ReturnAsync() && fixture.Packets.Count == count && fixture.ProjectionCalls == 0);
                 await fixture.MenuAsync();
+                check("a complete replacement menu renews the pending source without copying a failed write receipt",
+                    HasCurrentControlsSource(fixture.Session)
+                    && !ReferenceEquals(fixture.Session.GuardianAltarControls, pendingSource));
                 check("a later complete successful menu write authorizes return after transport recovery",
                     await fixture.ReturnAsync() && fixture.ProjectionCalls == 1);
             }
@@ -92,6 +103,9 @@ namespace DfoServer.SelfTests
                 await fixture.MenuAsync();
                 check("source displacement after the menu frame cannot publish a return receipt",
                     IsMenu(fixture.Packets.Single()) && !await fixture.ReturnAsync() && fixture.ProjectionCalls == 0);
+                check("source displacement after a menu write leaves a stale controls source unable to authorize current restore",
+                    fixture.Session.GuardianAltarControls != null && !HasCurrentControlsSource(fixture.Session)
+                    && !ReferenceEquals(fixture.Session.GuardianAltarControls.Account, fixture.Session.Account));
                 await fixture.MenuAsync();
                 fixture.FailNextWrite = true;
                 await fixture.MenuAsync();
@@ -125,6 +139,10 @@ namespace DfoServer.SelfTests
             check("START_GAME uses a complete real menu without creating an ordinary run or selection",
                 fixture.Progress.Reads == 1 && IsMenu(fixture.Packets.Single())
                 && fixture.Session.Player.CurrentRun == null && fixture.Session.Player.CurrentDungeonSelection == null);
+            check("a successful menu registers controls using the actual current epochs without creating a run identity",
+                HasCurrentControlsSource(fixture.Session)
+                && fixture.Session.GuardianAltarControls.RunGeneration == 0
+                && fixture.Session.GuardianAltarControls.SelectionGeneration == 0);
             // Position reports may arrive while the menu is open. Only movement
             // after a completed return expires its replay scope.
             fixture.Session.Player.NextTownMovementSequence();
@@ -348,7 +366,15 @@ namespace DfoServer.SelfTests
             await fixture.MenuAsync();
             await fixture.ReturnAsync();
             var oldFence = fixture.LastProjectionFence;
+            var oldControls = fixture.Session.GuardianAltarControls;
             await fixture.MenuAsync();
+            var renewedControls = fixture.Session.GuardianAltarControls;
+            check("a newer successful menu replaces controls source at unchanged epochs and rejects old-source completion",
+                renewedControls != null && oldControls != null && !ReferenceEquals(renewedControls, oldControls)
+                && renewedControls.RunGeneration == oldControls.RunGeneration
+                && renewedControls.SelectionGeneration == oldControls.SelectionGeneration
+                && !fixture.Session.TryCompleteGuardianControlsRestore(oldControls)
+                && ReferenceEquals(fixture.Session.GuardianAltarControls, renewedControls));
             check("a newer complete START_GAME menu invalidates the previous projection fence",
                 oldFence != null && !oldFence());
             check("a renewed menu is pending even when identity and movement sequence are unchanged",
@@ -410,6 +436,7 @@ namespace DfoServer.SelfTests
             internal bool AckBeforeProjection = true;
             internal bool ProjectionOutsideSendLock = true;
             internal Func<bool> LastProjectionFence;
+            internal EnhancedClientSession.GuardianAltarControlProjectionSource SourceAtLastWrite;
             private readonly DateTimeOffset _now = new(2026, 10, 3, 10, 0, 0, TimeSpan.Zero);
 
             internal Fixture(GuardianAltarMenuDefinition definition)
@@ -455,6 +482,7 @@ namespace DfoServer.SelfTests
             private Task SendBatchAsync(EnhancedClientSession session, Func<IReadOnlyList<byte[]>> prepare)
                 => EnhancedClientSession.SendPreparedPacketBatchCoreAsync(SendGate, prepare, packet =>
                 {
+                    SourceAtLastWrite = session.GuardianAltarControls;
                     if (FailNextWrite)
                     {
                         FailNextWrite = false;
@@ -516,6 +544,16 @@ namespace DfoServer.SelfTests
                 SendGate.Dispose();
                 foreach (var session in _sessions) session.Close();
             }
+        }
+
+        private static bool HasCurrentControlsSource(EnhancedClientSession session)
+        {
+            var source = session.GuardianAltarControls;
+            return source != null && ReferenceEquals(source.Generation, session.GameSession)
+                && ReferenceEquals(source.Account, session.Account) && source.CharacterId == session.Player.CharacterId
+                && source.AccountId == session.Account?.AccountId && source.UserId == session.Player.UserId
+                && source.RunGeneration == session.Player.CurrentDungeonRunGeneration
+                && source.SelectionGeneration == session.Player.CurrentDungeonSelectionGeneration;
         }
 
         private static bool IsMenu(byte[] packet)

@@ -230,7 +230,7 @@ namespace DfoServer.Network.Handlers.Dungeon
                         // Mark the possible client override before the batch is
                         // written, so a partial START_MAP write can also restore.
                         session.GuardianAltarControls = new EnhancedClientSession.GuardianAltarControlProjectionSource(
-                            session.GameSession, session.Account, cid, accountId, uid, identity,
+                            session.GameSession, session.Account, cid, accountId, uid, identity.RunGeneration,
                             session.Player.CurrentDungeonSelectionGeneration);
                         projected = true;
                         return new[]

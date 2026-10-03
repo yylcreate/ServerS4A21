@@ -92,6 +92,28 @@ namespace DfoServer.Network.Handlers
                         return new[] { ack };
                     });
                     if (successProjected)
+                    {
+                        // The ACK only marks an existing client achievement row.
+                        // A first claim inserts that row in the durable snapshot,
+                        // so publish it through the existing full menu update.
+                        await _sendBatch(session, () =>
+                        {
+                            if (!IdentityCurrent())
+                                return Array.Empty<byte[]>();
+                            try
+                            {
+                                if (!Allowed())
+                                    return Array.Empty<byte[]>();
+                            }
+                            catch (SqliteException ex)
+                            {
+                                FileLogger.Log($"[GuardianAltarAchievement] menu update restriction failed cid={characterId}: {ex}");
+                                return Array.Empty<byte[]>();
+                            }
+                            return new[] { GamePacketEnvelopeBuilder.Build(0,
+                                (ushort)NotiPacketTypeA21.ADVANCE_ALTAR_UPDATE_RIDABLE,
+                                GuardianAltarMenuBodyBuilder.BuildUpdateRidable(result.Progress, 0)) };
+                        });
                         await _sendBatch(session, () =>
                         {
                             if (!IdentityCurrent() || !IsTownReady(session)
@@ -104,6 +126,7 @@ namespace DfoServer.Network.Handlers
                                 (ushort)NotiPacketTypeA21.MAILBOX_ALARM,
                                 MailboxHandler.BuildMailboxAlarmNotification(1)) };
                         });
+                    }
                 }
                 catch (Exception ex) when (ex is IOException or SocketException or ObjectDisposedException)
                 {
