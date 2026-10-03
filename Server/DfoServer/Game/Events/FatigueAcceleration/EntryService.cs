@@ -9,16 +9,16 @@ namespace DfoServer.Game.Events.FatigueAcceleration
     internal enum FatigueAccelerationEntryResult
     {
         Stopped,
+        Started,
         InvalidRequest,
         NotInTown,
         EntryClosed,
         DefinitionUnavailable,
         EntryUnavailable,
-        EffectsUnavailable,
     }
 
-    // The catalog entry and stopped projection do not authorize a burn.
-    // Active state requires the shared fatigue/experience owners, not a UI flag.
+    // Catalog/PVF policy owner. Player toggles remain owned by GameSession,
+    // while each dungeon run freezes the permitted experience/cost profile.
     internal sealed class FatigueAccelerationEntryService
     {
         internal const ushort EventId = 115;
@@ -28,12 +28,17 @@ namespace DfoServer.Game.Events.FatigueAcceleration
 
         private readonly FatigueAccelerationEntryRepository _repository;
         private readonly Lazy<FatigueAccelerationConfigFile> _definition;
+        private readonly FatigueAccelerationEffectProfile _effects;
 
         internal FatigueAccelerationEntryService(IGameDatabase database,
-            Func<FatigueAccelerationConfigFile> definition = null)
+            Func<FatigueAccelerationConfigFile> definition = null,
+            FatigueAccelerationEffectProfile? effects = null)
         {
             _repository = new FatigueAccelerationEntryRepository(database);
             _definition = new Lazy<FatigueAccelerationConfigFile>(definition ?? LoadDefinition);
+            _effects = effects ?? FatigueAccelerationEffectProfile.ServerDefault;
+            if (_effects.FatigueConsumptionMultiplier < 1)
+                throw new ArgumentException("Fatigue consumption multiplier must be positive.", nameof(effects));
         }
 
         internal FatigueAccelerationConfigFile Definition => _definition.Value;
@@ -62,8 +67,7 @@ namespace DfoServer.Game.Events.FatigueAcceleration
                 return FatigueAccelerationEntryResult.InvalidRequest;
             if (!townReady)
                 return FatigueAccelerationEntryResult.NotInTown;
-            // The only currently implemented player state is stopped. Stopping
-            // is idempotent and remains available after the catalog is closed.
+            // Stop remains available after the catalog is closed.
             if (!enable)
                 return FatigueAccelerationEntryResult.Stopped;
             if (!Definition.IsValid)
@@ -78,7 +82,27 @@ namespace DfoServer.Game.Events.FatigueAcceleration
                 FileLogger.Log("[FatigueAcceleration] entry read failed: " + ex.Message);
                 return FatigueAccelerationEntryResult.EntryUnavailable;
             }
-            return FatigueAccelerationEntryResult.EffectsUnavailable;
+            return FatigueAccelerationEntryResult.Started;
+        }
+
+        internal FatigueAccelerationEffectProfile CaptureEffects(
+            FatigueAccelerationRuntime runtime, int characterId,
+            int dungeonId, DungeonFile dungeon)
+        {
+            if (runtime?.IsEnabled(characterId) != true || dungeonId <= 0
+                || dungeon == null || dungeon.NoFatigue || !Definition.IsValid
+                || Definition.IsDungeonDisabled(dungeonId))
+                return FatigueAccelerationEffectProfile.Inactive;
+            try
+            {
+                return _repository.IsEnabled()
+                    ? _effects : FatigueAccelerationEffectProfile.Inactive;
+            }
+            catch (SqliteException ex)
+            {
+                FileLogger.Log("[FatigueAcceleration] entry snapshot unavailable: " + ex.Message);
+                return FatigueAccelerationEffectProfile.Inactive;
+            }
         }
 
         internal static bool TryParseEntrySetting(string setting, out bool? enabled)

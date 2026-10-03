@@ -25,7 +25,9 @@ namespace DfoServer.Game.Dungeon
             bool partyHasEquippedAvatar,
             bool hasEquippedCreature,
             int storyExperienceBonusRatePercent = 0,
-            int storyExperienceDifficulty = -1)
+            int storyExperienceDifficulty = -1,
+            int fatigueBurnExperienceBonusPercent = 0,
+            int fatigueConsumptionMultiplier = 1)
         {
             IsCaptured = true;
             PartyMemberCount = Math.Max(1, Math.Min(4, partyMemberCount));
@@ -38,6 +40,8 @@ namespace DfoServer.Game.Dungeon
             StoryExperienceDifficulty = storyExperienceDifficulty >= 0
                 ? storyExperienceDifficulty
                 : -1;
+            FatigueBurnExperienceBonusPercent = Math.Max(0, fatigueBurnExperienceBonusPercent);
+            FatigueConsumptionMultiplier = Math.Max(1, fatigueConsumptionMultiplier);
         }
 
         internal static DungeonParticipantExperienceBonusSnapshot None =>
@@ -52,6 +56,13 @@ namespace DfoServer.Game.Dungeon
         internal bool HasEquippedCreature { get; }
         internal int StoryExperienceBonusRatePercent { get; }
         internal int StoryExperienceDifficulty { get; }
+        internal int FatigueBurnExperienceBonusPercent { get; }
+        internal int FatigueConsumptionMultiplier { get; }
+
+        // Pure interface for a future unified fatigue debit service. This does
+        // not spend fatigue or change any persistent balance.
+        internal uint ScaleFatigueConsumption(uint baseCost)
+            => checked((uint)((ulong)baseCost * (uint)Math.Max(1, FatigueConsumptionMultiplier)));
         internal bool HasStoryExperienceProfile =>
             StoryExperienceDifficulty >= 0;
 
@@ -69,7 +80,9 @@ namespace DfoServer.Game.Dungeon
                 PartyHasEquippedAvatar,
                 HasEquippedCreature,
                 ratePercent,
-                experienceDifficulty);
+                experienceDifficulty,
+                FatigueBurnExperienceBonusPercent,
+                FatigueConsumptionMultiplier);
     }
 
     internal readonly struct DungeonClearParticipantBonusResult
@@ -100,13 +113,14 @@ namespace DfoServer.Game.Dungeon
         internal static bool TryCaptureOwned(
             Guid sessionId,
             int characterId,
-            out DungeonParticipantEquipmentBonusFacts facts)
+            out DungeonParticipantEquipmentBonusFacts facts,
+            out InventoryLease lease)
         {
             facts = default;
             if (!InventoryContext.TryGetOwnedLease(
                     sessionId,
                     characterId,
-                    out var lease))
+                    out lease))
             {
                 return false;
             }

@@ -34,6 +34,8 @@ namespace DfoServer.Network.Handlers.Dungeon
         internal RecommendDungeonClearStatsService RecommendDungeonClears { get; }
         internal DailyAttendanceAnytimeService DailyAttendanceAnytime { get; }
         internal TotalAttendanceService TotalAttendance { get; }
+        internal Game.Events.FatigueAcceleration.FatigueAccelerationEntryService
+            FatigueAcceleration { get; }
         internal Game.Dungeon.DungeonItemAcquisitionService ItemAcquisition { get; }
         internal DungeonPersistentMechanismCoordinator PersistentMechanisms { get; }
         internal SqliteCharacterRepository CharacterRepository { get; }
@@ -99,7 +101,9 @@ namespace DfoServer.Network.Handlers.Dungeon
             Game.DailyReset.DailyResetService dailyResetService = null,
             Game.Dungeon.AntonAwakeningDailyProgressService
                 antonAwakeningProgress = null,
-            IInventoryOverflowRewardSink overflowRewardSink = null)
+            IInventoryOverflowRewardSink overflowRewardSink = null,
+            Game.Events.FatigueAcceleration.FatigueAccelerationEntryService
+                fatigueAcceleration = null)
         {
             ReviveCoin = reviveCoin
                 ?? throw new ArgumentNullException(nameof(reviveCoin));
@@ -139,6 +143,7 @@ namespace DfoServer.Network.Handlers.Dungeon
                 ?? new RecommendDungeonClearStatsService(Database);
             DailyAttendanceAnytime = dailyAttendanceAnytime;
             TotalAttendance = totalAttendance;
+            FatigueAcceleration = fatigueAcceleration;
             Subtype1Repository = new SqliteSubtype1Repository(
                 Database);
             CharacterStateRepository = new SqliteCharacterStateRepository(

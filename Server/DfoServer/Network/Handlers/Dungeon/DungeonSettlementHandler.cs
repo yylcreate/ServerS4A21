@@ -358,6 +358,8 @@ namespace DfoServer.Network.Handlers.Dungeon
                                 growthContractBonusExp:
                                     settlement.GrowthContractBonusExp,
                                 eliteMonsterKillBonusExp: 0,
+                                fatigueBurnBonusExp:
+                                    GetSettlementNotificationFatigueBurnBonus(settlement),
                                 reloadMissingAccountProgress: true));
                 }
                 FileLogger.Log(
@@ -571,6 +573,8 @@ namespace DfoServer.Network.Handlers.Dungeon
                                 "SET_PLAY_RESULT",
                                 experiencePotionBonusExp:
                                     settlement.ExperiencePotionBonusExp,
+                                fatigueBurnBonusExp:
+                                    GetSettlementNotificationFatigueBurnBonus(settlement),
                                 reloadMissingAccountProgress: true))
                     || !await ExecuteSettlementProjectionEffectAsync(
                         session,
@@ -615,7 +619,11 @@ namespace DfoServer.Network.Handlers.Dungeon
                                         settlement),
                                     paidCardCost: settlement.PaidCardCost,
                                     objectExperienceEntries:
-                                        settlement.ObjectExperienceEntries)))))
+                                        settlement.ObjectExperienceEntries,
+                                    fatigueBurnExp: ToInt32Saturated(
+                                        settlement.FatigueBurnBonusExp),
+                                    monsterFatigueBurnExp: ToInt32Saturated(
+                                        settlement.MonsterFatigueBurnBonusExp))))))
                 {
                     run.Effects.TryFail(presentationReservation);
                     return;
@@ -733,6 +741,8 @@ namespace DfoServer.Network.Handlers.Dungeon
                     $"base={settlement.ClearBaseExp} " +
                     $"scoreBonus={settlement.ScoreBonusExp} " +
                     $"potionBonus={settlement.ExperiencePotionBonusExp} " +
+                    $"fatigueBurnBonus={settlement.FatigueBurnBonusExp} " +
+                    $"monsterFatigueBurnBonus={settlement.MonsterFatigueBurnBonusExp} " +
                     $"equipBonus={settlement.MonsterEquipmentBonusExp} " +
                     $"total={settlement.ClearTotalExp} " +
                     $"charExp={session.Player.Exp}");
@@ -1196,9 +1206,17 @@ namespace DfoServer.Network.Handlers.Dungeon
                     > settlement.ExperiencePotionBonusExp
                 ? updatedPotionBonus - settlement.ExperiencePotionBonusExp
                 : 0;
-            var adjustment = CharacterExperienceService.AddSaturating(
-                scoreDelta,
-                potionDelta);
+            var updatedTotal = CharacterExperienceService.AddSaturating(
+                CharacterExperienceService.AddSaturating(
+                    CalculatePrePotionTotal(settlement, scoreBonus),
+                    updatedPotionBonus),
+                settlement.FatigueBurnBonusExp);
+            // The frozen burn component was already admitted to the first
+            // RawGain. A later rank cannot grant beyond the final saturated
+            // total by summing independent score/potion deltas.
+            var adjustment = updatedTotal > settlement.ClearTotalExp
+                ? updatedTotal - settlement.ClearTotalExp
+                : 0;
             var authoritativeEffectId = GetAuthoritativeSettlementEffectId(run);
             var authoritativeCommitted = run.Effects.GetState(
                 authoritativeEffectId) == DungeonEffectState.Committed;
@@ -1285,7 +1303,9 @@ namespace DfoServer.Network.Handlers.Dungeon
                     settlement.BlackDiamondBonusExp),
                 CharacterExperienceService.AddSaturating(
                     settlement.AdventureGroupBonusExp,
-                    settlement.ExperiencePotionBonusExp));
+                    CharacterExperienceService.AddSaturating(
+                        settlement.ExperiencePotionBonusExp,
+                        settlement.FatigueBurnBonusExp)));
             settlement.ClearTotalExp = CharacterExperienceService.AddSaturating(
                 settlement.ClearBaseExp,
                 settlement.ClearBonusExp);
@@ -1522,6 +1542,7 @@ namespace DfoServer.Network.Handlers.Dungeon
                 AdventureGroupBonusExp = clearExp.AdventureGroupBonus,
                 ExperiencePotionBonusRate = clearExp.ExperiencePotionBonusRate,
                 ExperiencePotionBonusExp = clearExp.ExperiencePotionBonus,
+                FatigueBurnBonusExp = clearExp.FatigueBurnBonus,
                 ClearBonusExp = clearExp.Bonus,
                 ClearTotalExp = clearExp.Total,
                 PreviousLevel = session.Player.Level,
@@ -1551,6 +1572,8 @@ namespace DfoServer.Network.Handlers.Dungeon
                     monsterExperience.MonsterGrowthContractBonusExperience,
                 MonsterEquipmentBonusExp =
                     monsterExperience.MonsterEquipmentBonusExperience,
+                MonsterFatigueBurnBonusExp =
+                    monsterExperience.MonsterFatigueBurnBonusExperience,
                 ObjectExperienceEntries =
                     monsterExperience.ObjectExperienceEntries,
                 ClearTimeMilliseconds = clearTimeMilliseconds,
@@ -1582,6 +1605,15 @@ namespace DfoServer.Network.Handlers.Dungeon
                 clearTimeMilliseconds,
                 lcg);
         }
+
+        private static uint GetSettlementNotificationFatigueBurnBonus(
+            DungeonSettlementRuntime settlement)
+            => settlement.ExperienceGrant == null
+                || ReferenceEquals(
+                    settlement.ExperienceGrant,
+                    settlement.ScoreAdjustmentExperienceGrant)
+                ? 0
+                : settlement.FatigueBurnBonusExp;
 
         private ExperienceGrantResult GrantSettlementExperienceInTransaction(
             EnhancedClientSession session,
@@ -2024,6 +2056,14 @@ namespace DfoServer.Network.Handlers.Dungeon
                 ExperienceBonusEffectService.CalculateBonus(
                     prePotionTotal,
                     experienceBonusRate);
+            var totalWithoutBurn = CharacterExperienceService.AddSaturating(
+                prePotionTotal,
+                experienceBonus);
+            var fatigueBurnBonus = DungeonParticipantExperienceRuntime
+                .CalculateFatigueBurnBonus(
+                    storyAdjustedBaseExp,
+                    totalWithoutBurn,
+                    experienceBonusSnapshot.FatigueBurnExperienceBonusPercent);
             FileLogger.Log(
                 $"[{DungeonSharedServices.ProtocolLogName}] "
                 + $"CLEAR_EXP: dungeon={run.DungeonId} "
@@ -2032,7 +2072,9 @@ namespace DfoServer.Network.Handlers.Dungeon
                 + $"storyRate={experienceBonusSnapshot.StoryExperienceBonusRatePercent}% "
                 + $"storyWeight={storyWeightMultiplier:R} "
                 + $"storyBonus={storyBonus} base={clearBaseExp} "
-                + $"adjustedBase={storyAdjustedBaseExp}");
+                + $"adjustedBase={storyAdjustedBaseExp} "
+                + $"fatigueBurnRate={experienceBonusSnapshot.FatigueBurnExperienceBonusPercent}% "
+                + $"fatigueBurnBonus={fatigueBurnBonus}");
 
             return new ClearExpParts(
                 storyAdjustedBaseExp,
@@ -2043,7 +2085,8 @@ namespace DfoServer.Network.Handlers.Dungeon
                 blackDiamondBonus,
                 adventureGroupBonus,
                 experienceBonusRate,
-                experienceBonus);
+                experienceBonus,
+                fatigueBurnBonus);
         }
 
         private static uint CalculateNonStandardCompatibilityClearBase(
@@ -2169,7 +2212,8 @@ namespace DfoServer.Network.Handlers.Dungeon
                 uint blackDiamondBonus,
                 uint adventureGroupBonus,
                 int experiencePotionBonusRate,
-                uint experiencePotionBonus)
+                uint experiencePotionBonus,
+                uint fatigueBurnBonus)
             {
                 Base = baseExp;
                 ScoreBonus = scoreBonus;
@@ -2180,6 +2224,7 @@ namespace DfoServer.Network.Handlers.Dungeon
                 AdventureGroupBonus = adventureGroupBonus;
                 ExperiencePotionBonusRate = experiencePotionBonusRate;
                 ExperiencePotionBonus = experiencePotionBonus;
+                FatigueBurnBonus = fatigueBurnBonus;
             }
 
             internal uint Base { get; }
@@ -2191,6 +2236,7 @@ namespace DfoServer.Network.Handlers.Dungeon
             internal uint AdventureGroupBonus { get; }
             internal int ExperiencePotionBonusRate { get; }
             internal uint ExperiencePotionBonus { get; }
+            internal uint FatigueBurnBonus { get; }
             internal uint Bonus
             {
                 get
@@ -2211,7 +2257,9 @@ namespace DfoServer.Network.Handlers.Dungeon
                         value,
                         CharacterExperienceService.AddSaturating(
                             AdventureGroupBonus,
-                            ExperiencePotionBonus));
+                            CharacterExperienceService.AddSaturating(
+                                ExperiencePotionBonus,
+                                FatigueBurnBonus)));
                 }
             }
             internal uint Total => CharacterExperienceService.AddSaturating(Base, Bonus);

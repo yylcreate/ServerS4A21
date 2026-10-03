@@ -150,7 +150,8 @@ namespace DfoServer.Network.Handlers.Dungeon
             uint growthContractBonusExp = 0,
             uint eliteMonsterKillBonusExp = 0,
             uint experiencePotionBonusExp = 0,
-            bool reloadMissingAccountProgress = false)
+            bool reloadMissingAccountProgress = false,
+            uint fatigueBurnBonusExp = 0)
         {
             if (grant == null
                 || (grant.NormalExpGain == 0
@@ -189,6 +190,7 @@ namespace DfoServer.Network.Handlers.Dungeon
                     honor,
                     fatigueBuffBonusExp: experiencePotionBonusExp,
                     growthContractBonusExp: growthContractBonusExp,
+                    fatigueBurnBonusExp: fatigueBurnBonusExp,
                     eliteMonsterKillBonusExp: eliteMonsterKillBonusExp,
                     growthCapsuleExp: GrowthCapsuleDataProvider.GetDisplayProgress(
                         session.Player.Level,

@@ -18,6 +18,7 @@ using DfoServer.Network;
 using DfoServer.Network.Builders;
 using DfoServer.Network.Builders.Events;
 using DfoServer.Network.Handlers;
+using DfoServer.Network.Handlers.Dungeon;
 using DfoServer.Network.Parsers.Events;
 using Microsoft.Data.Sqlite;
 using PvfLib;
@@ -45,6 +46,7 @@ namespace DfoServer.SelfTests
             Section("entry authority", () => VerifyRepository(Check));
             Section("registered runtime", () => VerifyRegistration(Check));
             Section("request behavior", () => VerifyRequestsAsync(Check).GetAwaiter().GetResult());
+            Section("frozen effects and fatigue interface", () => VerifyEffects(Check));
             Section("identity fences", () => VerifyFencesAsync(Check).GetAwaiter().GetResult());
             Console.WriteLine($"FATIGUE_ACCELERATION_ENTRY assertions={assertions} failures={failures}");
             return failures;
@@ -60,11 +62,11 @@ namespace DfoServer.SelfTests
                 check("parser rejects malformed or unknown switch " + (body?.Length ?? -1),
                     !FatigueAccelerationRequestParser.TryParse(body, out var enabled) && !enabled);
             foreach (var item in new[] { (FatigueAccelerationEntryResult.Stopped, -1),
+                (FatigueAccelerationEntryResult.Started, -1),
                 (FatigueAccelerationEntryResult.InvalidRequest, 4), (FatigueAccelerationEntryResult.NotInTown, 19),
                 (FatigueAccelerationEntryResult.EntryClosed, 179),
                 (FatigueAccelerationEntryResult.DefinitionUnavailable, 4),
-                (FatigueAccelerationEntryResult.EntryUnavailable, 4),
-                (FatigueAccelerationEntryResult.EffectsUnavailable, 4) })
+                (FatigueAccelerationEntryResult.EntryUnavailable, 4) })
                 check("complete A21 command acknowledgement: " + item.Item1,
                     Ack(FatigueAccelerationPacketBuilder.BuildAck(item.Item1), item.Item2));
             var unknownRejected = false;
@@ -74,6 +76,9 @@ namespace DfoServer.SelfTests
             check("inactive state uses the independent NOTI enum and exactly U16 plus U8",
                 Inactive(FatigueAccelerationPacketBuilder.BuildInactivePacket())
                 && FatigueAccelerationPacketBuilder.BuildInactiveBody().SequenceEqual(new byte[3]));
+            check("active state uses only the proven state1 and preserves zero U16",
+                Active(FatigueAccelerationPacketBuilder.BuildStatePacket(true))
+                && FatigueAccelerationPacketBuilder.BuildStateBody(true).SequenceEqual(new byte[] { 0, 0, 1 }));
             foreach (var setting in new[] { null, "", " \t", "0", "1" })
                 check("entry setting accepts missing or exact switch " + setting,
                     FatigueAccelerationEntryService.TryParseEntrySetting(setting, out var value)
@@ -169,10 +174,23 @@ namespace DfoServer.SelfTests
                 fixture.Packets.Count == 4 && Ack(fixture.Packets[0], -1) && Inactive(fixture.Packets[1])
                 && Ack(fixture.Packets[2], -1) && Inactive(fixture.Packets[3]));
             fixture.Packets.Clear(); await fixture.Dispatch(session, new byte[] { 1 });
-            check("open entry never fabricates activation while effects are unavailable",
-                fixture.Packets.Count == 3 && Ack(fixture.Packets[0], 4) && Inactive(fixture.Packets[1])
-                && Envelope(fixture.Packets[2], 0, (ushort)NotiPacketTypeA21.SERVER_NOTICE_MESSAGE));
+            check("valid start succeeds and projects the accepted session state",
+                fixture.Packets.Count == 2 && Ack(fixture.Packets[0], -1) && Active(fixture.Packets[1])
+                && session.GameSession.FatigueAcceleration.IsEnabled(session.Player.CharacterId));
+            fixture.Packets.Clear(); await fixture.Dispatch(session, new byte[] { 1 });
+            check("duplicate start succeeds without a second effect owner or cost",
+                fixture.Packets.Count == 2 && Ack(fixture.Packets[0], -1) && Active(fixture.Packets[1]));
+            fixture.Packets.Clear(); await fixture.Dispatch(session, new byte[] { 2 });
+            check("invalid request preserves the previous accepted state",
+                fixture.Packets.Count == 2 && Ack(fixture.Packets[0], 4) && Active(fixture.Packets[1])
+                && session.GameSession.FatigueAcceleration.IsEnabled(session.Player.CharacterId));
             fixture.Service.Initialize("0"); fixture.Packets.Clear();
+            await fixture.Dispatch(session, new byte[] { 1 });
+            check("closed catalog preserves an accepted preference without granting a new run bonus",
+                fixture.Packets.Count == 2 && Ack(fixture.Packets[0], 179) && Active(fixture.Packets[1])
+                && fixture.Service.CaptureEffects(session.GameSession.FatigueAcceleration,
+                    session.Player.CharacterId, 104, new DungeonFile()).ExperienceBonusPercent == 0);
+            fixture.Packets.Clear();
             await fixture.Dispatch(session, new byte[] { 0 }); await fixture.Dispatch(session, new byte[] { 1 });
             check("closed entry still allows stopping but rejects starting without an active-state packet",
                 fixture.Packets.Count == 4 && Ack(fixture.Packets[0], -1) && Inactive(fixture.Packets[1])
@@ -212,6 +230,19 @@ namespace DfoServer.SelfTests
             await fixture.Dispatch(session, new byte[] { 0 });
             check("failed transport leaves no delivered record and permits retry", failed
                 && fixture.Packets.Count == 2 && Ack(fixture.Packets[0], -1) && Inactive(fixture.Packets[1]));
+            fixture.Service.Initialize("1"); fixture.Packets.Clear(); fixture.FailNextWrite = true;
+            await fixture.Dispatch(session, new byte[] { 1 });
+            check("an accepted start survives an ACK write failure for idempotent retry",
+                fixture.Packets.Count == 0 && session.GameSession.FatigueAcceleration.IsEnabled(session.Player.CharacterId));
+            await fixture.Dispatch(session, new byte[] { 1 });
+            check("retry after accepted start projects success and the same active state",
+                fixture.Packets.Count == 2 && Ack(fixture.Packets[0], -1) && Active(fixture.Packets[1]));
+            fixture.Packets.Clear(); await fixture.Dispatch(session, new byte[] { 0 });
+            fixture.Packets.Clear(); fixture.BeforePrepare = () => fixture.Service.Initialize("0");
+            await fixture.Dispatch(session, new byte[] { 1 });
+            check("catalog closure while waiting for send rejects activation at preparation",
+                fixture.Packets.Count == 2 && Ack(fixture.Packets[0], 179) && Inactive(fixture.Packets[1])
+                && !session.GameSession.FatigueAcceleration.IsEnabled(session.Player.CharacterId));
             using var invalid = new Fixture(validDefinition: false); var invalidSession = invalid.CreateSession();
             await invalid.Dispatch(invalidSession, new byte[] { 1 });
             check("invalid definition returns failure, inactive projection and visible notice",
@@ -224,6 +255,91 @@ namespace DfoServer.SelfTests
             check("entry read failure is generic failure plus notice, not a false closed-event result",
                 unavailable.Packets.Count == 3 && Ack(unavailable.Packets[0], 4) && Inactive(unavailable.Packets[1])
                 && Envelope(unavailable.Packets[2], 0, (ushort)NotiPacketTypeA21.SERVER_NOTICE_MESSAGE));
+        }
+
+        private static void VerifyEffects(Action<string, bool> check)
+        {
+            using var fixture = new Fixture(); var session = fixture.CreateSession();
+            var cid = session.Player.CharacterId;
+            var runtime = session.GameSession.FatigueAcceleration;
+            var dungeon = new DungeonFile();
+            var stopped = fixture.Service.CaptureEffects(runtime, cid, 104, dungeon);
+            check("inactive run has no extra experience and a neutral consumption interface",
+                stopped.ExperienceBonusPercent == 0 && stopped.FatigueConsumptionMultiplier == 1);
+            runtime.SetEnabled(cid, true);
+            var active = fixture.Service.CaptureEffects(runtime, cid, 104, dungeon);
+            check("server policy gives additive 100 percent and future double consumption",
+                active.ExperienceBonusPercent == 100 && active.FatigueConsumptionMultiplier == 2);
+            check("another character never inherits a session toggle",
+                !runtime.IsEnabled(cid + 1)
+                && fixture.Service.CaptureEffects(runtime, cid + 1, 104, dungeon).ExperienceBonusPercent == 0);
+            check("PVF excluded dungeon and no-fatigue definitions remain neutral",
+                fixture.Service.CaptureEffects(runtime, cid, 3557, dungeon).ExperienceBonusPercent == 0
+                && fixture.Service.CaptureEffects(runtime, cid, 104, new DungeonFile { NoFatigue = true }).FatigueConsumptionMultiplier == 1
+                && fixture.Service.CaptureEffects(runtime, cid, 104, null).ExperienceBonusPercent == 0);
+            var snapshot = new DungeonParticipantExperienceBonusSnapshot(1, false, false,
+                fatigueBurnExperienceBonusPercent: active.ExperienceBonusPercent,
+                fatigueConsumptionMultiplier: active.FatigueConsumptionMultiplier);
+            var story = snapshot.WithStoryExperienceProfile(50, 2);
+            check("story profile preserves burn effects and the future fatigue-cost interface",
+                story.FatigueBurnExperienceBonusPercent == 100 && story.FatigueConsumptionMultiplier == 2
+                && story.StoryExperienceBonusRatePercent == 50 && story.ScaleFatigueConsumption(3) == 6
+                && story.ScaleFatigueConsumption(0) == 0
+                && DungeonParticipantExperienceBonusSnapshot.None.ScaleFatigueConsumption(3) == 3);
+            var overflowRejected = false;
+            try { story.ScaleFatigueConsumption(uint.MaxValue); }
+            catch (OverflowException) { overflowRejected = true; }
+            check("future fatigue consumer receives an overflow instead of a wrapped debit", overflowRejected);
+            var plan = DungeonEntryExperienceBonusPlan.Capture(session, null, fixture.Sessions, 1,
+                fixture.Service, 104);
+            runtime.SetEnabled(cid, false);
+            fixture.Service.Initialize("0");
+            check("entry snapshot survives later stop and catalog closure",
+                plan.ForParticipant(session).FatigueBurnExperienceBonusPercent == 100
+                && plan.ForParticipant(session).FatigueConsumptionMultiplier == 2
+                && fixture.Service.CaptureEffects(runtime, cid, 104, dungeon).ExperienceBonusPercent == 0);
+            runtime.SetEnabled(cid, true);
+            check("a closed catalog grants no effects to a newly captured run",
+                fixture.Service.CaptureEffects(runtime, cid, 104, dungeon).ExperienceBonusPercent == 0);
+            fixture.Service.Initialize("1");
+            var oldLeasePlan = DungeonEntryExperienceBonusPlan.Capture(session, null, fixture.Sessions, 1,
+                fixture.Service, 104);
+            InventoryContext.Register(session.SessionId, fixture.Inventory);
+            check("owned lease replacement invalidates the old entry snapshot",
+                oldLeasePlan.ForParticipant(session).FatigueBurnExperienceBonusPercent == 0);
+            var next = DungeonEntryExperienceBonusPlan.Capture(session, null, fixture.Sessions, 1,
+                fixture.Service, 104);
+            var oldOwner = session.GameSession;
+            session.GameSession = new GameSession(session, fixture.Database);
+            check("character selection owner replacement drops both old toggle and old entry plan",
+                oldOwner.FatigueAcceleration.IsEnabled(cid)
+                && !session.GameSession.FatigueAcceleration.IsEnabled(cid)
+                && next.ForParticipant(session).FatigueBurnExperienceBonusPercent == 0);
+            var custom = new FatigueAccelerationEntryService(fixture.Database, () => Definition(),
+                new FatigueAccelerationEffectProfile(50, 3));
+            session.GameSession.FatigueAcceleration.SetEnabled(cid, true);
+            var configured = custom.CaptureEffects(session.GameSession.FatigueAcceleration, cid, 104, dungeon);
+            check("rates belong to injectable server policy rather than copied PVF tables",
+                configured.ExperienceBonusPercent == 50 && configured.FatigueConsumptionMultiplier == 3);
+            var invalidPolicyRejected = false;
+            try { _ = new FatigueAccelerationEntryService(fixture.Database, () => Definition(),
+                default(FatigueAccelerationEffectProfile)); }
+            catch (ArgumentException) { invalidPolicyRejected = true; }
+            check("explicit default struct cannot bypass policy validation", invalidPolicyRejected);
+
+            using var other = new Fixture(); var follower = other.CreateSession();
+            follower.Player.UserId++;
+            fixture.Sessions.Register(follower.Player.CharacterId, follower);
+            var party = new Game.Party.Party(9);
+            party.TryAddMember(new Game.Party.PartyMember { CharacterId = cid,
+                UserId = session.Player.UserId, SessionId = session.SessionId });
+            party.TryAddMember(new Game.Party.PartyMember { CharacterId = follower.Player.CharacterId,
+                UserId = follower.Player.UserId, SessionId = follower.SessionId });
+            var partyPlan = DungeonEntryExperienceBonusPlan.Capture(session, party, fixture.Sessions, 2,
+                fixture.Service, 104);
+            check("each party participant freezes their own switch instead of the leader's switch",
+                party.Count == 2 && partyPlan.ForParticipant(session).FatigueBurnExperienceBonusPercent == 100
+                && partyPlan.ForParticipant(follower).FatigueBurnExperienceBonusPercent == 0);
         }
 
         private static async Task VerifyFencesAsync(Action<string, bool> check)
@@ -267,7 +383,7 @@ namespace DfoServer.SelfTests
                     check(phase + " source fence rejects stale " + change.Name,
                         fixture.Packets.Count == (phase == "per-frame" ? 1 : 0)
                         && (phase == "prepare" || fixture.CancelledWrites == 1)
-                        && (phase != "per-frame" || Ack(fixture.Packets[0], 4)));
+                        && (phase != "per-frame" || Ack(fixture.Packets[0], -1)));
                 }
             }
             foreach (var missing in new[] { "UID", "character", "account", "GameSession", "lease" })
@@ -293,6 +409,9 @@ namespace DfoServer.SelfTests
         private static bool Inactive(byte[] packet)
             => Envelope(packet, 0, (ushort)NotiPacketTypeA21.USER_FATIGUE_ACCELERATION_STATE)
                 && packet.AsSpan(15).SequenceEqual(new byte[3]);
+        private static bool Active(byte[] packet)
+            => Envelope(packet, 0, (ushort)NotiPacketTypeA21.USER_FATIGUE_ACCELERATION_STATE)
+                && packet.AsSpan(15).SequenceEqual(new byte[] { 0, 0, 1 });
         private static GameSession Identity()
             => (GameSession)RuntimeHelpers.GetUninitializedObject(typeof(GameSession));
         private static FatigueAccelerationConfigFile Definition(bool valid = true)
@@ -336,7 +455,8 @@ namespace DfoServer.SelfTests
                 session.Account = new AccountRecord { AccountId = 1 };
                 session.Player.CharacterId = _character; session.Player.UserId = 12345;
                 session.Player.Level = 50; session.Player.UserState = 0; session.Player.TownPresenceReady = true;
-                session.GameSession = Identity(); _sessions.Add(session); Sessions.Register(_character, session);
+                session.GameSession = new GameSession(session, Database);
+                _sessions.Add(session); Sessions.Register(_character, session);
                 Inventory = new InventoryService(_character, 1, Database);
                 Inventory.SetMainVirtualCount(0, 1000); Inventory.ClearDirtyState();
                 InventoryContext.Register(session.SessionId, Inventory);

@@ -69,18 +69,22 @@ namespace DfoServer.Network.Handlers
                 if (!IsCurrent())
                     return;
                 var townReady = IsTownReady(player);
-                var result = _service.Evaluate(valid, enable, townReady);
+                var result = FatigueAccelerationEntryResult.InvalidRequest;
                 try
                 {
                     await _send(session, () =>
                     {
                         if (!IsCurrent() || IsTownReady(player) != townReady)
                             return Array.Empty<byte[]>();
+                        result = _service.Evaluate(valid, enable, townReady);
+                        if (result is FatigueAccelerationEntryResult.Started
+                            or FatigueAccelerationEntryResult.Stopped)
+                            generation.FatigueAcceleration.SetEnabled(cid, enable);
                         var packets = new List<byte[]> { FatigueAccelerationPacketBuilder.BuildAck(result) };
                         if (townReady)
-                            packets.Add(FatigueAccelerationPacketBuilder.BuildInactivePacket());
-                        if (result == FatigueAccelerationEntryResult.EffectsUnavailable
-                            || result == FatigueAccelerationEntryResult.DefinitionUnavailable
+                            packets.Add(FatigueAccelerationPacketBuilder.BuildStatePacket(
+                                generation.FatigueAcceleration.IsEnabled(cid)));
+                        if (result == FatigueAccelerationEntryResult.DefinitionUnavailable
                             || result == FatigueAccelerationEntryResult.EntryUnavailable)
                         {
                             packets.Add(GamePacketEnvelopeBuilder.Build(0,
@@ -101,7 +105,8 @@ namespace DfoServer.Network.Handlers
                     return;
                 }
                 FileLogger.Log($"[FatigueAcceleration] cid={cid} enable={enable} valid={valid} "
-                    + $"bodyLength={body?.Length ?? 0} result={result} effectsReady=false");
+                    + $"bodyLength={body?.Length ?? 0} result={result} "
+                    + $"active={generation.FatigueAcceleration.IsEnabled(cid)} policy=ServerPolicy");
             });
         }
 

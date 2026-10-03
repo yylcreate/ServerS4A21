@@ -30,6 +30,8 @@ namespace DfoServer.Network.Builders
         public const int RewardSlotBlockOffset = 17;
         public const int FixedRewardSlotCount = 23;
         public const int EquipmentBonusExpSlotIndex = 20;
+        public const int FatigueBurnClearBonusSlotIndex = 10;
+        public const int MonsterFatigueBurnBonusSlotIndex = 16;
         public const int FirstVariableRewardCountOffset = 109;
         public const int SecondVariableRewardCountOffset = 110;
         public const int PostVariableRewardBlockOffset = 111;
@@ -469,7 +471,9 @@ namespace DfoServer.Network.Builders
             int freeCardGold = 0, int freeCardItemId = 0, int freeCardItemCount = 0,
             IReadOnlyList<ClearRewardFreeCardSeat> freeCardSeats = null,
             int paidCardCost = 0,
-            IReadOnlyList<DungeonObjectExperienceEntry> objectExperienceEntries = null)
+            IReadOnlyList<DungeonObjectExperienceEntry> objectExperienceEntries = null,
+            int fatigueBurnExp = 0,
+            int monsterFatigueBurnExp = 0)
         {
             var w = new GamePacketWriter();
             // A12 wrote the aggregate monster EXP into its fixed tail. Current
@@ -496,6 +500,8 @@ namespace DfoServer.Network.Builders
                 else if (i == 5) value = creatureExp;       // 槽位6: 宠物通关奖励
                 else if (i == 7) value = adventureGroupExp; // 槽 8：冒险团通关经验
                 else if (i == 9) value = growthContractExp; // 槽位10: 成长之契约
+                else if (i == FatigueBurnClearBonusSlotIndex) value = fatigueBurnExp;
+                else if (i == MonsterFatigueBurnBonusSlotIndex) value = monsterFatigueBurnExp;
                 else if (i == 18) value = monsterGrowthContractExp; // 槽位19: 杀怪成长之契约
                 else if (i == MonsterEquipmentBonusSlotIndex) value = monsterEquipmentExp; // 槽位21: 装备加成奖励
                 w.WriteInt32(value);
