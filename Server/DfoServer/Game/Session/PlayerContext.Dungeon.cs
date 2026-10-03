@@ -19,6 +19,9 @@ namespace DfoServer.Game.Session
         internal long CurrentDungeonRunGeneration =>
             Interlocked.Read(ref _dungeonRunGeneration);
 
+        internal long CurrentDungeonSelectionGeneration =>
+            Interlocked.Read(ref _dungeonSelectionGeneration);
+
         internal Game.Dungeon.DungeonSelectionContext CurrentDungeonSelection =>
             Volatile.Read(ref _currentDungeonSelection);
 

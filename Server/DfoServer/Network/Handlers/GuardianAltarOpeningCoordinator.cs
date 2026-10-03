@@ -147,6 +147,7 @@ namespace DfoServer.Network.Handlers
             {
                 GuardianAltarEntryRejection? preparedReason = null;
                 var preparedMenu = false;
+                MenuProjectionReceipt menuReceipt = null;
                 GuardianAltarProgressSnapshot menu = null;
                 GuardianAltarEntryRejection? menuFailure = null;
                 var menuAnchor = _utcNow();
@@ -241,6 +242,7 @@ namespace DfoServer.Network.Handlers
                                 == Game.DailyReset.DailyResetService.TodayId(menuAnchor.UtcDateTime))
                         {
                             preparedMenu = true;
+                            menuReceipt = CaptureMenuProjection(session);
                             return new[]
                             {
                                 GamePacketEnvelopeBuilder.Build(1,
@@ -284,9 +286,12 @@ namespace DfoServer.Network.Handlers
                         + $"reason={preparedReason.Value} entryOnly=true");
                 else if (preparedMenu && menu != null && IsCurrentGeneration(session, characterId, generation)
                     && session.Player.UserId == userId)
+                {
+                    RememberMenuProjection(session, menuReceipt);
                     FileLogger.Log($"[GuardianAltarEntry] START_GAME menu projected cid={characterId} "
                         + $"ridable={menu.Header.RidableId} stages={menu.Stages.Count} "
                         + $"tickets={menu.Header.FreeTickets}+{menu.Header.SecondaryTickets} combatAdmission=false");
+                }
             });
         }
 
@@ -547,7 +552,10 @@ namespace DfoServer.Network.Handlers
         {
             if (session != null)
                 lock (_notificationSync)
+                {
                     _lastSent.Remove(session.SessionId);
+                    _menuProjections.Remove(session.SessionId);
+                }
             return Task.CompletedTask;
         }
 
@@ -563,7 +571,10 @@ namespace DfoServer.Network.Handlers
             }
             _sessions.SessionEnding -= OnSessionEndingAsync;
             lock (_notificationSync)
+            {
                 _lastSent.Clear();
+                _menuProjections.Clear();
+            }
         }
 
         private void ThrowIfDisposed()

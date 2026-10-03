@@ -801,7 +801,7 @@ namespace DfoServer.Network
             d[(ushort)CmdPacketTypeA21.FINISH_LOADING] =
                 _dungeonLoading.HandleFinishLoadingAsync;
             d[0x002A] = _dungeonLoading.HandleGiveupGameAsync;
-            d[0x0084] = (s, h, b) => HandleRaidAwareDungeonExit(s, h, b, _townHandler.Handle_ENUM_CMDPACKET_GIVEUP_GAME, "back-to-village");
+            d[(ushort)CmdPacketTypeA21.BACK_2_VILLAGE] = HandleBackToVillageAsync;
             d[0x00ED] = _townHandler.Handle_ENUM_CMDPACKET_TELEPORT;
             d[(ushort)CmdPacketTypeA21.GET_PCROOM_TIME_POINT_ITEM] =
                 _eventPcRoomTimePointHandler.HandleAsync;
@@ -813,6 +813,17 @@ namespace DfoServer.Network
                 _townHandler.Handle_ENUM_CMDPACKET_PARTY_TELEPORT;
             d[(ushort)CmdPacketTypeA21.SOLO_TELEPOART] =
                 _townHandler.Handle_ENUM_CMDPACKET_SOLO_TELEPOART;
+        }
+
+        private async Task HandleBackToVillageAsync(
+            EnhancedClientSession session, GamePacketHeader header, byte[] body)
+        {
+            if (_guardianAltarOpening != null
+                && await _guardianAltarOpening.TryHandleMenuReturnAsync(
+                    session, header, body, _townHandler.ProjectGuardianMenuReturnAsync))
+                return;
+            await HandleRaidAwareDungeonExit(session, header, body,
+                _townHandler.Handle_ENUM_CMDPACKET_GIVEUP_GAME, "back-to-village");
         }
 
         private void RegisterSettingsHandlers(GameCommandRegistry.GameCommandRegistrationGroup d)
