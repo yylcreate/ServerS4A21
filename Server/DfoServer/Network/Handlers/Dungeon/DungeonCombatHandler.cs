@@ -37,13 +37,19 @@ namespace DfoServer.Network.Handlers.Dungeon
         private readonly DungeonKillApplicationService _kills;
         private readonly TournamentDungeonCoordinator _tournament;
         private Func<EnhancedClientSession, DungeonRun, ushort, Task<bool>> _guardianCenterDeath;
+        private Func<EnhancedClientSession, DungeonRun, Task<bool>> _guardianCharacterDeath;
+        private Func<EnhancedClientSession, DungeonRun, ushort, Task<bool>> _guardianCoinRejection;
 
         internal void ConfigureGuardianAltar(
             Func<EnhancedClientSession, DungeonRun, Task> completion,
-            Func<EnhancedClientSession, DungeonRun, ushort, Task<bool>> centerDeath)
+            Func<EnhancedClientSession, DungeonRun, ushort, Task<bool>> centerDeath,
+            Func<EnhancedClientSession, DungeonRun, Task<bool>> characterDeath,
+            Func<EnhancedClientSession, DungeonRun, ushort, Task<bool>> coinRejection)
         {
             _kills.ConfigureGuardianCompletion(completion);
             _guardianCenterDeath = centerDeath ?? throw new ArgumentNullException(nameof(centerDeath));
+            _guardianCharacterDeath = characterDeath ?? throw new ArgumentNullException(nameof(characterDeath));
+            _guardianCoinRejection = coinRejection ?? throw new ArgumentNullException(nameof(coinRejection));
         }
 
         internal DungeonCombatHandler(
@@ -284,6 +290,14 @@ namespace DfoServer.Network.Handlers.Dungeon
             var bodyHex = body != null ? BitConverter.ToString(body) : "null";
             FileLogger.Log($"[{DungeonSharedServices.ProtocolLogName}] DIE_CHARACTER: uid={session.Player.UserId} body={bodyHex}");
             var deathRun = session.Player.CurrentRun;
+            if (deathRun?.Instance?.Mechanisms.GuardianAltarCombat != null)
+            {
+                if (_guardianCharacterDeath != null)
+                    await _guardianCharacterDeath(session, deathRun);
+                else
+                    FileLogger.Log("[GuardianAltarClear] character death suppressed: Guardian death owner is not configured.");
+                return;
+            }
             var scriptedDeath =
                 DungeonMechanismCoordinator.OnCharacterDied(session, deathRun);
             var deathEvent = scriptedDeath.ClearRequest.ShouldClearDungeon
@@ -829,6 +843,15 @@ namespace DfoServer.Network.Handlers.Dungeon
             if (run == null || !session.Player.IsCurrentDungeonRun(runIdentity))
                 return false;
 
+            if (run.Instance.Mechanisms.GuardianAltarCombat != null)
+            {
+                if (_guardianCoinRejection != null)
+                    await _guardianCoinRejection(session, run, targetId);
+                else
+                    FileLogger.Log("[GuardianAltarClear] USE_COIN suppressed: Guardian coin rejection owner is not configured.");
+                return false;
+            }
+
             DungeonParticipantRosterEntry reviveTarget = null;
             var isTournament = _svc.Tournaments.IsTournamentRun(run);
             short coinSlot;
@@ -889,13 +912,10 @@ namespace DfoServer.Network.Handlers.Dungeon
 
             if (!reviveCommitted)
             {
-                var err = new GamePacketWriter();
-                err.WriteByte(0x00);
-                err.WriteUInt16(targetId);
                 await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(
                     0x01,
                     0x0029,
-                    err.ToArray()));
+                    BuildUseCoinRejectionBody(targetId)));
                 FileLogger.Log(
                     $"[{DungeonSharedServices.ProtocolLogName}] " +
                     $"USE_COIN rejected target={targetId} cid={characterId}");
@@ -932,6 +952,14 @@ namespace DfoServer.Network.Handlers.Dungeon
             await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(0x01, 0x0029, ack.ToArray()));
             FileLogger.Log($"[{DungeonSharedServices.ProtocolLogName}] USE_COIN: OK cid={characterId} slot={coinSlot} remaining={coinRemaining}");
             return true;
+        }
+
+        internal static byte[] BuildUseCoinRejectionBody(ushort targetId)
+        {
+            var writer = new GamePacketWriter();
+            writer.WriteByte(0);
+            writer.WriteUInt16(targetId);
+            return writer.ToArray();
         }
 
         private bool TryConsumeReviveCoin(

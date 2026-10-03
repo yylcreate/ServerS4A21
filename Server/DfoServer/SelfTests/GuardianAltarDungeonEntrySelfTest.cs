@@ -21,7 +21,7 @@ using DfoServer.Network.Parsers.Events;
 
 namespace DfoServer.SelfTests
 {
-    internal static class GuardianAltarDungeonEntrySelfTest
+    internal static partial class GuardianAltarDungeonEntrySelfTest
     {
         internal static int Run()
         {
@@ -60,6 +60,7 @@ namespace DfoServer.SelfTests
                 Section("Guardian energy coordinator", () => CheckEnergyAsync(Check, definition).GetAwaiter().GetResult());
                 Section("Guardian formal clear resource plans", () => CheckClearPlans(Check, definition));
                 Section("Guardian dedicated failed settlement", () => CheckFailedClearAsync(Check, definition).GetAwaiter().GetResult());
+                Section("Guardian dedicated character death and coin refusal", () => CheckCharacterDeathAsync(Check, definition).GetAwaiter().GetResult());
                 Section("Guardian result-button selection and exit", () => CheckEplpSelectionAsync(Check, definition).GetAwaiter().GetResult());
             }
             Console.WriteLine($"GUARDIAN_ALTAR_DUNGEON_ENTRY assertions={assertions} failures={failures}");

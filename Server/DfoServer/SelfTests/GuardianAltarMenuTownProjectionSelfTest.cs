@@ -64,7 +64,8 @@ namespace DfoServer.SelfTests
             Section("actual Guardian run giveup and reopened menu", () => VerifyRunGiveupControlsAsync(Check));
             Section("existing returned menu read authority", () => VerifyExistingReturnMenuReadAsync(Check));
             Section("actual closed result selection continuation", () => VerifyActualClosedContinuationAsync(Check));
-            Section("deferred town inputs and retry", () => VerifyDeferredTownInputsAsync(Check));
+            Section("activity release and town retry", () => VerifyActivityReleaseRetryAsync(Check));
+            Section("actual giveup release-to-town source fence", () => VerifyRunGiveupReleaseScopeAsync(Check));
             Section("normal controls failure and retry", () => VerifyControlsRetryAsync(Check));
             Section("normal controls source and send fences", () => VerifyControlsFencesAsync(Check));
             Console.WriteLine($"GUARDIAN_ALTAR_MENU_TOWN_PROJECTION assertions={assertions} failures={failures}");
@@ -376,11 +377,14 @@ namespace DfoServer.SelfTests
 
         private static async Task VerifyRunGiveupControlsAsync(Action<string, bool> check)
         {
-            foreach (var input in new[] { "area", "position" })
-            {
             using var fixture = new Fixture();
             fixture.ConfigureRealControls();
-            fixture.RegisterControlsInventory();
+            var lease = fixture.RegisterControlsInventory();
+            var expectedSkills = SkillInfoBodyBuilder.BuildFrom(fixture.Projector.LoadSyncedSkillState(
+                fixture.Record.CharacterId, fixture.Session.Player.Level, persist: false).Skills);
+            byte[] expectedItems;
+            lock (lease.SyncRoot)
+                expectedItems = ItemListPacketBuilder.BuildItemSpaceListBody(lease.Inventory, InventoryListType.Main);
             fixture.ConfigureMenuOwner();
             await fixture.MenuAsync();
             await fixture.DrainAsync();
@@ -405,44 +409,49 @@ namespace DfoServer.SelfTests
             var packets = await fixture.DrainAsync();
             var types = packets.Select(Type).ToList();
             var rosterIndex = types.IndexOf((ushort)NotiPacketTypeA21.AREA_USERS);
-            var deferredSource = fixture.Session.GuardianAltarControls;
-            check("actual run GIVEUP keeps its restoration source while the client asynchronously leaves the activity: " + input,
-                packets.Count > 0 && Type(packets[0]) == (ushort)CmdPacketTypeA21.GIVEUP_GAME
+            var releaseIndex = types.IndexOf((ushort)NotiPacketTypeA21.ADVANCE_ALTAR_EPLP_STATE);
+            var skillIndex = types.IndexOf((ushort)NotiPacketTypeA21.SKILLINFO);
+            var mainIndex = types.IndexOf((ushort)NotiPacketTypeA21.ITEM_LIST);
+            check("actual run GIVEUP releases activity controls before Town and restores normal controls without any new client input",
+                packets.Count > 1 && Type(packets[0]) == (ushort)CmdPacketTypeA21.GIVEUP_GAME
                 && packets[0].AsSpan(HeaderLength).SequenceEqual(new byte[] { 1 })
-                && rosterIndex >= 0 && !types.Contains((ushort)NotiPacketTypeA21.SKILLINFO)
-                && !types.Contains((ushort)NotiPacketTypeA21.ITEM_LIST)
-                && fixture.Session.Player.CurrentRun == null && deferredSource?.AwaitingTownInput == true
-                && deferredSource.RunGeneration == source.RunGeneration
-                && deferredSource.SelectionGeneration == source.SelectionGeneration
-                && !ReferenceEquals(source, deferredSource));
+                && releaseIndex == 1 && packets[releaseIndex].AsSpan(HeaderLength)
+                    .SequenceEqual(GuardianAltarClearBodyBuilder.BuildEplpState(3, 0))
+                && types[releaseIndex + 1] == (ushort)NotiPacketTypeA21.USER_STATE
+                && rosterIndex > releaseIndex && skillIndex > rosterIndex && mainIndex == skillIndex + 1
+                && types.Count(x => x == (ushort)NotiPacketTypeA21.ADVANCE_ALTAR_EPLP_STATE) == 1
+                && types.Count(x => x == (ushort)NotiPacketTypeA21.SKILLINFO) == 1
+                && types.Count(x => x == (ushort)NotiPacketTypeA21.ITEM_LIST) == 1
+                && fixture.Session.Player.CurrentRun == null && fixture.Session.GuardianAltarControls == null);
+            check("direct GIVEUP restores actual ordinary skill pages and the current owned Main",
+                skillIndex >= 0 && mainIndex >= 0
+                && packets[skillIndex].AsSpan(HeaderLength).SequenceEqual(expectedSkills)
+                && packets[mainIndex].AsSpan(HeaderLength).SequenceEqual(expectedItems));
             check("actual GIVEUP does not advance epochs, spend tickets or fabricate a clear reward",
                 fixture.Session.Player.CurrentDungeonRunGeneration == runGeneration
                 && fixture.Session.Player.CurrentDungeonSelectionGeneration == selectionGeneration
                 && SameGuardianProgress(progress, fixture.ReadGuardianProgress())
-                && fixture.ReadPersistedItemCount() == 7 && !fixture.Session.TryCompleteGuardianControlsRestore(source));
+                && fixture.ReadPersistedItemCount() == 7 && !fixture.Session.TryCompleteGuardianControlsRestore(source)
+                && !types.Contains((ushort)NotiPacketTypeA21.ADVANCE_ALTAR_CLEAR_STAGE)
+                && !types.Contains((ushort)NotiPacketTypeA21.ADVANCE_ALTAR_UPDATE_RIDABLE));
             await fixture.Town.Handle_ENUM_CMDPACKET_FINISH_LOADING(fixture.Session,
                 new GamePacketHeader { cmd = 1, type = (ushort)CmdPacketTypeA21.FINISH_LOADING },
                 Array.Empty<byte>()).WaitAsync(Timeout);
             packets = await fixture.DrainAsync();
-            check("an unrelated loading request cannot release a deferred GIVEUP source",
+            check("an unrelated loading request cannot repeat completed GIVEUP restoration",
                 !packets.Any(x => Type(x) == (ushort)NotiPacketTypeA21.SKILLINFO
-                    || Type(x) == (ushort)NotiPacketTypeA21.ITEM_LIST)
-                && ReferenceEquals(fixture.Session.GuardianAltarControls, deferredSource));
-            await fixture.TownInputAsync(input);
-            packets = await fixture.DrainAsync();
-            types = packets.Select(Type).ToList();
-            check("the real town " + input + " handler rebinds persisted skills and owned Main after its normal projection",
-                types.Count(x => x == (ushort)NotiPacketTypeA21.SKILLINFO) == 1
-                && types.Count(x => x == (ushort)NotiPacketTypeA21.ITEM_LIST) == 1
-                && types[^2] == (ushort)NotiPacketTypeA21.SKILLINFO
-                && types[^1] == (ushort)NotiPacketTypeA21.ITEM_LIST
-                && fixture.Session.GuardianAltarControls == null
-                && fixture.ReadPersistedItemCount() == 7 && SameGuardianProgress(progress, fixture.ReadGuardianProgress()));
-            await fixture.TownInputAsync(input);
-            packets = await fixture.DrainAsync();
-            check("later town " + input + " requests do not repeat a completed normal-controls projection",
-                !packets.Any(x => Type(x) == (ushort)NotiPacketTypeA21.SKILLINFO
-                    || Type(x) == (ushort)NotiPacketTypeA21.ITEM_LIST));
+                    || Type(x) == (ushort)NotiPacketTypeA21.ITEM_LIST
+                    || Type(x) == (ushort)NotiPacketTypeA21.ADVANCE_ALTAR_EPLP_STATE)
+                && fixture.Session.GuardianAltarControls == null);
+            foreach (var input in new[] { "area", "position" })
+            {
+                await fixture.TownInputAsync(input);
+                packets = await fixture.DrainAsync();
+                check("later town " + input + " requests do not repeat a completed normal-controls projection",
+                    !packets.Any(x => Type(x) == (ushort)NotiPacketTypeA21.SKILLINFO
+                        || Type(x) == (ushort)NotiPacketTypeA21.ITEM_LIST
+                        || Type(x) == (ushort)NotiPacketTypeA21.ADVANCE_ALTAR_EPLP_STATE));
+            }
             await fixture.MenuAsync();
             await fixture.DrainAsync();
             var renewed = fixture.Session.GuardianAltarControls;
@@ -455,27 +464,57 @@ namespace DfoServer.SelfTests
                 consumed && packets.Select(Type).SequenceEqual(MenuControlsTypes())
                 && fixture.Session.GuardianAltarControls == null && SameGuardianProgress(progress, fixture.ReadGuardianProgress())
                 && fixture.ReadPersistedItemCount() == 7);
-            }
         }
 
-        private static async Task VerifyDeferredTownInputsAsync(Action<string, bool> check)
+        private static async Task VerifyActivityReleaseRetryAsync(Action<string, bool> check)
         {
+            using (var fixture = new Fixture())
+            {
+                fixture.ConfigureRealControls();
+                fixture.RegisterControlsInventory();
+                var source = fixture.MarkControlsSource() with { ActivityReleasePending = true };
+                fixture.Session.GuardianAltarControls = source;
+                await fixture.SendGate.WaitAsync();
+                Task pending;
+                EnhancedClientSession.GuardianAltarControlProjectionSource replacement;
+                try
+                {
+                    pending = fixture.TownInputAsync("position");
+                    check("a real Town position request captures its source before waiting on the send lock", !pending.IsCompleted);
+                    replacement = source with { };
+                    fixture.Session.GuardianAltarControls = replacement;
+                }
+                finally { fixture.SendGate.Release(); }
+                await pending.WaitAsync(Timeout);
+                var packets = await fixture.DrainAsync();
+                check("a queued old Town request cannot release a replacement menu source or project its controls",
+                    ReferenceEquals(fixture.Session.GuardianAltarControls, replacement)
+                    && !fixture.Session.TryCompleteGuardianControlsRestore(source)
+                    && !packets.Any(x => Type(x) == (ushort)NotiPacketTypeA21.ADVANCE_ALTAR_EPLP_STATE
+                        || Type(x) == (ushort)NotiPacketTypeA21.SKILLINFO || Type(x) == (ushort)NotiPacketTypeA21.ITEM_LIST));
+            }
             foreach (var input in new[] { "area", "position" })
             {
                 using var fixture = new Fixture();
                 fixture.ConfigureRealControls();
-                var source = fixture.MarkControlsSource() with { AwaitingTownInput = true };
+                var source = fixture.MarkControlsSource() with { ActivityReleasePending = true };
                 fixture.Session.GuardianAltarControls = source;
                 var failure = await ObserveAsync(() => fixture.TownInputAsync(input));
                 var partial = await fixture.DrainAsync();
-                check("deferred " + input + " restore without a lease preserves source and reports an incomplete projection",
-                    failure is InvalidOperationException && ReferenceEquals(fixture.Session.GuardianAltarControls, source)
+                var released = fixture.Session.GuardianAltarControls;
+                check("pending " + input + " releases the activity but a missing owned lease preserves ordinary restore for retry",
+                    failure is InvalidOperationException && released != null && !released.ActivityReleasePending
+                    && released == (source with { ActivityReleasePending = false })
+                    && partial.Count(x => Type(x) == (ushort)NotiPacketTypeA21.ADVANCE_ALTAR_EPLP_STATE) == 1
+                    && partial.Single(x => Type(x) == (ushort)NotiPacketTypeA21.ADVANCE_ALTAR_EPLP_STATE)
+                        .AsSpan(HeaderLength).SequenceEqual(GuardianAltarClearBodyBuilder.BuildEplpState(3, 0))
                     && !partial.Any(x => Type(x) == (ushort)NotiPacketTypeA21.ITEM_LIST));
                 fixture.RegisterControlsInventory();
                 await fixture.TownInputAsync(input);
                 var retried = await fixture.DrainAsync();
-                check("deferred " + input + " retry uses the new owned lease without losing the pending source",
+                check("pending " + input + " retry uses the new owned lease and does not repeat an already released activity",
                     fixture.Session.GuardianAltarControls == null
+                    && !retried.Any(x => Type(x) == (ushort)NotiPacketTypeA21.ADVANCE_ALTAR_EPLP_STATE)
                     && retried.Count(x => Type(x) == (ushort)NotiPacketTypeA21.ITEM_LIST) == 1
                     && fixture.ReadPersistedItemCount() == 7);
             }
@@ -484,7 +523,7 @@ namespace DfoServer.SelfTests
                 using var fixture = new Fixture();
                 fixture.ConfigureRealControls();
                 fixture.RegisterControlsInventory();
-                var source = fixture.MarkControlsSource() with { AwaitingTownInput = true };
+                var source = fixture.MarkControlsSource() with { ActivityReleasePending = true };
                 fixture.Session.GuardianAltarControls = source;
                 if (stale == "account") fixture.Session.Account = new AccountRecord { AccountId = source.AccountId };
                 if (stale == "generation") fixture.Session.GameSession = new GameSession(fixture.Session,
@@ -500,10 +539,95 @@ namespace DfoServer.SelfTests
                 if (stale == "directory") await fixture.Sessions.UnregisterAsync(fixture.Record.CharacterId, fixture.Session);
                 await fixture.TownInputAsync("position");
                 var packets = await fixture.DrainAsync();
-                check("a town input cannot restore stale deferred " + stale + " controls",
+                check("a town input cannot release or restore stale " + stale + " controls",
                     ReferenceEquals(fixture.Session.GuardianAltarControls, source)
                     && !packets.Any(x => Type(x) == (ushort)NotiPacketTypeA21.SKILLINFO
-                        || Type(x) == (ushort)NotiPacketTypeA21.ITEM_LIST));
+                        || Type(x) == (ushort)NotiPacketTypeA21.ITEM_LIST
+                        || Type(x) == (ushort)NotiPacketTypeA21.ADVANCE_ALTAR_EPLP_STATE));
+            }
+        }
+
+        private static async Task VerifyRunGiveupReleaseScopeAsync(Action<string, bool> check)
+        {
+            foreach (var stage in new[] { "queued ACK", "released activity and queued Town" })
+            {
+                using var fixture = new Fixture();
+                fixture.ConfigureRealControls();
+                fixture.RegisterControlsInventory();
+                fixture.ConfigureMenuOwner();
+                await fixture.MenuAsync();
+                await fixture.DrainAsync();
+                if (!await fixture.StartGuardianStageAsync())
+                    throw new InvalidOperationException("The real Guardian owner did not admit the return-scope fixture.");
+                await fixture.DrainAsync();
+                var before = fixture.ReadGuardianProgress();
+                var run = fixture.Session.Player.CurrentRun;
+                var original = fixture.Session.GuardianAltarControls;
+                await fixture.SendGate.WaitAsync();
+                var gateHeld = true;
+                EnhancedClientSession.GuardianAltarControlProjectionSource replacement = null;
+                var pending = fixture.Town.Handle_ENUM_CMDPACKET_GIVEUP_GAME(fixture.Session,
+                    new GamePacketHeader { cmd = 1, type = (ushort)CmdPacketTypeA21.GIVEUP_GAME, length = 14 },
+                    Array.Empty<byte>());
+                try
+                {
+                    // The SDK's real asynchronous semaphore queue lets this
+                    // test stop between actual writes without a production hook
+                    // or elapsed-time assumption. Only this return writes here.
+                    await WaitForQueuedWriteAsync(fixture.SendGate, pending);
+                    if (stage == "released activity and queued Town")
+                    {
+                        var afterAck = fixture.SendGate.WaitAsync();
+                        fixture.SendGate.Release(); gateHeld = false;
+                        await afterAck.WaitAsync(Timeout); gateHeld = true;
+                        await WaitForQueuedWriteAsync(fixture.SendGate, pending);
+                        var afterRelease = fixture.SendGate.WaitAsync();
+                        fixture.SendGate.Release(); gateHeld = false;
+                        await afterRelease.WaitAsync(Timeout); gateHeld = true;
+                        await WaitForQueuedWriteAsync(fixture.SendGate, pending);
+                    }
+                    var captured = fixture.Session.GuardianAltarControls;
+                    check(stage + " uses the real ended run and retains the precise pending/released source",
+                        !pending.IsCompleted && fixture.Session.Player.CurrentRun == null
+                        && captured != null && !ReferenceEquals(captured, original)
+                        && captured.RunGeneration == run.RunGeneration
+                        && captured.ActivityReleasePending == (stage == "queued ACK"));
+                    replacement = captured with { };
+                    fixture.Session.GuardianAltarControls = replacement;
+                }
+                finally { if (gateHeld) fixture.SendGate.Release(); }
+                await pending.WaitAsync(Timeout);
+                var packets = await fixture.DrainAsync();
+                var expected = stage == "queued ACK" ? Array.Empty<ushort>()
+                    : new[] { (ushort)CmdPacketTypeA21.GIVEUP_GAME, (ushort)NotiPacketTypeA21.ADVANCE_ALTAR_EPLP_STATE };
+                check("source replacement at " + stage + " suppresses old Town, skills and Main without consuming the new source",
+                    packets.Select(Type).SequenceEqual(expected)
+                    && ReferenceEquals(fixture.Session.GuardianAltarControls, replacement)
+                    && !fixture.Session.TryCompleteGuardianControlsRestore(original)
+                    && !packets.Any(x => Type(x) == (ushort)NotiPacketTypeA21.USER_STATE
+                        || Type(x) == (ushort)NotiPacketTypeA21.USER_AREA || Type(x) == (ushort)NotiPacketTypeA21.AREA_USERS
+                        || Type(x) == (ushort)NotiPacketTypeA21.SKILLINFO || Type(x) == (ushort)NotiPacketTypeA21.ITEM_LIST));
+                if (stage == "released activity and queued Town")
+                    check("the already written release remains the existing control-only EPLP body",
+                        packets.Count == 2 && packets[0].AsSpan(HeaderLength).SequenceEqual(new byte[] { 1 })
+                        && packets[1].AsSpan(HeaderLength).SequenceEqual(GuardianAltarClearBodyBuilder.BuildEplpState(3, 0)));
+                check("a suppressed " + stage + " tail leaves persistent rewards and owned inventory unchanged",
+                    SameGuardianProgress(before, fixture.ReadGuardianProgress()) && fixture.ReadPersistedItemCount() == 7);
+            }
+
+            static async Task WaitForQueuedWriteAsync(SemaphoreSlim gate, Task sending)
+            {
+                var head = typeof(SemaphoreSlim).GetFields(BindingFlags.Instance | BindingFlags.NonPublic)
+                    .Single(field => field.Name.EndsWith("asyncHead", StringComparison.Ordinal));
+                var started = Environment.TickCount64;
+                while (head.GetValue(gate) == null)
+                {
+                    if (sending.IsCompleted)
+                        throw new InvalidOperationException("The real return completed before the expected queued write.");
+                    if (Environment.TickCount64 - started >= Timeout.TotalMilliseconds)
+                        throw new TimeoutException("The real return did not queue its next write.");
+                    await Task.Yield();
+                }
             }
         }
 

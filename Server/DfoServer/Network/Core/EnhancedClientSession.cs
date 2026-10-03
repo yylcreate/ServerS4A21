@@ -46,13 +46,14 @@ namespace DfoServer.Network
         internal bool TryCompleteGuardianControlsRestore(GuardianAltarControlProjectionSource source)
             => ReferenceEquals(Interlocked.CompareExchange(ref _guardianAltarControls, null, source), source);
 
-        internal bool TryDeferGuardianControlsRestore(GuardianAltarControlProjectionSource source)
-            => source != null && ReferenceEquals(Interlocked.CompareExchange(ref _guardianAltarControls,
-                source with { AwaitingTownInput = true }, source), source);
+        internal bool TryReplaceGuardianControlsSource(GuardianAltarControlProjectionSource source,
+            GuardianAltarControlProjectionSource replacement)
+            => source != null && replacement != null && ReferenceEquals(
+                Interlocked.CompareExchange(ref _guardianAltarControls, replacement, source), source);
 
         internal sealed record GuardianAltarControlProjectionSource(
             GameSession Generation, AccountRecord Account, int CharacterId, int AccountId, ushort UserId,
-            long RunGeneration, long SelectionGeneration, bool AwaitingTownInput = false);
+            long RunGeneration, long SelectionGeneration, bool ActivityReleasePending = false);
 
         // 玩家当前打开的收集箱 PVF [Index] 值(0388请求体末尾字节, 见 CollectionBoxHandler)
         public int SelectedCollectionBoxIndex { get; set; }

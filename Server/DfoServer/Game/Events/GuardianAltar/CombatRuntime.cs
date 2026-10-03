@@ -445,6 +445,31 @@ namespace DfoServer.Game.Events.GuardianAltar
             return true;
         }
 
+        internal bool TryFailCharacterDeath(DungeonParticipantRoomIdentity identity, long loadingGeneration,
+            long activeMilliseconds, out GuardianAltarTerminalFact fact)
+        {
+            var created = false;
+            lock (_syncRoot)
+            {
+                fact = null;
+                if (!MatchesScopeLocked(identity, loadingGeneration) || activeMilliseconds < 0)
+                    return false;
+                if (_terminalFact != null)
+                {
+                    fact = _terminalFact;
+                    return fact.Result == GuardianAltarTerminalResult.Failed;
+                }
+                _lastActiveMilliseconds = Math.Max(_lastActiveMilliseconds, activeMilliseconds);
+                fact = new GuardianAltarTerminalFact(Guid.NewGuid(), _identity, _generation,
+                    _lastActiveMilliseconds, GuardianAltarTerminalResult.Failed, "guardian-character-death");
+                _terminalFact = fact;
+                created = true;
+            }
+            if (created)
+                Timers.CancelAll();
+            return true;
+        }
+
         internal void Close()
         {
             lock (_syncRoot)

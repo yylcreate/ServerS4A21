@@ -174,7 +174,8 @@ namespace DfoServer.Network.Handlers
                     returnToStageSelection(session, identity, current,
                         () => _services.TownReturn.ReturnAsync(session, identity)));
             _combat.ConfigureGuardianAltar(_guardianAltar.TryCompleteAsync,
-                _guardianAltar.TryHandleCenterDeathAsync);
+                _guardianAltar.TryHandleCenterDeathAsync, _guardianAltar.TryHandleCharacterDeathAsync,
+                _guardianAltar.TryRejectUseCoinAsync);
             _settlement.ConfigureGuardianAltarEplp(_guardianAltar.TryHandleEplpCommandAsync);
         }
 

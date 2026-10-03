@@ -104,7 +104,9 @@ namespace DfoServer.Network.Builders
         internal static byte[] BuildEplpState(int endType, int availableTicket)
         {
             // sub_1147D10 consumes exactly five bytes. This batch exposes only
-            // the confirmed center-failure and successful-clear projections.
+            // the confirmed failure and control-release projections. Type3
+            // follows a successful clear or an explicit GIVEUP; it does not
+            // create success, rewards, or a next-stage unlock on its own.
             if (endType != 0 && endType != 3)
                 throw new ArgumentOutOfRangeException(nameof(endType));
             if (availableTicket < 0 || availableTicket > byte.MaxValue)

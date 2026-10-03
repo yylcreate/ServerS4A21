@@ -35,6 +35,7 @@ namespace DfoServer.SelfTests
             Section("terminal success authority", () => CheckTerminalSuccess(Check));
             Section("terminal pending projection", () => CheckTerminalPending(Check));
             Section("terminal failure and abort", () => CheckTerminalFailure(Check));
+            Section("Guardian character death terminal", () => CheckCharacterDeathFailure(Check));
             Section("terminal scope fencing", () => CheckTerminalScope(Check));
             Section("definition admission and close", () => CheckBoundary(Check));
             Console.WriteLine($"GUARDIAN_ALTAR_COMBAT_RUNTIME assertions={assertions} failures={failures}");
@@ -537,6 +538,69 @@ namespace DfoServer.SelfTests
                 && !closed.TryCommitRegistered(pending) && !closed.TryMarkProjected(pending)
                 && !closed.RetainForRetry(pending) && !closed.TryAllocateSequence(identity, 1, out _)
                 && !closed.TryApplyDeath(identity, 1, pending.Spawns[0].SequenceId, out _));
+        }
+
+        private static void CheckCharacterDeathFailure(Action<string, bool> check)
+        {
+            var identity = Identity();
+            var runtime = Runtime(Phases((1000, "1 -1 -1")), "1 1 0 500 1",
+                centerSequences: new ushort[] { 0 });
+            check("a character death cannot initialize unbound combat authority",
+                !runtime.TryFailCharacterDeath(identity, 1, 0, out _) && runtime.TerminalFact == null);
+            runtime.BindLoadingRelease(identity, 1);
+            var batch = Reserve(runtime, 0);
+            Publish(runtime, batch);
+            var wave = runtime.Timers.Begin(DungeonRunTimerKeys.GuardianAltarWaveSchedule);
+            check("death from another participant room or loading generation cannot fail this combat",
+                !runtime.TryFailCharacterDeath(Identity(runId: 2), 1, 1, out _)
+                && !runtime.TryFailCharacterDeath(Identity(runGeneration: 2), 1, 1, out _)
+                && !runtime.TryFailCharacterDeath(Identity(roomId: 2), 1, 1, out _)
+                && !runtime.TryFailCharacterDeath(identity, 2, 1, out _)
+                && !runtime.TryFailCharacterDeath(identity, 1, -1, out _)
+                && runtime.TerminalFact == null && runtime.Timers.IsCurrent(wave));
+            check("current character death freezes Failed while enemies and configured centers still survive",
+                runtime.TryFailCharacterDeath(identity, 1, 250, out var fact)
+                && fact.Result == GuardianAltarTerminalResult.Failed && fact.Reason == "guardian-character-death"
+                && fact.ActiveMilliseconds == 250 && fact.EventId != Guid.Empty
+                && runtime.AliveCount == 1 && runtime.IsTerminal && !runtime.Timers.IsCurrent(wave)
+                && runtime.NextDueActiveMilliseconds == null);
+            var original = runtime.TerminalFact;
+            check("duplicate character or later center death retains the same immutable failure event",
+                runtime.TryFailCharacterDeath(identity, 1, 900, out var repeated)
+                && ReferenceEquals(repeated, original)
+                && runtime.TryFailCenter(identity, 1, 0, 900, out var center)
+                && ReferenceEquals(center, original));
+            check("character failure blocks success, wave projection, actor deaths and new summon sequences",
+                !runtime.TryComplete(identity, 1, 10000, out _)
+                && !runtime.TryRecordSpawnProjected(batch, 0)
+                && !runtime.TryApplyDeath(identity, 1, batch.Spawns[0].SequenceId, out _)
+                && !runtime.TryAllocateSequence(identity, 1, out _)
+                && runtime.AliveCount == 1 && ReferenceEquals(runtime.TerminalFact, original));
+            runtime.Close();
+            check("closing failed combat preserves character death and rejects late repeats",
+                ReferenceEquals(runtime.TerminalFact, original)
+                && !runtime.TryFailCharacterDeath(identity, 1, 10000, out _));
+
+            var won = Runtime(Phases((1000, "1 -1 -1")), "1 1 0 500 1",
+                centerSequences: new ushort[] { 0 });
+            won.BindLoadingRelease(identity, 1);
+            var last = Reserve(won, 0);
+            Publish(won, last);
+            won.TryApplyDeath(identity, 1, last.Spawns[0].SequenceId, out _);
+            won.TryReserveDue(1000, identity, 1, out _, out _);
+            won.TryComplete(identity, 1, 1000, out var success);
+            check("a later character death cannot overwrite the already frozen successful last-wave outcome",
+                success?.Result == GuardianAltarTerminalResult.Succeeded
+                && !won.TryFailCharacterDeath(identity, 1, 1100, out var preserved)
+                && ReferenceEquals(success, preserved) && ReferenceEquals(success, won.TerminalFact));
+            won.Close();
+
+            var emptyCenters = Runtime(Phases((1000, "1 -1 -1")), "1 1 0 500 1");
+            emptyCenters.BindLoadingRelease(identity, 1);
+            check("character death is independent of a configured center roster or invented center sequence",
+                emptyCenters.TryFailCharacterDeath(identity, 1, 0, out var noCenter)
+                && noCenter.Result == GuardianAltarTerminalResult.Failed);
+            emptyCenters.Close();
         }
 
         private static GuardianAltarCombatRuntime Runtime(string map, string action, int firstSequence = 1,
