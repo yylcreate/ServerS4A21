@@ -13,7 +13,8 @@ namespace DfoServer.Game.Events.GuardianAltar
     // use the caller's inventory/outbox transaction; socket projections and
     // combat state remain with the Guardian coordinator/runtime.
     internal sealed class GuardianAltarProgressService : IGuardianAltarProgressService,
-        IGuardianAltarPurchaseService, IGuardianAltarSlotService, IGuardianAltarAchievementService
+        IGuardianAltarPurchaseService, IGuardianAltarSlotService, IGuardianAltarAchievementService,
+        IGuardianAltarExchangeService, IGuardianAltarExistingMenuService
     {
         private readonly IGameDatabase _database;
         private readonly DailyResetService _dailyReset;
@@ -84,6 +85,27 @@ namespace DfoServer.Game.Events.GuardianAltar
 
         internal string DatabaseConnectionString => _database.ConnectionString;
 
+        public GuardianAltarProgressSnapshot ReadExistingMenu(int characterId, int accountId,
+            Func<bool> isCurrent = null)
+        {
+            if (characterId <= 0 || accountId <= 0)
+                throw new ArgumentOutOfRangeException(nameof(characterId));
+            var definition = _definition.Value;
+            return _database.Read(connection =>
+            {
+                // One deferred read snapshot keeps the header and all vectors
+                // consistent. It never creates progress or changes a daily receipt.
+                using var transaction = connection.BeginTransaction(deferred: true);
+                RequireCurrentGeneration(isCurrent);
+                _repository.RequireCharacterOwnership(connection, transaction, characterId, accountId);
+                var result = _repository.Read(connection, transaction, characterId, definition.RidableId);
+                ValidateComplete(result, definition);
+                RequireCurrentGeneration(isCurrent);
+                transaction.Commit();
+                return result;
+            });
+        }
+
         public GuardianAltarPurchaseResult Buy(int characterId, int accountId,
             GuardianAltarPurchaseRequest request, Func<bool> isCurrent = null)
         {
@@ -149,6 +171,38 @@ namespace DfoServer.Game.Events.GuardianAltar
                 ValidateComplete(after, definition);
                 RequireCurrentGeneration(isCurrent);
                 return new GuardianAltarSlotResult(true, after, plan.Updated, !plan.IsReplay);
+            });
+        }
+
+        public GuardianAltarExchangeResult ExchangeSlots(int characterId, int accountId,
+            GuardianAltarExchangeRequest request, Func<bool> isCurrent = null)
+        {
+            if (characterId <= 0 || accountId <= 0)
+                throw new ArgumentOutOfRangeException(nameof(characterId));
+            var definition = _definition.Value;
+            return _database.Write((connection, transaction) =>
+            {
+                RequireCurrentGeneration(isCurrent);
+                _repository.RequireCharacterOwnership(connection, transaction, characterId, accountId);
+                var before = _repository.Read(connection, transaction, characterId, definition.RidableId);
+                ValidateComplete(before, definition);
+                if (!definition.TryCreateExchangePlan(before, request, out var plan, out var reason))
+                {
+                    RequireCurrentGeneration(isCurrent);
+                    return new GuardianAltarExchangeResult(false, before, null, null, false, reason);
+                }
+                if (!plan.IsReplay)
+                {
+                    // Both existing slot CAS writes share this progress transaction.
+                    // A failed second endpoint or final identity fence rolls back both.
+                    _repository.UpdateSlot(connection, transaction, characterId, definition.RidableId, plan.First);
+                    _repository.UpdateSlot(connection, transaction, characterId, definition.RidableId, plan.Second);
+                }
+                var after = _repository.Read(connection, transaction, characterId, definition.RidableId);
+                ValidateComplete(after, definition);
+                RequireCurrentGeneration(isCurrent);
+                return new GuardianAltarExchangeResult(true, after, plan.First.Updated,
+                    plan.Second.Updated, !plan.IsReplay);
             });
         }
 

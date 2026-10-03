@@ -12,6 +12,15 @@ namespace DfoServer.Network.Handlers.Dungeon
     internal sealed partial class GuardianAltarDungeonCoordinator
     {
         private readonly DungeonPersistentEffectApplicationService _persistentEffects;
+        private Func<EnhancedClientSession, DungeonRunIdentity, Func<bool>, Task> _returnToStageSelection;
+
+        internal void ConfigureStageSelectionReturn(
+            Func<EnhancedClientSession, DungeonRunIdentity, Func<bool>, Task> returnToStageSelection)
+        {
+            if (_returnToStageSelection != null)
+                throw new InvalidOperationException("Guardian stage-selection return has already been configured.");
+            _returnToStageSelection = returnToStageSelection ?? throw new ArgumentNullException(nameof(returnToStageSelection));
+        }
 
         internal async Task TryCompleteAsync(EnhancedClientSession session, DungeonRun run)
         {
@@ -258,10 +267,15 @@ namespace DfoServer.Network.Handlers.Dungeon
                 return new[] { packet };
             }, Current);
             if (body[0] == 1 && prepared && Current())
+            {
                 // sub_E10700 reads the accepted option after the town fade:
                 // option 1 sends START_GAME itself; option 2 enters town.
                 // End only this run and let the existing menu owner respond.
-                await _returnToTown(session, fact.Identity.Run);
+                if (body[1] == 1 && _returnToStageSelection != null)
+                    await _returnToStageSelection(session, fact.Identity.Run, Current);
+                else
+                    await _returnToTown(session, fact.Identity.Run);
+            }
             return true;
         }
     }

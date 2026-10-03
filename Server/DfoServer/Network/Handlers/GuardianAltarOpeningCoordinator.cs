@@ -117,6 +117,9 @@ namespace DfoServer.Network.Handlers
             handlers[(ushort)CmdPacketTypeA21.ADVANCE_ALTAR_SET_SLOT] =
                 (session, header, body) => HandleSetSlotAsync(
                     session, header, body, hasActiveTrade, mercenaryRestrictions);
+            handlers[(ushort)CmdPacketTypeA21.ADVANCE_ALTAR_EXCHANGE_SLOT] =
+                (session, header, body) => HandleExchangeSlotAsync(
+                    session, header, body, hasActiveTrade, mercenaryRestrictions);
             handlers[(ushort)CmdPacketTypeA21.ADVANCE_ALTAR_GET_ACHIEVEMENT_REWARD] =
                 (session, header, body) => HandleAchievementRewardAsync(
                     session, header, body, hasActiveTrade, mercenaryRestrictions);
@@ -127,7 +130,7 @@ namespace DfoServer.Network.Handlers
         {
             if (_progress != null && _definition != null)
                 dungeon.ConfigureGuardianAltarEntry(_service, _progress, _definition,
-                    _transitions, hasTrade, mercenaries);
+                    _transitions, hasTrade, mercenaries, ReturnToStageSelectionAsync);
         }
 
         private async Task HandleStartGameAsync(
@@ -145,9 +148,13 @@ namespace DfoServer.Network.Handlers
             if (userId == 0 || !IsCurrentGeneration(session, characterId, generation))
                 return;
             var validRequest = GuardianAltarStartGameRequestParser.TryParse(body, out _);
+            var runMenuContinuation = validRequest ? CaptureRunMenuContinuation(session) : null;
 
             await _transitions.RunIfCurrentAsync(session, async () =>
             {
+                if (validRequest
+                    && await TryProjectRunMenuContinuationAsync(session, runMenuContinuation))
+                    return;
                 GuardianAltarEntryRejection? preparedReason = null;
                 var preparedMenu = false;
                 MenuProjectionReceipt menuReceipt = null;
@@ -299,6 +306,8 @@ namespace DfoServer.Network.Handlers
                     && session.Player.UserId == userId)
                 {
                     RememberMenuProjection(session, menuReceipt);
+                    if (runMenuContinuation != null)
+                        CompleteRunMenuContinuation(session, runMenuContinuation);
                     FileLogger.Log($"[GuardianAltarEntry] START_GAME menu projected cid={characterId} "
                         + $"ridable={menu.Header.RidableId} stages={menu.Stages.Count} "
                         + $"tickets={menu.Header.FreeTickets}+{menu.Header.SecondaryTickets} combatAdmission=false");
@@ -566,6 +575,7 @@ namespace DfoServer.Network.Handlers
                 {
                     _lastSent.Remove(session.SessionId);
                     _menuProjections.Remove(session.SessionId);
+                    _runMenuContinuations.Remove(session.SessionId);
                 }
             return Task.CompletedTask;
         }
@@ -585,6 +595,7 @@ namespace DfoServer.Network.Handlers
             {
                 _lastSent.Clear();
                 _menuProjections.Clear();
+                _runMenuContinuations.Clear();
             }
         }
 

@@ -54,6 +54,22 @@ namespace DfoServer.Game.Events.GuardianAltar
     internal sealed record GuardianAltarSlotResult(
         bool Accepted, GuardianAltarProgressSnapshot Progress, GuardianAltarSlot Slot,
         bool Changed, string RejectionReason = null);
+
+    internal readonly record struct GuardianAltarExchangeEndpoint(
+        int SlotType, byte SlotIndex, int ResourceId);
+
+    internal readonly record struct GuardianAltarExchangeRequest(
+        int RidableId, GuardianAltarExchangeEndpoint First, GuardianAltarExchangeEndpoint Second);
+
+    internal sealed record GuardianAltarExchangePlan(
+        GuardianAltarSlotPlan First, GuardianAltarSlotPlan Second)
+    {
+        internal bool IsReplay => First.IsReplay && Second.IsReplay;
+    }
+
+    internal sealed record GuardianAltarExchangeResult(
+        bool Accepted, GuardianAltarProgressSnapshot Progress, GuardianAltarSlot First,
+        GuardianAltarSlot Second, bool Changed, string RejectionReason = null);
     internal sealed record GuardianAltarAchievement(int AchievementId, byte Claimed);
 
     internal sealed record GuardianAltarAchievementResult(bool Accepted, bool Changed,
@@ -90,6 +106,14 @@ namespace DfoServer.Game.Events.GuardianAltar
             Func<bool> isCurrent = null);
     }
 
+    // Exit continuation reads existing progress without initialization or the
+    // daily ticket replacement performed by a new, open-window menu request.
+    internal interface IGuardianAltarExistingMenuService
+    {
+        GuardianAltarProgressSnapshot ReadExistingMenu(int characterId, int accountId,
+            Func<bool> isCurrent = null);
+    }
+
     // The same progress owner supplies this capability. Keeping the interface
     // narrow does not make menu-only test/adaptation providers authorize buys.
     internal interface IGuardianAltarPurchaseService
@@ -110,6 +134,12 @@ namespace DfoServer.Game.Events.GuardianAltar
     {
         GuardianAltarAchievementResult ClaimAchievement(int characterId, int accountId,
             int achievementType, Func<bool> isCurrent = null);
+    }
+
+    internal interface IGuardianAltarExchangeService
+    {
+        GuardianAltarExchangeResult ExchangeSlots(int characterId, int accountId,
+            GuardianAltarExchangeRequest request, Func<bool> isCurrent = null);
     }
 
     internal static class GuardianAltarProgressValidator

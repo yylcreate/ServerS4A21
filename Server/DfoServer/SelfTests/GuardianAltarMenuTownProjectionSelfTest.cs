@@ -32,7 +32,7 @@ namespace DfoServer.SelfTests
 {
     // Covers the real Town owner and socket writes. Menu receipt admission,
     // duplicate commands and command registration belong to MenuReturnSelfTest.
-    internal static class GuardianAltarMenuTownProjectionSelfTest
+    internal static partial class GuardianAltarMenuTownProjectionSelfTest
     {
         private static readonly TimeSpan Timeout = TimeSpan.FromSeconds(5);
         private const int HeaderLength = 15;
@@ -62,6 +62,9 @@ namespace DfoServer.SelfTests
             Section("actual menu and direct return controls", () => VerifyDirectMenuControlsAsync(Check));
             Section("rejected actual menu controls source", () => VerifyRejectedMenuControlsAsync(Check));
             Section("actual Guardian run giveup and reopened menu", () => VerifyRunGiveupControlsAsync(Check));
+            Section("existing returned menu read authority", () => VerifyExistingReturnMenuReadAsync(Check));
+            Section("actual closed result selection continuation", () => VerifyActualClosedContinuationAsync(Check));
+            Section("deferred town inputs and retry", () => VerifyDeferredTownInputsAsync(Check));
             Section("normal controls failure and retry", () => VerifyControlsRetryAsync(Check));
             Section("normal controls source and send fences", () => VerifyControlsFencesAsync(Check));
             Console.WriteLine($"GUARDIAN_ALTAR_MENU_TOWN_PROJECTION assertions={assertions} failures={failures}");
@@ -373,6 +376,8 @@ namespace DfoServer.SelfTests
 
         private static async Task VerifyRunGiveupControlsAsync(Action<string, bool> check)
         {
+            foreach (var input in new[] { "area", "position" })
+            {
             using var fixture = new Fixture();
             fixture.ConfigureRealControls();
             fixture.RegisterControlsInventory();
@@ -400,20 +405,44 @@ namespace DfoServer.SelfTests
             var packets = await fixture.DrainAsync();
             var types = packets.Select(Type).ToList();
             var rosterIndex = types.IndexOf((ushort)NotiPacketTypeA21.AREA_USERS);
-            var skillIndex = types.IndexOf((ushort)NotiPacketTypeA21.SKILLINFO);
-            var itemIndex = types.IndexOf((ushort)NotiPacketTypeA21.ITEM_LIST);
-            check("actual run GIVEUP uses the existing ending and Town owners and restores both controls after the roster",
+            var deferredSource = fixture.Session.GuardianAltarControls;
+            check("actual run GIVEUP keeps its restoration source while the client asynchronously leaves the activity: " + input,
                 packets.Count > 0 && Type(packets[0]) == (ushort)CmdPacketTypeA21.GIVEUP_GAME
                 && packets[0].AsSpan(HeaderLength).SequenceEqual(new byte[] { 1 })
-                && rosterIndex >= 0 && skillIndex > rosterIndex && itemIndex > skillIndex
-                && types.Count(x => x == (ushort)NotiPacketTypeA21.SKILLINFO) == 1
-                && types.Count(x => x == (ushort)NotiPacketTypeA21.ITEM_LIST) == 1
-                && fixture.Session.Player.CurrentRun == null && fixture.Session.GuardianAltarControls == null);
+                && rosterIndex >= 0 && !types.Contains((ushort)NotiPacketTypeA21.SKILLINFO)
+                && !types.Contains((ushort)NotiPacketTypeA21.ITEM_LIST)
+                && fixture.Session.Player.CurrentRun == null && deferredSource?.AwaitingTownInput == true
+                && deferredSource.RunGeneration == source.RunGeneration
+                && deferredSource.SelectionGeneration == source.SelectionGeneration
+                && !ReferenceEquals(source, deferredSource));
             check("actual GIVEUP does not advance epochs, spend tickets or fabricate a clear reward",
                 fixture.Session.Player.CurrentDungeonRunGeneration == runGeneration
                 && fixture.Session.Player.CurrentDungeonSelectionGeneration == selectionGeneration
                 && SameGuardianProgress(progress, fixture.ReadGuardianProgress())
                 && fixture.ReadPersistedItemCount() == 7 && !fixture.Session.TryCompleteGuardianControlsRestore(source));
+            await fixture.Town.Handle_ENUM_CMDPACKET_FINISH_LOADING(fixture.Session,
+                new GamePacketHeader { cmd = 1, type = (ushort)CmdPacketTypeA21.FINISH_LOADING },
+                Array.Empty<byte>()).WaitAsync(Timeout);
+            packets = await fixture.DrainAsync();
+            check("an unrelated loading request cannot release a deferred GIVEUP source",
+                !packets.Any(x => Type(x) == (ushort)NotiPacketTypeA21.SKILLINFO
+                    || Type(x) == (ushort)NotiPacketTypeA21.ITEM_LIST)
+                && ReferenceEquals(fixture.Session.GuardianAltarControls, deferredSource));
+            await fixture.TownInputAsync(input);
+            packets = await fixture.DrainAsync();
+            types = packets.Select(Type).ToList();
+            check("the real town " + input + " handler rebinds persisted skills and owned Main after its normal projection",
+                types.Count(x => x == (ushort)NotiPacketTypeA21.SKILLINFO) == 1
+                && types.Count(x => x == (ushort)NotiPacketTypeA21.ITEM_LIST) == 1
+                && types[^2] == (ushort)NotiPacketTypeA21.SKILLINFO
+                && types[^1] == (ushort)NotiPacketTypeA21.ITEM_LIST
+                && fixture.Session.GuardianAltarControls == null
+                && fixture.ReadPersistedItemCount() == 7 && SameGuardianProgress(progress, fixture.ReadGuardianProgress()));
+            await fixture.TownInputAsync(input);
+            packets = await fixture.DrainAsync();
+            check("later town " + input + " requests do not repeat a completed normal-controls projection",
+                !packets.Any(x => Type(x) == (ushort)NotiPacketTypeA21.SKILLINFO
+                    || Type(x) == (ushort)NotiPacketTypeA21.ITEM_LIST));
             await fixture.MenuAsync();
             await fixture.DrainAsync();
             var renewed = fixture.Session.GuardianAltarControls;
@@ -426,6 +455,56 @@ namespace DfoServer.SelfTests
                 consumed && packets.Select(Type).SequenceEqual(MenuControlsTypes())
                 && fixture.Session.GuardianAltarControls == null && SameGuardianProgress(progress, fixture.ReadGuardianProgress())
                 && fixture.ReadPersistedItemCount() == 7);
+            }
+        }
+
+        private static async Task VerifyDeferredTownInputsAsync(Action<string, bool> check)
+        {
+            foreach (var input in new[] { "area", "position" })
+            {
+                using var fixture = new Fixture();
+                fixture.ConfigureRealControls();
+                var source = fixture.MarkControlsSource() with { AwaitingTownInput = true };
+                fixture.Session.GuardianAltarControls = source;
+                var failure = await ObserveAsync(() => fixture.TownInputAsync(input));
+                var partial = await fixture.DrainAsync();
+                check("deferred " + input + " restore without a lease preserves source and reports an incomplete projection",
+                    failure is InvalidOperationException && ReferenceEquals(fixture.Session.GuardianAltarControls, source)
+                    && !partial.Any(x => Type(x) == (ushort)NotiPacketTypeA21.ITEM_LIST));
+                fixture.RegisterControlsInventory();
+                await fixture.TownInputAsync(input);
+                var retried = await fixture.DrainAsync();
+                check("deferred " + input + " retry uses the new owned lease without losing the pending source",
+                    fixture.Session.GuardianAltarControls == null
+                    && retried.Count(x => Type(x) == (ushort)NotiPacketTypeA21.ITEM_LIST) == 1
+                    && fixture.ReadPersistedItemCount() == 7);
+            }
+            foreach (var stale in new[] { "account", "generation", "run", "selection", "directory" })
+            {
+                using var fixture = new Fixture();
+                fixture.ConfigureRealControls();
+                fixture.RegisterControlsInventory();
+                var source = fixture.MarkControlsSource() with { AwaitingTownInput = true };
+                fixture.Session.GuardianAltarControls = source;
+                if (stale == "account") fixture.Session.Account = new AccountRecord { AccountId = source.AccountId };
+                if (stale == "generation") fixture.Session.GameSession = new GameSession(fixture.Session,
+                    fixture.Database, fixture.Records, sessionDirectory: fixture.Sessions);
+                if (stale == "run") fixture.Session.Player.NextDungeonRunGeneration();
+                if (stale == "selection")
+                {
+                    var player = fixture.Session.Player;
+                    player.BeginDungeonSelection(new DungeonTownReturnAnchor(player.CurTownId,
+                        player.CurAreaId, player.CurPosX, player.CurPosY, player.CurDirection, player.CurAreaState));
+                    player.ClearDungeonSelection();
+                }
+                if (stale == "directory") await fixture.Sessions.UnregisterAsync(fixture.Record.CharacterId, fixture.Session);
+                await fixture.TownInputAsync("position");
+                var packets = await fixture.DrainAsync();
+                check("a town input cannot restore stale deferred " + stale + " controls",
+                    ReferenceEquals(fixture.Session.GuardianAltarControls, source)
+                    && !packets.Any(x => Type(x) == (ushort)NotiPacketTypeA21.SKILLINFO
+                        || Type(x) == (ushort)NotiPacketTypeA21.ITEM_LIST));
+            }
         }
 
         private static ushort[] MenuControlsTypes()
@@ -688,7 +767,7 @@ namespace DfoServer.SelfTests
 
         private static ushort Type(byte[] packet) => BitConverter.ToUInt16(packet, 1);
 
-        private sealed class Fixture : IDisposable
+        private sealed partial class Fixture : IDisposable
         {
             private readonly string _directory = Path.Combine(Path.GetTempPath(), "guardian-menu-town-" + Guid.NewGuid().ToString("N"));
             private readonly TcpClient _peer = new();
@@ -696,7 +775,7 @@ namespace DfoServer.SelfTests
             internal readonly DungeonInstanceRegistry Instances = new();
             private readonly GameCommandRegistry _menuRegistry = new();
             private readonly GuardianAltarOpeningService _opening = new();
-            private readonly DateTimeOffset _menuNow = new(2026, 10, 3, 10, 0, 0, TimeSpan.Zero);
+            private DateTimeOffset _menuNow = new(2026, 10, 3, 10, 0, 0, TimeSpan.Zero);
             private GuardianAltarOpeningCoordinator _menuOwner;
             private GuardianAltarDungeonCoordinator _guardianEntry;
             private CharacterTransitionCoordinator _menuTransitions;
@@ -853,6 +932,27 @@ namespace DfoServer.SelfTests
                 => _menuOwner.TryHandleMenuReturnAsync(Session, new GamePacketHeader { cmd = 1,
                     type = (ushort)CmdPacketTypeA21.BACK_2_VILLAGE, length = 14 },
                     Array.Empty<byte>(), Town.ProjectGuardianMenuReturnAsync).WaitAsync(Timeout);
+
+            internal Task TownInputAsync(string input)
+            {
+                var player = Session.Player;
+                if (input == "area")
+                {
+                    var body = new byte[6];
+                    body[0] = player.CurTownId;
+                    body[1] = player.CurAreaId;
+                    BinaryPrimitives.WriteInt16LittleEndian(body.AsSpan(2), player.CurPosX);
+                    BinaryPrimitives.WriteInt16LittleEndian(body.AsSpan(4), player.CurPosY);
+                    return Town.Handle_ENUM_CMDPACKET_SET_USER_AREA(Session, new GamePacketHeader {
+                        cmd = 1, type = (ushort)CmdPacketTypeA21.SET_USER_AREA }, body).WaitAsync(Timeout);
+                }
+                var position = new byte[7];
+                BinaryPrimitives.WriteInt16LittleEndian(position, player.CurPosX);
+                BinaryPrimitives.WriteInt16LittleEndian(position.AsSpan(2), player.CurPosY);
+                position[4] = player.CurDirection;
+                return Town.Handle_ENUM_CMDPACKET_SET_USER_POSITION(Session, new GamePacketHeader {
+                    cmd = 1, type = (ushort)CmdPacketTypeA21.SET_USER_POSITION }, position).WaitAsync(Timeout);
+            }
 
             internal GuardianAltarProgressSnapshot ReadGuardianProgress()
                 => GuardianProgress.LoadMenu(Record.CharacterId, _menuNow.UtcDateTime);

@@ -21,7 +21,7 @@ using PvfLib;
 
 namespace DfoServer.SelfTests
 {
-    internal static class GuardianAltarSlotSelfTest
+    internal static partial class GuardianAltarSlotSelfTest
     {
         private static readonly DateTime Anchor = new(2026, 10, 3, 10, 0, 0, DateTimeKind.Utc);
         private const int LearnedUnit = 100002;
@@ -51,6 +51,10 @@ namespace DfoServer.SelfTests
                 VerifyCorruptedSlots(database, service, Check);
                 VerifyRequests(database, service, path, definition, Check).GetAwaiter().GetResult();
                 VerifyRealStartPlan(database, Check);
+                VerifyExchangeWire(Check);
+                VerifyExchangeDomain(database, service, definition, path, Check);
+                VerifyExchangeRequests(database, service, Check).GetAwaiter().GetResult();
+                VerifyRealExchangePlan(database, Check);
             }
             catch (Exception ex)
             {
@@ -346,9 +350,9 @@ namespace DfoServer.SelfTests
             using var fixture = new SlotRequestFixture(progress);
             var request = new GuardianAltarSlotRequest(1, true, 2, 2, ActiveSkill);
             var before = progress.LoadMenu(3, Anchor);
-            check("production entry registration handles SET_SLOT and does not enable unproven EXCHANGE_SLOT",
+            check("production entry registration owns both SET_SLOT and EXCHANGE_SLOT",
                 fixture.Registry.TryGetValue((ushort)CmdPacketTypeA21.ADVANCE_ALTAR_SET_SLOT, out _)
-                && !fixture.Registry.TryGetValue((ushort)CmdPacketTypeA21.ADVANCE_ALTAR_EXCHANGE_SLOT, out _));
+                && fixture.Registry.TryGetValue((ushort)CmdPacketTypeA21.ADVANCE_ALTAR_EXCHANGE_SLOT, out _));
             await fixture.Dispatch(request);
             check("closed configuration returns rejection without entering its transaction",
                 IsFailure(fixture.Packets.Single()) && Same(before, progress.LoadMenu(3, Anchor)) && fixture.Probe.Calls == 0);
@@ -443,7 +447,8 @@ namespace DfoServer.SelfTests
                 IsSuccess(fixture.Packets.Single(), request, Slot(progress.LoadMenu(3, Anchor), 2, 2)));
         }
 
-        private sealed class SlotProgressProbe : IGuardianAltarProgressService, IGuardianAltarSlotService
+        private sealed class SlotProgressProbe : IGuardianAltarProgressService, IGuardianAltarSlotService,
+            IGuardianAltarExchangeService
         {
             private readonly GuardianAltarProgressService _inner;
             internal int Calls;
@@ -457,6 +462,17 @@ namespace DfoServer.SelfTests
                 Calls++;
                 var fenceCalls = 0;
                 return _inner.SetSlot(characterId, accountId, request, () =>
+                {
+                    DuringFence?.Invoke(++fenceCalls);
+                    return isCurrent == null || isCurrent();
+                });
+            }
+            public GuardianAltarExchangeResult ExchangeSlots(int characterId, int accountId,
+                GuardianAltarExchangeRequest request, Func<bool> isCurrent = null)
+            {
+                Calls++;
+                var fenceCalls = 0;
+                return _inner.ExchangeSlots(characterId, accountId, request, () =>
                 {
                     DuringFence?.Invoke(++fenceCalls);
                     return isCurrent == null || isCurrent();
@@ -488,6 +504,7 @@ namespace DfoServer.SelfTests
             internal bool Trading;
             internal bool FailNextWrite;
             internal Action BeforePrepare;
+            internal Action AfterWrite;
             internal SlotRequestFixture(GuardianAltarProgressService progress)
             {
                 Probe = new SlotProgressProbe(progress);
@@ -521,6 +538,15 @@ namespace DfoServer.SelfTests
                     type = (ushort)CmdPacketTypeA21.ADVANCE_ALTAR_SET_SLOT,
                     length = checked((uint)(14 + body.Length)) }, body);
             }
+            internal Task DispatchExchange(GuardianAltarExchangeRequest request, byte[] body = null)
+            {
+                if (!Registry.TryGetValue((ushort)CmdPacketTypeA21.ADVANCE_ALTAR_EXCHANGE_SLOT, out var handler))
+                    throw new InvalidOperationException("Guardian EXCHANGE_SLOT handler was not registered.");
+                body ??= ExchangeBody(request);
+                return handler(Session, new GamePacketHeader { cmd = 1,
+                    type = (ushort)CmdPacketTypeA21.ADVANCE_ALTAR_EXCHANGE_SLOT,
+                    length = checked((uint)(14 + body.Length)) }, body);
+            }
             private Task Send(EnhancedClientSession session, Func<IReadOnlyList<byte[]>> prepare)
             {
                 var callback = BeforePrepare;
@@ -533,6 +559,9 @@ namespace DfoServer.SelfTests
                     throw new IOException("Guardian slot ACK transport selftest failure");
                 }
                 Packets.AddRange(packets.Select(x => x.ToArray()));
+                var after = AfterWrite;
+                AfterWrite = null;
+                after?.Invoke();
                 return Task.CompletedTask;
             }
             public void Dispose()

@@ -48,6 +48,8 @@ namespace DfoServer.SelfTests
                 Section("menu receipt source epochs", () => VerifySourcesAsync(definition, Check));
                 Section("queued and final-send source fences", () => VerifyQueuedAsync(definition, Check));
                 Section("new menu replaces the previous receipt", () => VerifyRenewalAsync(definition, Check));
+                Section("closed stage-selection continuation", () => VerifyClosedContinuationAsync(definition, Check));
+                Section("closed continuation source and write fences", () => VerifyClosedContinuationFencesAsync(definition, Check));
             }
             catch (Exception exception) { Check("current PVF menu definition: " + exception, false); }
             Console.WriteLine($"GUARDIAN_ALTAR_MENU_RETURN assertions={assertions} failures={failures}");
@@ -387,15 +389,201 @@ namespace DfoServer.SelfTests
                 !await fixture.ReturnAsync() && fixture.Packets.Count == count);
         }
 
-        private sealed class ProgressStub : IGuardianAltarProgressService
+        private static async Task VerifyClosedContinuationAsync(GuardianAltarMenuDefinition definition, Action<string, bool> check)
+        {
+            using (var fixture = new Fixture(definition))
+            {
+                await fixture.MenuAsync();
+                check("ordinary Closed START_GAME has no existing-menu read or fabricated continuation",
+                    fixture.Progress.Reads == 0 && fixture.Progress.ExistingReads == 0
+                    && fixture.Packets.Single().AsSpan(15).SequenceEqual(Convert.FromHexString("0101000000"))
+                    && fixture.Session.GuardianAltarControls == null && !await fixture.ReturnAsync());
+            }
+            foreach (var window in new[] { "open", "closes during prepare", "reopened next day" })
+            {
+                using var fixture = new Fixture(definition);
+                fixture.Open();
+                var run = fixture.BeginRealGuardianRun();
+                await fixture.CompleteStageSelectionReturnAsync(run);
+                if (window == "closes during prepare") fixture.BeforePrepare = () => fixture.Service.Close();
+                if (window == "reopened next day")
+                {
+                    fixture.Service.Close();
+                    fixture.AdvanceDay();
+                    fixture.Open();
+                }
+                await fixture.MenuAsync();
+                check("a true result continuation uses only existing state regardless of admission window: " + window,
+                    fixture.Progress.ExistingReads == 1 && fixture.Progress.Reads == 0
+                    && fixture.Packets.Count == 1 && IsMenu(fixture.Packets[0]) && HasCurrentControlsSource(fixture.Session)
+                    && await fixture.ReturnAsync());
+            }
+            using (var fixture = new Fixture(definition))
+            {
+                fixture.Open();
+                await fixture.MenuAsync();
+                var reads = fixture.Progress.Reads;
+                var run = fixture.BeginRealGuardianRun();
+                await fixture.CompleteStageSelectionReturnAsync(run);
+                fixture.Service.Close();
+                fixture.AdvanceDay();
+                var before = fixture.Packets.Count;
+                await fixture.MenuAsync();
+                check("an expected-run returned-Town continuation can answer pending Closed START_GAME with one complete existing menu",
+                    fixture.ExpectedReturnCalls == 1 && fixture.Session.Player.CurrentRun == null
+                    && fixture.Packets.Count == before + 1 && IsMenu(fixture.Packets[^1])
+                    && fixture.Progress.Reads == reads && fixture.Progress.ExistingReads == 1
+                    && fixture.Progress.ExistingAccountId == fixture.Session.Account.AccountId
+                    && fixture.Packets[^1].AsSpan(15).SequenceEqual(GuardianAltarMenuBodyBuilder.Build(
+                        fixture.Progress.ExistingSnapshot)) && HasCurrentControlsSource(fixture.Session));
+                check("Closed continuation across a day boundary does not call the initializing or refill menu authority",
+                    fixture.Progress.Reads == reads && fixture.Progress.ExistingSnapshot.Header.FreeTickets == definition.DailyRefillTicket
+                    && fixture.Session.Player.CurrentDungeonRunGeneration == run.RunGeneration
+                    && fixture.Session.Player.CurrentDungeonSelectionGeneration == 0);
+                check("a fully sent Closed continuation establishes the actual menu receipt so user BACK can exit normally",
+                    await fixture.ReturnAsync() && fixture.ProjectionCalls == 1);
+                before = fixture.Packets.Count;
+                await fixture.MenuAsync();
+                check("successful continuation is consumed once and a later Closed START_GAME remains refused",
+                    fixture.Packets.Count == before + 1
+                    && fixture.Packets[^1].AsSpan(15).SequenceEqual(Convert.FromHexString("0101000000"))
+                    && fixture.Progress.ExistingReads == 1 && fixture.Progress.Reads == reads);
+            }
+            foreach (var failure in new[] { "failed write", "uncertain complete write", "read failure" })
+            {
+                using var fixture = new Fixture(definition);
+                var run = fixture.BeginRealGuardianRun();
+                await fixture.CompleteStageSelectionReturnAsync(run);
+                fixture.FailNextWrite = failure == "failed write";
+                fixture.FailAfterWrite = failure == "uncertain complete write";
+                if (failure == "read failure") fixture.Progress.ExistingError = new InvalidDataException("injected existing menu unavailable");
+                var before = fixture.Packets.Count;
+                await fixture.MenuAsync();
+                check("Closed continuation " + failure + " cannot publish a completed menu exit receipt",
+                    !await fixture.ReturnAsync() && fixture.ProjectionCalls == 0 && fixture.Progress.Reads == 0
+                    && fixture.Session.Player.CurrentRun == null
+                    && fixture.Packets.Count == before + (failure == "uncertain complete write" ? 1 : 0));
+                fixture.Progress.ExistingError = null;
+                await fixture.MenuAsync();
+                check("Closed continuation " + failure + " keeps only its original one-shot source for intact retry",
+                    IsMenu(fixture.Packets[^1]) && fixture.Progress.ExistingReads == 2 && fixture.Progress.Reads == 0
+                    && await fixture.ReturnAsync() && fixture.ProjectionCalls == 1);
+            }
+            foreach (var incomplete in new[] { "source rejected", "return false", "run still attached" })
+            {
+                using var fixture = new Fixture(definition);
+                var run = fixture.BeginRealGuardianRun();
+                fixture.ReturnSucceeds = incomplete != "return false";
+                fixture.ReturnLeavesRun = incomplete == "run still attached";
+                await fixture.CompleteStageSelectionReturnAsync(run, sourceAllowed: incomplete != "source rejected");
+                var before = fixture.Packets.Count;
+                await fixture.MenuAsync();
+                check("an incomplete expected-run return cannot authorize Closed existing-menu continuation: " + incomplete,
+                    fixture.Packets.Count == before + 1
+                    && fixture.Packets[^1].AsSpan(15).SequenceEqual(Convert.FromHexString("0101000000"))
+                    && fixture.Progress.Reads == 0 && fixture.Progress.ExistingReads == 0);
+            }
+        }
+
+        private static async Task VerifyClosedContinuationFencesAsync(GuardianAltarMenuDefinition definition, Action<string, bool> check)
+        {
+            foreach (var change in new[] { "GameSession", "account object", "UID", "run epoch", "selection epoch", "Town", "movement" })
+            {
+                using var fixture = new Fixture(definition);
+                var run = fixture.BeginRealGuardianRun();
+                await fixture.CompleteStageSelectionReturnAsync(run);
+                ChangeContinuationScope(fixture, change);
+                await fixture.MenuAsync();
+                check("returned-Town continuation rejects stale " + change + " before reading existing state",
+                    fixture.Progress.ExistingReads == 0 && fixture.Progress.Reads == 0
+                    && fixture.Packets.Count == 1
+                    && fixture.Packets[0].AsSpan(15).SequenceEqual(Convert.FromHexString("0101000000")));
+            }
+            foreach (var change in new[] { "GameSession", "account object", "run epoch", "movement" })
+            {
+                using var fixture = new Fixture(definition);
+                var run = fixture.BeginRealGuardianRun();
+                fixture.AfterExpectedReturn = () => ChangeContinuationScope(fixture, change);
+                await fixture.CompleteStageSelectionReturnAsync(run);
+                await fixture.MenuAsync();
+                check("a return displaced before receipt promotion cannot authorize Closed menu: " + change,
+                    fixture.Progress.ExistingReads == 0 && fixture.Progress.Reads == 0
+                    && fixture.Packets.Single().AsSpan(15).SequenceEqual(Convert.FromHexString("0101000000")));
+            }
+            using (var fixture = new Fixture(definition))
+            {
+                var run = fixture.BeginRealGuardianRun();
+                await fixture.CompleteStageSelectionReturnAsync(run);
+                using (var cancellation = new CancellationTokenSource(Timeout))
+                using (await fixture.Transitions.AcquireAsync(fixture.Session.Player.CharacterId, cancellation.Token))
+                {
+                    var pending = fixture.MenuAsync();
+                    check("a captured Closed continuation waits for the existing character transition", !pending.IsCompleted);
+                    fixture.Session.Player.NextDungeonRunGeneration();
+                    cancellation.CancelAfter(Timeout);
+                    // Dispose the transition lease before awaiting the queued handler.
+                    fixture.QueuedMenu = pending;
+                }
+                await fixture.QueuedMenu;
+                check("queued source replacement suppresses the old Closed response without reading or starting a new menu",
+                    fixture.Packets.Count == 0 && fixture.Progress.ExistingReads == 0 && fixture.Progress.Reads == 0);
+            }
+            foreach (var change in new[] { "account object", "run epoch", "movement" })
+            {
+                using var fixture = new Fixture(definition);
+                var run = fixture.BeginRealGuardianRun();
+                await fixture.CompleteStageSelectionReturnAsync(run);
+                fixture.BeforePrepare = () => ChangeContinuationScope(fixture, change);
+                await fixture.MenuAsync();
+                check("Closed continuation final send prepare suppresses stale " + change + " without publishing controls or receipt",
+                    fixture.Progress.ExistingReads == 1 && fixture.Progress.Reads == 0 && fixture.Packets.Count == 0
+                    && fixture.Session.GuardianAltarControls == null && !await fixture.ReturnAsync());
+            }
+        }
+
+        private static void ChangeContinuationScope(Fixture fixture, string change)
+        {
+            var player = fixture.Session.Player;
+            switch (change)
+            {
+                case "GameSession": fixture.Session.GameSession = GameSessionIdentity(); break;
+                case "account object": fixture.Session.Account = new AccountRecord { AccountId = 11 }; break;
+                case "UID": player.UserId++; break;
+                case "run epoch": player.NextDungeonRunGeneration(); break;
+                case "selection epoch":
+                    var selection = player.BeginDungeonSelection(Anchor(fixture.Session));
+                    player.TryInvalidateDungeonSelection(selection); break;
+                case "Town": player.CurTownId++; break;
+                case "movement": player.NextTownMovementSequence(); break;
+                default: throw new InvalidOperationException("Unknown continuation source mutation.");
+            }
+        }
+
+        private sealed class ProgressStub : IGuardianAltarProgressService, IGuardianAltarExistingMenuService
         {
             private readonly GuardianAltarMenuDefinition _definition;
             internal int Reads;
+            internal int ExistingReads;
+            internal int ExistingAccountId;
+            internal Exception ExistingError;
+            internal GuardianAltarProgressSnapshot ExistingSnapshot;
             internal ProgressStub(GuardianAltarMenuDefinition definition) => _definition = definition;
             public GuardianAltarProgressSnapshot LoadMenu(int characterId, DateTime utcNow, Func<bool> isCurrent = null)
             {
                 if (isCurrent != null && !isCurrent()) throw new InvalidOperationException("old menu fixture source");
                 Reads++;
+                return Snapshot(characterId);
+            }
+            public GuardianAltarProgressSnapshot ReadExistingMenu(int characterId, int accountId, Func<bool> isCurrent = null)
+            {
+                if (isCurrent != null && !isCurrent()) throw new InvalidOperationException("old returned menu fixture source");
+                ExistingReads++;
+                ExistingAccountId = accountId;
+                if (ExistingError != null) throw ExistingError;
+                return ExistingSnapshot = Snapshot(characterId);
+            }
+            private GuardianAltarProgressSnapshot Snapshot(int characterId)
+            {
                 return new GuardianAltarProgressSnapshot(characterId,
                     new GuardianAltarHeader(_definition.RidableId, _definition.DailyRefillTicket, 0, 0, 0, 0, 0, 0, 0, 0),
                     new[] { new GuardianAltarStage(_definition.FirstDungeonId, -1) },
@@ -426,6 +614,12 @@ namespace DfoServer.SelfTests
             internal bool FailNextWrite;
             internal bool FailAfterWrite;
             internal Action AfterWrite;
+            internal Action BeforePrepare;
+            internal Action AfterExpectedReturn;
+            internal bool ReturnSucceeds = true;
+            internal bool ReturnLeavesRun;
+            internal int ExpectedReturnCalls;
+            internal Task QueuedMenu;
             internal Action DuringProjection;
             internal TaskCompletionSource<bool> ProjectionEntered;
             internal TaskCompletionSource<bool> ProjectionRelease;
@@ -437,10 +631,12 @@ namespace DfoServer.SelfTests
             internal bool ProjectionOutsideSendLock = true;
             internal Func<bool> LastProjectionFence;
             internal EnhancedClientSession.GuardianAltarControlProjectionSource SourceAtLastWrite;
-            private readonly DateTimeOffset _now = new(2026, 10, 3, 10, 0, 0, TimeSpan.Zero);
+            private DateTimeOffset _now = new(2026, 10, 3, 10, 0, 0, TimeSpan.Zero);
+            private readonly GuardianAltarMenuDefinition _definition;
 
             internal Fixture(GuardianAltarMenuDefinition definition)
             {
+                _definition = definition;
                 Progress = new ProgressStub(definition);
                 Transitions = new CharacterTransitionCoordinator(Sessions);
                 Coordinator = new GuardianAltarOpeningCoordinator(Service, Sessions, Transitions,
@@ -450,6 +646,40 @@ namespace DfoServer.SelfTests
                 Session = CreateSession(71000101);
             }
             internal void Open() => Service.SetWindow(_now, _now.AddMinutes(5));
+            internal void AdvanceDay() => _now = _now.AddDays(1);
+            internal DungeonRun BeginRealGuardianRun()
+            {
+                var instance = new DungeonInstance((short)_definition.FirstDungeonId, 0,
+                    DungeonRewardPolicy.GuardianAltar, DungeonDropDefinition.CreateGuardianAltar(_definition.FirstDungeonId));
+                if (!DungeonRunLifecycle.BeginRunFromAuthorizedTown(Session, instance, Anchor(Session),
+                        Session.Player.CurrentDungeonRunGeneration, () => true, out var run))
+                    throw new InvalidOperationException("The existing lifecycle could not create the continuation test run.");
+                Session.Player.UserState = 1;
+                return run;
+            }
+            internal Task CompleteStageSelectionReturnAsync(DungeonRun run, bool sourceAllowed = true)
+            {
+                var identity = run.CaptureIdentity();
+                return Coordinator.ReturnToStageSelectionAsync(Session, identity,
+                    () => sourceAllowed && Session.Player.IsCurrentDungeonRun(identity), () =>
+                    {
+                        ExpectedReturnCalls++;
+                        if (!ReturnSucceeds) return Task.FromResult(false);
+                        // A bounded injected expected-run return contract. No
+                        // real Town/DB/packet side effects are claimed here;
+                        // actual ending is covered by the separate socket test.
+                        lock (Session.Player.DungeonRunLifecycleSyncRoot)
+                        {
+                            if (!Session.Player.IsCurrentDungeonRun(identity)) return Task.FromResult(false);
+                            if (ReturnLeavesRun) return Task.FromResult(true);
+                            run.TryBeginEnding();
+                            Session.Player.CurrentRun = null;
+                            Session.Player.UserState = 0;
+                        }
+                        var after = AfterExpectedReturn; AfterExpectedReturn = null; after?.Invoke();
+                        return Task.FromResult(true);
+                    }).WaitAsync(Timeout);
+            }
             internal EnhancedClientSession CreateSession(int characterId)
             {
                 var session = new EnhancedClientSession(new TcpClient(), new GamePacketHeader());
@@ -480,7 +710,11 @@ namespace DfoServer.SelfTests
                     type = type ?? (ushort)CmdPacketTypeA21.BACK_2_VILLAGE,
                     length = checked((uint)(14 + (body?.Length ?? 0))) }, body ?? Array.Empty<byte>(), ProjectTownAsync).WaitAsync(Timeout);
             private Task SendBatchAsync(EnhancedClientSession session, Func<IReadOnlyList<byte[]>> prepare)
-                => EnhancedClientSession.SendPreparedPacketBatchCoreAsync(SendGate, prepare, packet =>
+                => EnhancedClientSession.SendPreparedPacketBatchCoreAsync(SendGate, () =>
+                {
+                    var before = BeforePrepare; BeforePrepare = null; before?.Invoke();
+                    return prepare();
+                }, packet =>
                 {
                     SourceAtLastWrite = session.GuardianAltarControls;
                     if (FailNextWrite)

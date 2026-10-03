@@ -219,6 +219,7 @@ namespace DfoServer.Network.Handlers
         public async Task Handle_ENUM_CMDPACKET_SET_USER_POSITION(EnhancedClientSession session, GamePacketHeader header, byte[] body)
         {
             if (body == null || body.Length < 7) return;
+            var controlsSource = session.GuardianAltarControls;
             var movementSequence = session.Player.NextTownMovementSequence();
             var gotoPosX = BitConverter.ToInt16(body, 0);
             var gotoPosY = BitConverter.ToInt16(body, 2);
@@ -257,6 +258,10 @@ namespace DfoServer.Network.Handlers
                     positionPacket,
                     session.ListenerPort);
             }
+            if (controlsSource?.AwaitingTownInput == true && header.cmd == 1
+                && header.type == (ushort)CmdPacketTypeA21.SET_USER_POSITION)
+                await TryRestoreGuardianControlsAsync(session, default(TownProjectionGuard),
+                    observedTownInput: true, expectedSource: controlsSource);
         }
 
         public async Task Handle_ENUM_CMDPACKET_GET_PCROOM_TIME_POINT_ITEM(
@@ -291,14 +296,17 @@ namespace DfoServer.Network.Handlers
             => SetUserAreaCoreAsync(
                 session,
                 body,
-                default(TownProjectionGuard));
+                default(TownProjectionGuard), observedTownInput: header.cmd == 1
+                    && header.type == (ushort)CmdPacketTypeA21.SET_USER_AREA);
 
         private async Task SetUserAreaCoreAsync(
             EnhancedClientSession session,
             byte[] body,
-            TownProjectionGuard projectionGuard)
+            TownProjectionGuard projectionGuard,
+            bool observedTownInput = false)
         {
             if (body == null || body.Length < 6) return;
+            var controlsSource = session?.GuardianAltarControls;
             if (!CanContinueTownProjection(session, projectionGuard))
                 return;
             var gotoTownId = body[0];
@@ -398,17 +406,19 @@ namespace DfoServer.Network.Handlers
                 return;
 
             PersistPosition(session, forceImmediate: true, source: "set_user_area");
-            // AREA_USERS has already switched the client from the activity to
-            // Town. Rebinding normal controls before this point is ignored by
-            // the client's active Guardian override.
-            await TryRestoreGuardianControlsAsync(session, projectionGuard);
+            // GIVEUP's client fade can outlive AREA_USERS. Keep that source
+            // until a real town input arrives, rather than consuming it here.
+            await TryRestoreGuardianControlsAsync(session, projectionGuard,
+                observedTownInput, controlsSource);
         }
 
         private async Task TryRestoreGuardianControlsAsync(
-            EnhancedClientSession session, TownProjectionGuard guard)
+            EnhancedClientSession session, TownProjectionGuard guard,
+            bool observedTownInput = false,
+            EnhancedClientSession.GuardianAltarControlProjectionSource expectedSource = null)
         {
-            var source = session.GuardianAltarControls;
-            if (source == null)
+            var source = observedTownInput ? expectedSource : session.GuardianAltarControls;
+            if (source == null || (source.AwaitingTownInput && !observedTownInput))
                 return;
             bool Current() => CanContinueTownProjection(session, guard)
                 && ReferenceEquals(session.GuardianAltarControls, source)
@@ -1389,6 +1399,18 @@ namespace DfoServer.Network.Handlers
             bool sendCommandResponse,
             Func<Task> afterRunEnded = null)
         {
+            var controlsSource = session?.GuardianAltarControls;
+            var deferGuardianControls = header.type == (ushort)CmdPacketTypeA21.GIVEUP_GAME
+                && session?.Player?.CurrentRun?.Instance.Mechanisms.GuardianAltar != null
+                && session.Player.IsCurrentDungeonRun(runIdentity)
+                && controlsSource != null
+                && ReferenceEquals(session.GameSession, controlsSource.Generation)
+                && ReferenceEquals(session.Account, controlsSource.Account)
+                && session.Account?.AccountId == controlsSource.AccountId
+                && session.Player.CharacterId == controlsSource.CharacterId
+                && session.Player.UserId == controlsSource.UserId
+                && controlsSource.RunGeneration == runIdentity.RunGeneration
+                && controlsSource.SelectionGeneration == session.Player.CurrentDungeonSelectionGeneration;
             if (!await Dungeon.DungeonRunLifecycle.EndRunAsync(
                     session,
                     DfoServer.Game.Dungeon.DungeonRunEndReason.ReturnToTown,
@@ -1404,6 +1426,9 @@ namespace DfoServer.Network.Handlers
                 {
                     return false;
                 }
+                if (deferGuardianControls && session.TryDeferGuardianControlsRestore(controlsSource))
+                    FileLogger.Log($"[GuardianAltarEntry] direct GIVEUP defers controls until town input "
+                        + $"cid={controlsSource.CharacterId} runGeneration={controlsSource.RunGeneration}");
                 Dungeon.DungeonRunLifecycle.ApplyTownReturnAnchor(
                     session.Player,
                     returnAnchor,

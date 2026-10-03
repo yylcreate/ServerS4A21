@@ -200,6 +200,55 @@ namespace DfoServer.Game.Events.GuardianAltar
             return true;
         }
 
+        internal bool TryCreateExchangePlan(GuardianAltarProgressSnapshot progress,
+            GuardianAltarExchangeRequest request, out GuardianAltarExchangePlan plan, out string rejectionReason)
+        {
+            plan = null;
+            rejectionReason = null;
+            ValidateProgress(progress);
+            var first = request.First;
+            var second = request.Second;
+            if (request.RidableId != RidableId || first.SlotType < 1 || first.SlotType > 2
+                || first.SlotType != second.SlotType || first.SlotIndex > 5 || second.SlotIndex > 5
+                || first.SlotIndex == second.SlotIndex || first.ResourceId < 0 || second.ResourceId < 0
+                || first.ResourceId == second.ResourceId)
+            {
+                rejectionReason = "invalid exchange endpoints";
+                return false;
+            }
+            var firstSlot = progress.Slots.Single(x => x.SlotType == first.SlotType && x.SlotIndex == first.SlotIndex);
+            var secondSlot = progress.Slots.Single(x => x.SlotType == second.SlotType && x.SlotIndex == second.SlotIndex);
+            bool ResourceAllowed(int resource)
+            {
+                if (resource == 0) return true;
+                var learned = progress.Purchases.SingleOrDefault(x => x.ShopType == first.SlotType - 1
+                    && x.ResourceId == resource);
+                var shop = _shopEntries.SingleOrDefault(x => x.ShopType == first.SlotType - 1
+                    && x.ResourceId == resource);
+                return learned?.Level > 0 && shop?.IsSettableSlot == true
+                    && shop.Levels.Count(x => x.Level == learned.Level && x.Price == learned.Price) == 1;
+            }
+            if (firstSlot.Locked != 0 || secondSlot.Locked != 0
+                || !ResourceAllowed(first.ResourceId) || !ResourceAllowed(second.ResourceId))
+            {
+                rejectionReason = "exchange slot is locked or resource cannot be deployed";
+                return false;
+            }
+            var beforeMatches = firstSlot.ResourceId == first.ResourceId && secondSlot.ResourceId == second.ResourceId;
+            var afterMatches = firstSlot.ResourceId == second.ResourceId && secondSlot.ResourceId == first.ResourceId;
+            if (!beforeMatches && !afterMatches)
+            {
+                rejectionReason = "exchange resources no longer match either authoritative endpoint state";
+                return false;
+            }
+            // The request has no operation nonce. An exact post-state is a retry,
+            // never a reason to reverse a previously committed exchange.
+            plan = new GuardianAltarExchangePlan(
+                new GuardianAltarSlotPlan(firstSlot, firstSlot with { ResourceId = second.ResourceId }),
+                new GuardianAltarSlotPlan(secondSlot, secondSlot with { ResourceId = first.ResourceId }));
+            return true;
+        }
+
         internal GuardianAltarDungeonStartPlan CreateStartPlan(int dungeonId, byte difficulty,
             GuardianAltarProgressSnapshot progress)
         {

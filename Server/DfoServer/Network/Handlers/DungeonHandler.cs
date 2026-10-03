@@ -150,7 +150,8 @@ namespace DfoServer.Network.Handlers
             Func<Game.Events.GuardianAltar.GuardianAltarMenuDefinition> definition,
             CharacterTransitionCoordinator transitions,
             Func<EnhancedClientSession, bool> hasTrade,
-            IMercenaryRestrictionService mercenaries)
+            IMercenaryRestrictionService mercenaries,
+            Func<EnhancedClientSession, DungeonRunIdentity, Func<bool>, Func<Task<bool>>, Task> returnToStageSelection = null)
         {
             if (_guardianAltar != null)
                 throw new InvalidOperationException("Guardian dungeon entry has already been configured.");
@@ -168,6 +169,10 @@ namespace DfoServer.Network.Handlers
                     if (session.Player.IsCurrentDungeonRun(identity))
                         await Game.Friends.UnitedFriendSystem.NotifyUserStateChanged(session, _services.Sessions);
                 }, persistentEffects: _services.PersistentEffects);
+            if (returnToStageSelection != null)
+                _guardianAltar.ConfigureStageSelectionReturn((session, identity, current) =>
+                    returnToStageSelection(session, identity, current,
+                        () => _services.TownReturn.ReturnAsync(session, identity)));
             _combat.ConfigureGuardianAltar(_guardianAltar.TryCompleteAsync,
                 _guardianAltar.TryHandleCenterDeathAsync);
             _settlement.ConfigureGuardianAltarEplp(_guardianAltar.TryHandleEplpCommandAsync);

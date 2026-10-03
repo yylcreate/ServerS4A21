@@ -82,7 +82,7 @@ namespace DfoServer.SelfTests
             {
                 fixture.Open();
                 check("real registry adds the achievement command to the same menu owner",
-                    fixture.Registry.Count == 4 && fixture.Registry.TryGetValue(
+                    fixture.Registry.Count == 5 && fixture.Registry.TryGetValue(
                         (ushort)CmdPacketTypeA21.ADVANCE_ALTAR_GET_ACHIEVEMENT_REWARD, out _));
                 await fixture.DispatchAsync();
                 check("a menu-only provider cannot claim rewards or trigger mailbox alarm",
