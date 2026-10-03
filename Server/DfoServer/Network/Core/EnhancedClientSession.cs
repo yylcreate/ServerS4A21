@@ -98,19 +98,21 @@ namespace DfoServer.Network
             }
         }
 
-        internal Task SendPreparedPacketBatchAsync(Func<IReadOnlyList<byte[]>> prepare)
+        internal Task SendPreparedPacketBatchAsync(Func<IReadOnlyList<byte[]>> prepare,
+            Func<bool> canWritePacket = null)
         {
             return SendPreparedPacketBatchCoreAsync(_sendLock, prepare, packet =>
             {
                 PacketFileLogger.Log("SEND", packet);
                 return Stream.WriteAsync(packet, 0, packet.Length);
-            });
+            }, canWritePacket);
         }
 
         internal static async Task SendPreparedPacketBatchCoreAsync(
             SemaphoreSlim sendLock,
             Func<IReadOnlyList<byte[]>> prepare,
-            Func<byte[], Task> writePacket)
+            Func<byte[], Task> writePacket,
+            Func<bool> canWritePacket = null)
         {
             ArgumentNullException.ThrowIfNull(sendLock);
             ArgumentNullException.ThrowIfNull(prepare);
@@ -121,7 +123,11 @@ namespace DfoServer.Network
                 var packets = prepare()
                     ?? throw new InvalidOperationException("Packet batch preparation returned null");
                 foreach (var packet in packets)
+                {
+                    if (canWritePacket != null && !canWritePacket())
+                        throw new OperationCanceledException("Prepared packet batch source expired before write.");
                     await writePacket(packet);
+                }
             }
             finally
             {
