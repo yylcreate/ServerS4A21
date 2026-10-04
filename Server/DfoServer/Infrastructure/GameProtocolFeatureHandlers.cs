@@ -32,7 +32,8 @@ namespace DfoServer.Infrastructure
             EventTotalAttendanceHandler eventTotalAttendance,
             NpcFavorHandler npcFavor,
             EventFatigueAccelerationHandler eventFatigueAcceleration,
-            GuardianAltarOpeningCoordinator guardianAltarOpening = null)
+            GuardianAltarOpeningCoordinator guardianAltarOpening = null,
+            EventDungeonOpeningCoordinator eventDungeons = null)
         {
             LotteryItem = lotteryItem
                 ?? throw new ArgumentNullException(nameof(lotteryItem));
@@ -76,6 +77,7 @@ namespace DfoServer.Infrastructure
             EventFatigueAcceleration = eventFatigueAcceleration
                 ?? throw new ArgumentNullException(nameof(eventFatigueAcceleration));
             GuardianAltarOpening = guardianAltarOpening;
+            EventDungeons = eventDungeons;
         }
 
         internal LotteryItemHandler LotteryItem { get; }
@@ -126,5 +128,7 @@ namespace DfoServer.Infrastructure
         internal EventFatigueAccelerationHandler EventFatigueAcceleration { get; }
 
         internal GuardianAltarOpeningCoordinator GuardianAltarOpening { get; }
+
+        internal EventDungeonOpeningCoordinator EventDungeons { get; }
     }
 }

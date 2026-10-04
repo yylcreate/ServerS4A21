@@ -822,6 +822,16 @@ namespace DfoServer.Infrastructure
                 ClockService.Instance,
                 progress: guardianProgress, definition: () => guardianDefinition.Value);
 
+            var eventDungeons = new EventDungeonOpeningCoordinator(
+                core.EventManager.EventDungeons,
+                world.Sessions,
+                world.CharacterTransitions,
+                ClockService.Instance,
+                townDungeon.Dungeon.EntryLimits);
+            townDungeon.Dungeon.ConfigureEventDungeons(
+                core.EventManager.EventDungeons,
+                eventDungeons.NotifyCountsAfterEntryWhileTransitionHeldAsync);
+
             var handlers = new GameProtocolFeatureHandlers(
                 lotteryItem,
                 new PetCreatureHandler(
@@ -886,8 +896,10 @@ namespace DfoServer.Infrastructure
                 new EventFatigueAccelerationHandler(
                     core.EventManager.FatigueAccelerationEntry,
                     world.CharacterTransitions),
-                guardianAltarOpening);
+                guardianAltarOpening,
+                eventDungeons);
             guardianAltarOpening.Start();
+            eventDungeons.Start();
             return handlers;
         }
 
@@ -1005,7 +1017,8 @@ namespace DfoServer.Infrastructure
                 inventory.InventoryRefreshSender,
                 core.Database,
                 core.DailyResetService,
-                featureHandlers.GuardianAltarOpening);
+                featureHandlers.GuardianAltarOpening,
+                featureHandlers.EventDungeons);
         }
 
         public void Dispose()
@@ -1015,6 +1028,7 @@ namespace DfoServer.Infrastructure
 
             _disposed = true;
             _gameProtocolFeatureHandlers?.GuardianAltarOpening?.Dispose();
+            _gameProtocolFeatureHandlers?.EventDungeons?.Dispose();
             _gameProtocolSocialHandlers?.Dispose();
             _gameProtocolWorld?.Dispose();
         }

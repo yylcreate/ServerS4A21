@@ -60,6 +60,19 @@ namespace DfoServer.Network.Handlers.Dungeon
         internal Game.Dungeon.DungeonEntryAdmissionApplicationService
             EntryAdmission { get; }
         internal Game.Dungeon.DungeonEntryLimitService EntryLimits { get; }
+        internal Game.Events.ScheduledDungeons.EventDungeonOpeningService
+            EventDungeons { get; private set; } = new();
+        internal Func<EnhancedClientSession, System.Threading.Tasks.Task>
+            EventDungeonCountsChanged { get; private set; }
+
+        internal void ConfigureEventDungeons(
+            Game.Events.ScheduledDungeons.EventDungeonOpeningService service,
+            Func<EnhancedClientSession, System.Threading.Tasks.Task> countsChanged)
+        {
+            EventDungeons = service ?? throw new ArgumentNullException(nameof(service));
+            EventDungeonCountsChanged = countsChanged
+                ?? throw new ArgumentNullException(nameof(countsChanged));
+        }
         internal DungeonAdmissionRejectSender AdmissionRejects { get; }
         internal DungeonProgressNotificationProjector ProgressNotifications { get; }
         internal DungeonTownReturnCoordinator TownReturn { get; }

@@ -47,6 +47,7 @@ namespace DfoServer.Network.Handlers
             _eventDailyAttendanceAnytimeHandler;
         private readonly EventTotalAttendanceHandler _eventTotalAttendanceHandler;
         private readonly GuardianAltarOpeningCoordinator _guardianAltarOpening;
+        private readonly EventDungeonOpeningCoordinator _eventDungeons;
         private readonly PvpRoomHandler _pvpRoomHandler;
         private readonly InventoryRefreshSender _inventoryRefreshSender;
         private readonly IGameDatabase _database;
@@ -73,7 +74,8 @@ namespace DfoServer.Network.Handlers
             InventoryRefreshSender inventoryRefreshSender,
             IGameDatabase database,
             DailyResetService dailyResetService = null,
-            GuardianAltarOpeningCoordinator guardianAltarOpening = null)
+            GuardianAltarOpeningCoordinator guardianAltarOpening = null,
+            EventDungeonOpeningCoordinator eventDungeons = null)
         {
             _loginHandler = loginHandler;
             _characterSelectHandler = characterSelectHandler;
@@ -93,6 +95,7 @@ namespace DfoServer.Network.Handlers
                 eventDailyAttendanceAnytimeHandler;
             _eventTotalAttendanceHandler = eventTotalAttendanceHandler;
             _guardianAltarOpening = guardianAltarOpening;
+            _eventDungeons = eventDungeons;
             _pvpRoomHandler = pvpRoomHandler;
             _inventoryRefreshSender = inventoryRefreshSender;
             _database = database ?? throw new ArgumentNullException(nameof(database));
@@ -511,6 +514,9 @@ namespace DfoServer.Network.Handlers
                             .NotifyStateOnLoginAsync(session);
                     if (_guardianAltarOpening != null)
                         await _guardianAltarOpening
+                            .NotifyStateOnLoginWhileTransitionHeldAsync(session);
+                    if (_eventDungeons != null)
+                        await _eventDungeons
                             .NotifyStateOnLoginWhileTransitionHeldAsync(session);
                     // 上线 hook：初始好友列表已由 init 包流下发
                     // （UnitedServerFriendInfoBodyBuilder），这里只做单向推送——
