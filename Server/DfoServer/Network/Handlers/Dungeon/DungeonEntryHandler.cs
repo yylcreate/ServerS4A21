@@ -2217,6 +2217,12 @@ namespace DfoServer.Network.Handlers.Dungeon
             }
 
             var req = Network.Parsers.Dungeon.SelectDungeonRequest.Parse(body);
+            var eventEntryPlayer = session.Player;
+            var eventEntryAccount = session.Account;
+            var eventEntryGameSession = session.GameSession;
+            var eventEntryCharacterId = eventEntryPlayer.CharacterId;
+            var eventEntryUserId = eventEntryPlayer.UserId;
+            var eventEntryAccountId = eventEntryAccount?.AccountId ?? 0;
             var entryLimitDungeonId = req.DungeonId;
             if (anotherAradSelection.HasValue)
             {
@@ -2251,6 +2257,15 @@ namespace DfoServer.Network.Handlers.Dungeon
                 {
                     FileLogger.Log($"[{DungeonSharedServices.ProtocolLogName}] TOWER_OF_DESPAIR_ENTRY ERROR: cid={session.Player.CharacterId} requested={req.DungeonId}: {ex.Message}");
                 }
+            }
+
+            if (!TryNormalizeEventDungeonRequest(session, ref req, out var eventEntryFailure))
+            {
+                FileLogger.Log($"[EventDungeonEntry] selection rejected cid={session.Player.CharacterId} "
+                    + $"dungeon={req.DungeonId} reason={eventEntryFailure}");
+                await RejectSelectionAsync(session, expectedSelection, header.type,
+                    DungeonAdmissionReject.DungeonUnavailable);
+                return;
             }
 
             if (!anotherAradSelection.HasValue
@@ -2866,6 +2881,32 @@ namespace DfoServer.Network.Handlers.Dungeon
             foreach (var plan in partyEntryPlans)
                 await NotifyTownAreaRosterDepartureAsync(plan.Session);
 
+            // Recheck the absolute opening and party state after asynchronous
+            // run preparation, before either existing debit owner commits.
+            var eventCommitFailure = string.Empty;
+            var eventSourceCurrent = !_svc.EventDungeons.IsManagedDungeon(run.DungeonId)
+                || (ReferenceEquals(session.Player, eventEntryPlayer)
+                    && ReferenceEquals(session.Account, eventEntryAccount)
+                    && ReferenceEquals(session.GameSession, eventEntryGameSession)
+                    && eventEntryGameSession != null
+                    && eventEntryPlayer.CharacterId == eventEntryCharacterId
+                    && eventEntryPlayer.UserId == eventEntryUserId
+                    && eventEntryAccountId > 0 && session.Account.AccountId == eventEntryAccountId
+                    && session.Player.IsCurrentDungeonRun(runIdentity)
+                    && _svc.Sessions != null
+                    && _svc.Sessions.TryGet(eventEntryCharacterId, out var currentEventSession)
+                    && ReferenceEquals(currentEventSession, session));
+            if (!eventSourceCurrent
+                || !TryValidateEventDungeonEntry(session, run, out eventCommitFailure))
+            {
+                if (!eventSourceCurrent) eventCommitFailure = "entry_source_changed";
+                FileLogger.Log($"[EventDungeonEntry] commit rejected cid={eventEntryCharacterId} "
+                    + $"dungeon={run.DungeonId} reason={eventCommitFailure}");
+                await ReturnPreparedPartyRunsToTownAsync(session, header.type, partyEntryPlans,
+                    DungeonAdmissionReject.DungeonUnavailable, "event_window_or_party_changed");
+                return;
+            }
+
             // 暗精灵遗迹入场在组队费用提交前最后提交; 此后任何失败路径都必须回滚 licensed entry
             var licensedCommittedStatus = default(LicensedDungeonStatus);
             if (licensedDungeonPlan != null
@@ -3090,6 +3131,12 @@ namespace DfoServer.Network.Handlers.Dungeon
                     "leader_start_map_projection_failed");
                 return;
             }
+            if (!session.Player.IsCurrentDungeonRun(runIdentity))
+                return;
+
+            if (_svc.EventDungeons.IsManagedDungeon(run.DungeonId)
+                && _svc.EventDungeonCountsChanged != null)
+                await _svc.EventDungeonCountsChanged(session);
             if (!session.Player.IsCurrentDungeonRun(runIdentity))
                 return;
 
@@ -3864,6 +3911,12 @@ namespace DfoServer.Network.Handlers.Dungeon
                     EntryCostFailureKind.InvalidState);
                 return false;
             }
+            if (!TryValidateEventDungeonEntry(session, run, out var eventEntryFailure))
+            {
+                validation = new EntryCostResult().Fail(
+                    "event dungeon " + eventEntryFailure, EntryCostFailureKind.MissingPermission);
+                return false;
+            }
             if (!WorldMap.IsStoryDungeon(run.DungeonId)
                 && !DungeonData.MeetsMinimumRequiredLevel(
                     run.DungeonId,
@@ -3951,6 +4004,74 @@ namespace DfoServer.Network.Handlers.Dungeon
                 return false;
             }
             return true;
+        }
+
+        internal bool TryNormalizeEventDungeonRequest(
+            EnhancedClientSession session,
+            ref SelectDungeonRequest request,
+            out string reason)
+        {
+            reason = string.Empty;
+            if (!_svc.EventDungeons.IsManagedDungeon(request.DungeonId))
+                return true;
+            if (!TryValidateEventDungeonEntry(session, request.DungeonId,
+                    out var difficulty, out reason))
+                return false;
+            request = new SelectDungeonRequest(request.DungeonId, difficulty,
+                request.Flag1, request.Flag2, request.A21Sentinel,
+                request.TrailingLength, request.HasNonZeroTrailingBytes);
+            return true;
+        }
+
+        private bool TryValidateEventDungeonEntry(
+            EnhancedClientSession session, DungeonRun run, out string reason)
+        {
+            reason = string.Empty;
+            if (!_svc.EventDungeons.IsManagedDungeon(run.DungeonId))
+                return true;
+            return TryValidateEventDungeonEntry(session, run.DungeonId,
+                    out var difficulty, out reason)
+                && (run.Difficulty == difficulty || FailDifficulty(out reason));
+
+            static bool FailDifficulty(out string failure)
+            {
+                failure = "designated_difficulty_changed";
+                return false;
+            }
+        }
+
+        private bool TryValidateEventDungeonEntry(
+            EnhancedClientSession session, int dungeonId, out byte difficulty, out string reason)
+        {
+            difficulty = 0;
+            reason = string.Empty;
+            var player = session?.Player;
+            if (player == null)
+            {
+                reason = "event_character_unavailable";
+                return false;
+            }
+            if (!_svc.EventDungeons.TryValidateEntry(dungeonId,
+                    player.Level, _svc.PartyManager?.GetPartyByUser(player.UserId)?.Count ?? 1,
+                    DateTimeOffset.UtcNow, out difficulty, out reason))
+                return false;
+            if (dungeonId != Game.Events.ScheduledDungeons.EventDungeonOpeningService.GoldSilverDungeonId)
+                return true;
+            try
+            {
+                var limits = _svc.EntryLimits.LoadSpecialDungeonLimits(
+                    session.Account?.AccountId ?? 0, player.CharacterId);
+                return Game.Events.ScheduledDungeons.GoldSilverHornCountProjection.TryCreate(
+                    _svc.EventDungeons.GoldSilverConfiguration, limits,
+                    out _, out _, out reason);
+            }
+            catch (Exception ex) when (ex is Microsoft.Data.Sqlite.SqliteException
+                or InvalidOperationException or System.IO.IOException)
+            {
+                FileLogger.Log($"[EventDungeonEntry] limit read failed cid={player.CharacterId}: {ex}");
+                reason = "gold_silver_limit_unavailable";
+                return false;
+            }
         }
 
         private bool TryEvaluateAntonAwakeningEntry(

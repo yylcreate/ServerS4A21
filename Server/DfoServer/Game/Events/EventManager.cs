@@ -6,6 +6,7 @@ using DfoServer.Game.Events.Joust;
 using DfoServer.Game.Events.PcRoomTimePoint;
 using DfoServer.Game.Events.TotalAttendance;
 using DfoServer.Game.Events.SeriaLuck;
+using DfoServer.Game.Events.ScheduledDungeons;
 using DfoServer.Infrastructure;
 
 namespace DfoServer.Game.Events
@@ -26,6 +27,8 @@ namespace DfoServer.Game.Events
 
         internal GuardianAltarOpeningService GuardianAltarOpening { get; } = new();
 
+        internal EventDungeonOpeningService EventDungeons { get; } = new();
+
         internal FatigueAccelerationEntryService FatigueAccelerationEntry { get; }
 
         internal SeriaLuckUiService SeriaLuckUi { get; }
@@ -39,6 +42,10 @@ namespace DfoServer.Game.Events
             if (!GuardianAltarOpening.TryConfigureEnvironment(out var openingError))
                 FileLogger.Log("[GuardianAltarEntry] invalid entry-only window; disabled: "
                     + openingError);
+
+            if (!EventDungeons.TryConfigureEnvironment(out var dungeonOpeningError))
+                FileLogger.Log("[EventDungeonEntry] invalid opening configuration: "
+                    + dungeonOpeningError);
 
             var joustConfig = JoustConfigProvider.Instance;
             joustConfig.Warmup();

@@ -79,6 +79,7 @@ namespace DfoServer.Network
         private readonly GameProtocolWorldDependencies _worldDependencies;
         private readonly bool _ownsWorldDependencies;
         private readonly GuardianAltarOpeningCoordinator _guardianAltarOpening;
+        private readonly EventDungeonOpeningCoordinator _eventDungeonOpening;
         private readonly bool _ownsGuardianAltarOpening;
         private readonly GameProtocolSocialHandlers _socialHandlers;
         private readonly GameCommandRegistry _cmdDispatch;
@@ -226,6 +227,7 @@ namespace DfoServer.Network
             _eventFatigueAccelerationHandler = featureHandlers.EventFatigueAcceleration;
             _npcFavorHandler = featureHandlers.NpcFavor;
             _guardianAltarOpening = featureHandlers.GuardianAltarOpening;
+            _eventDungeonOpening = featureHandlers.EventDungeons;
             _guardianAltarOpening?.ConfigureDungeonEntry(_dungeonHandler,
                 _socialHandlers.Trade.HasActiveTrade, _worldDependencies.MercenaryRestrictions);
             _pvpChannelInfoHandler = socialHandlers.PvpChannelInfo;
@@ -304,7 +306,10 @@ namespace DfoServer.Network
         public void Dispose()
         {
             if (_ownsGuardianAltarOpening)
+            {
                 _guardianAltarOpening?.Dispose();
+                _eventDungeonOpening?.Dispose();
+            }
             _socialHandlers.Dispose();
             if (_ownsWorldDependencies)
                 _worldDependencies.Dispose();

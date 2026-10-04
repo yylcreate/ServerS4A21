@@ -141,6 +141,13 @@ namespace DfoServer.Network.Handlers
                 session,
                 Game.Dungeon.DungeonRunEndReason.ReturnToTown);
 
+        internal DungeonEntryLimitService EntryLimits => _services.EntryLimits;
+
+        internal void ConfigureEventDungeons(
+            Game.Events.ScheduledDungeons.EventDungeonOpeningService service,
+            Func<EnhancedClientSession, Task> countsChanged)
+            => _services.ConfigureEventDungeons(service, countsChanged);
+
         internal void ConfigureLoadingProjectionStarted(
             Action<DungeonRoomIdentity, DungeonInstanceRoom, long> callback,
             Func<EnhancedClientSession, DungeonRunIdentity,

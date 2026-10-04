@@ -17,6 +17,7 @@ namespace DfoServer
         private static readonly (string Arg, Func<int> Run)[] SelfTestRegistry =
         {
             ("--selftest-a21-startup-protocol", SelfTests.A21StartupProtocolSelfTest.Run),
+            ("--selftest-event-dungeon-opening", SelfTests.EventDungeonOpeningSelfTest.Run),
             ("--selftest-fatigue-acceleration-definition", SelfTests.FatigueAccelerationDefinitionSelfTest.Run),
             ("--selftest-fatigue-acceleration-entry", SelfTests.FatigueAccelerationEntrySelfTest.Run),
             ("--selftest-guardian-altar-menu", SelfTests.GuardianAltarMenuSelfTest.Run),
