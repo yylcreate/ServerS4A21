@@ -7,7 +7,7 @@ namespace DfoServer.Network.Builders
     
     public sealed class FatigueAccelBodyBuilder : IInitPacketBuilder
     {
-        public ushort NotiType => 0x01EB;
+        public ushort NotiType => (ushort)NotiPacketTypeA21.USER_FATIGUE_ACCELERATION_STATE;
 
         public bool TryBuild(SelectCharacterDataSnapshot snapshot, int occurrenceIndex, out byte[] body)
         {

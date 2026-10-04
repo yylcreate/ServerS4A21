@@ -565,7 +565,8 @@ namespace DfoServer.Infrastructure
                     database: core.Database,
                     dailyResetService: core.DailyResetService,
                     antonAwakeningProgress: core.AntonAwakeningProgress,
-                    overflowRewardSink: inventory.OverflowRewardSink));
+                    overflowRewardSink: inventory.OverflowRewardSink,
+                    fatigueAcceleration: core.EventManager.FatigueAccelerationEntry));
         }
 
         internal GameProtocolSocialHandlers GetOrCreateGameProtocolSocialHandlers(
@@ -882,6 +883,9 @@ namespace DfoServer.Infrastructure
                 new NpcFavorHandler(
                     core.Database,
                     inventory.InventoryRefreshSender),
+                new EventFatigueAccelerationHandler(
+                    core.EventManager.FatigueAccelerationEntry,
+                    world.CharacterTransitions),
                 guardianAltarOpening);
             guardianAltarOpening.Start();
             return handlers;

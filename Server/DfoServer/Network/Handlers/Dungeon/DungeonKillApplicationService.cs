@@ -886,11 +886,12 @@ namespace DfoServer.Network.Handlers.Dungeon
                         equipmentBonusPercent);
                 }
             }
-            var awardedExp = CharacterExperienceService.AddSaturating(
-                CharacterExperienceService.AddSaturating(
-                    monsterAwardBaseExp,
-                    growthContractBonus),
-                equipmentBonus);
+            var awardedExp = CalculateMonsterAwardExperience(
+                monsterAwardBaseExp,
+                growthContractBonus,
+                equipmentBonus,
+                experienceBonusSnapshot,
+                out var fatigueBurnBonus);
 
             var dungeonBasisLevel = (int)monster.Level;
             var dungeonMinimumLevel = (int)monster.Level;
@@ -1061,7 +1062,8 @@ namespace DfoServer.Network.Handlers.Dungeon
                     isSuperChampion,
                     isNamed,
                     actorSequenceId: sequenceId,
-                    equipmentBonusExperience: equipmentBonus);
+                    equipmentBonusExperience: equipmentBonus,
+                    fatigueBurnBonusExperience: fatigueBurnBonus);
                 if (reusesFrozenSequentialOutcome)
                 {
                     if (!run.Instance.ParticipantEffects.TryApplyMonsterDropGold(
@@ -1102,6 +1104,8 @@ namespace DfoServer.Network.Handlers.Dungeon
                     $"awardBase={monsterAwardBaseExp} " +
                     $"growthContract={growthContractBonus} " +
                     $"equipBonus={equipmentBonus} " +
+                    $"fatigueBurnRate={experienceBonusSnapshot.FatigueBurnExperienceBonusPercent}% " +
+                    $"fatigueBurnBonus={fatigueBurnBonus} " +
                     $"awarded={awardedExp}");
             }
 
@@ -1112,7 +1116,8 @@ namespace DfoServer.Network.Handlers.Dungeon
                     grant,
                     "DUNGEON_KILL",
                     growthContractBonusExp: growthContractBonus,
-                    eliteMonsterKillBonusExp: eliteMonsterKillBonusExp);
+                    eliteMonsterKillBonusExp: eliteMonsterKillBonusExp,
+                    fatigueBurnBonusExp: fatigueBurnBonus);
                 if (!session.Player.IsCurrentDungeonRun(identity))
                     return generatedDrops;
                 if (grant.LeveledUp)
@@ -1746,6 +1751,30 @@ namespace DfoServer.Network.Handlers.Dungeon
                 IsAbyssMonsterScript = monster.IsHellMonsterScript,
                 CharacterId = characterId,
             };
+        }
+
+        internal static uint CalculateMonsterAwardExperience(
+            uint baseExperience,
+            uint growthContractBonusExperience,
+            uint equipmentBonusExperience,
+            DungeonParticipantExperienceBonusSnapshot bonusSnapshot,
+            out uint fatigueBurnBonusExperience)
+        {
+            var existingAward = CharacterExperienceService.AddSaturating(
+                CharacterExperienceService.AddSaturating(
+                    baseExperience,
+                    growthContractBonusExperience),
+                equipmentBonusExperience);
+            var percent = bonusSnapshot.IsCaptured
+                ? Math.Max(0, bonusSnapshot.FatigueBurnExperienceBonusPercent)
+                : 0;
+            // The base already includes story, actor-kind, party and level
+            // adjustments. Burn adds its own component; it never multiplies
+            // the independently calculated contract or equipment bonuses.
+            fatigueBurnBonusExperience = DungeonParticipantExperienceRuntime
+                .CalculateFatigueBurnBonus(baseExperience, existingAward, percent);
+            // Persist/project only the increment admitted to this raw grant.
+            return existingAward + fatigueBurnBonusExperience;
         }
 
         private uint CalculateGrowthContractMonsterBonus(

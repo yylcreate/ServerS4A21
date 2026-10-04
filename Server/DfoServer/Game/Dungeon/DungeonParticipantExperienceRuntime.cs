@@ -25,12 +25,14 @@ namespace DfoServer.Game.Dungeon
             uint superChampionBaseExperience,
             uint namedMonsterBaseExperience,
             IReadOnlyList<DungeonObjectExperienceEntry> objectExperienceEntries = null,
-            uint monsterEquipmentBonusExperience = 0)
+            uint monsterEquipmentBonusExperience = 0,
+            uint monsterFatigueBurnBonusExperience = 0)
         {
             MonsterBaseExperience = monsterBaseExperience;
             MonsterGrowthContractBonusExperience =
                 monsterGrowthContractBonusExperience;
             MonsterEquipmentBonusExperience = monsterEquipmentBonusExperience;
+            MonsterFatigueBurnBonusExperience = monsterFatigueBurnBonusExperience;
             BossBaseExperience = bossBaseExperience;
             ChampionBaseExperience = championBaseExperience;
             SuperChampionBaseExperience = superChampionBaseExperience;
@@ -42,11 +44,14 @@ namespace DfoServer.Game.Dungeon
         internal uint MonsterBaseExperience { get; }
         internal uint MonsterGrowthContractBonusExperience { get; }
         internal uint MonsterEquipmentBonusExperience { get; }
+        internal uint MonsterFatigueBurnBonusExperience { get; }
         internal uint MonsterTotalExperience => AddSaturating(
             MonsterBaseExperience,
             AddSaturating(
                 MonsterGrowthContractBonusExperience,
-                MonsterEquipmentBonusExperience));
+                AddSaturating(
+                    MonsterEquipmentBonusExperience,
+                    MonsterFatigueBurnBonusExperience)));
         internal uint BossBaseExperience { get; }
         internal uint ChampionBaseExperience { get; }
         internal uint SuperChampionBaseExperience { get; }
@@ -74,6 +79,7 @@ namespace DfoServer.Game.Dungeon
         internal uint MonsterBaseExperience { get; private set; }
         internal uint MonsterGrowthContractBonusExperience { get; private set; }
         internal uint MonsterEquipmentBonusExperience { get; private set; }
+        internal uint MonsterFatigueBurnBonusExperience { get; private set; }
         // 纹章加成的小数零头(decimal 避免双精度漂移吞掉进位)。
         // 逐只 floor 会在等级惩罚的小基数下吞掉全部加成,
         // 零头带进下一只, 整局合计 ≈ 基础总额 × 百分比。
@@ -82,7 +88,9 @@ namespace DfoServer.Game.Dungeon
             MonsterBaseExperience,
             AddSaturating(
                 MonsterGrowthContractBonusExperience,
-                MonsterEquipmentBonusExperience));
+                AddSaturating(
+                    MonsterEquipmentBonusExperience,
+                    MonsterFatigueBurnBonusExperience)));
         internal uint BossBaseExperience { get; private set; }
         internal uint ChampionBaseExperience { get; private set; }
         internal uint SuperChampionBaseExperience { get; private set; }
@@ -129,7 +137,8 @@ namespace DfoServer.Game.Dungeon
             bool isSuperChampion,
             bool isNamedMonster,
             ushort actorSequenceId = 0,
-            uint equipmentBonusExperience = 0)
+            uint equipmentBonusExperience = 0,
+            uint fatigueBurnBonusExperience = 0)
         {
             MonsterBaseExperience = AddSaturating(
                 MonsterBaseExperience,
@@ -140,6 +149,9 @@ namespace DfoServer.Game.Dungeon
             MonsterEquipmentBonusExperience = AddSaturating(
                 MonsterEquipmentBonusExperience,
                 equipmentBonusExperience);
+            MonsterFatigueBurnBonusExperience = AddSaturating(
+                MonsterFatigueBurnBonusExperience,
+                fatigueBurnBonusExperience);
             if (isBoss)
                 BossBaseExperience = AddSaturating(
                     BossBaseExperience,
@@ -172,7 +184,8 @@ namespace DfoServer.Game.Dungeon
                 SuperChampionBaseExperience,
                 NamedMonsterBaseExperience,
                 _objectExperienceEntries.ToArray(),
-                MonsterEquipmentBonusExperience);
+                MonsterEquipmentBonusExperience,
+                MonsterFatigueBurnBonusExperience);
 
         // Compatibility setters keep existing fixture/setup APIs usable. New
         // production code records awards only through RecordMonster.
@@ -180,6 +193,7 @@ namespace DfoServer.Game.Dungeon
         {
             MonsterBaseExperience = value;
             MonsterGrowthContractBonusExperience = 0;
+            MonsterFatigueBurnBonusExperience = 0;
         }
 
         internal void SetBossBaseForCompatibility(uint value) =>
@@ -213,6 +227,22 @@ namespace DfoServer.Game.Dungeon
                 : (uint)decimal.Floor(exact);
             _equipmentBonusCarry = exact - grant;
             return grant;
+        }
+
+        // Burn is an additive component of the already planned award. Record
+        // only the amount that fits in RawGain so the UI cannot claim a bonus
+        // that was discarded by the UInt32 saturation boundary.
+        internal static uint CalculateFatigueBurnBonus(
+            uint baseExperience,
+            uint totalWithoutBurnExperience,
+            int percent)
+        {
+            if (baseExperience == 0 || percent <= 0)
+                return 0;
+
+            var requested = (ulong)baseExperience * (ulong)percent / 100;
+            var available = (ulong)uint.MaxValue - totalWithoutBurnExperience;
+            return (uint)Math.Min(requested, available);
         }
 
         private static uint AddSaturating(uint left, uint right)

@@ -2489,7 +2489,9 @@ namespace DfoServer.Network.Handlers.Dungeon
                     session,
                     entryParty,
                     _svc.Sessions,
-                    entryPartyMemberCount);
+                    entryPartyMemberCount,
+                    _svc.FatigueAcceleration,
+                    req.DungeonId);
             var isDimensionDungeon = DungeonData.IsDimensionDungeon(req.DungeonId);
             if (!await TryValidateEntryLimitAsync(
                     session,

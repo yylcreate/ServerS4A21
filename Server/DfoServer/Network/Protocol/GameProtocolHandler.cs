@@ -56,6 +56,7 @@ namespace DfoServer.Network
         private readonly EventDailyAttendanceAnytimeHandler
             _eventDailyAttendanceAnytimeHandler;
         private readonly EventTotalAttendanceHandler _eventTotalAttendanceHandler;
+        private readonly EventFatigueAccelerationHandler _eventFatigueAccelerationHandler;
         private readonly NpcFavorHandler _npcFavorHandler;
         private readonly ExpertJobStoreHandler _expertJobStoreHandler;
         private readonly ExpertJobExtractionHandler _expertJobExtractionHandler;
@@ -222,6 +223,7 @@ namespace DfoServer.Network
             _eventDailyAttendanceAnytimeHandler =
                 featureHandlers.EventDailyAttendanceAnytime;
             _eventTotalAttendanceHandler = featureHandlers.EventTotalAttendance;
+            _eventFatigueAccelerationHandler = featureHandlers.EventFatigueAcceleration;
             _npcFavorHandler = featureHandlers.NpcFavor;
             _guardianAltarOpening = featureHandlers.GuardianAltarOpening;
             _guardianAltarOpening?.ConfigureDungeonEntry(_dungeonHandler,
@@ -809,6 +811,8 @@ namespace DfoServer.Network
                 _eventDailyAttendanceAnytimeHandler.HandleClaimAsync;
             d[(ushort)CmdPacketTypeA21.EVENT_TOTAL_ATTENDANCE_CHECK_THISWEEK] =
                 _eventTotalAttendanceHandler.HandleCheckThisWeekAsync;
+            d[(ushort)CmdPacketTypeA21.FATIGUE_ACCELERATION_STATE_CHANGE] =
+                _eventFatigueAccelerationHandler.HandleAsync;
             d[(ushort)CmdPacketType.PARTY_TELEPORT] =
                 _townHandler.Handle_ENUM_CMDPACKET_PARTY_TELEPORT;
             d[(ushort)CmdPacketTypeA21.SOLO_TELEPOART] =
