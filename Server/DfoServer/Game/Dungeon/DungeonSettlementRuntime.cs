@@ -38,6 +38,7 @@ namespace DfoServer.Game.Dungeon
         internal uint AdventureGroupBonusExp;
         internal int ExperiencePotionBonusRate;
         internal uint ExperiencePotionBonusExp;
+        internal uint FatigueBurnBonusExp;
         internal uint ClearBonusExp;
         internal uint ClearTotalExp;
         internal byte PreviousLevel;
@@ -73,6 +74,7 @@ namespace DfoServer.Game.Dungeon
         internal uint NamedMonsterTotalExp;
         internal uint MonsterGrowthContractBonusExp;
         internal uint MonsterEquipmentBonusExp;
+        internal uint MonsterFatigueBurnBonusExp;
         internal IReadOnlyList<DungeonObjectExperienceEntry>
             ObjectExperienceEntries = Array.Empty<DungeonObjectExperienceEntry>();
         internal int ClearTimeMilliseconds;
