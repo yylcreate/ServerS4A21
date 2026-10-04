@@ -372,7 +372,8 @@ namespace DfoServer.Infrastructure
                     world.MercenaryRestrictions,
                     core.Database,
                     core.DailyResetService,
-                    inventory.MailboxService),
+                    inventory.MailboxService,
+                    core.EventManager.SeriaLuckUi),
                 new InventoryHandler(
                     core.ExperienceItemUseService,
                     core.SelectCharacterDataSource,
@@ -387,7 +388,8 @@ namespace DfoServer.Infrastructure
                     core.Database,
                     inventory.OverflowRewardSink,
                     inventory.MailboxService,
-                    inventory.KnightShieldService),
+                    inventory.KnightShieldService,
+                    core.EventManager.SeriaLuckUi),
                 new KnightShieldHandler(
                     inventory.KnightShieldService,
                     core.CharacterRepository,

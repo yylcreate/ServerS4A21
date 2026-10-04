@@ -34,6 +34,7 @@ namespace DfoServer.Network.Handlers
         private readonly IInventoryOverflowRewardSink _overflowRewardSink;
         private readonly MailboxService _mailboxService;
         private readonly KnightShieldService _knightShieldService;
+        private readonly Game.Events.SeriaLuck.SeriaLuckUiService _seriaLuckUi;
 
         public string ProtocolName => "GameProtocol";
 
@@ -51,7 +52,8 @@ namespace DfoServer.Network.Handlers
             IGameDatabase database = null,
             IInventoryOverflowRewardSink overflowRewardSink = null,
             MailboxService mailboxService = null,
-            KnightShieldService knightShieldService = null)
+            KnightShieldService knightShieldService = null,
+            Game.Events.SeriaLuck.SeriaLuckUiService seriaLuckUi = null)
         {
             _experienceItemUseService = experienceItemUseService
                 ?? throw new ArgumentNullException(nameof(experienceItemUseService));
@@ -71,6 +73,7 @@ namespace DfoServer.Network.Handlers
             _monsterCardBindService = new MonsterCardBindService();
             _monsterCardUpgradeService = new MonsterCardUpgradeService();
             _database = database ?? GameDatabase.CreateDefault();
+            _seriaLuckUi = seriaLuckUi ?? new Game.Events.SeriaLuck.SeriaLuckUiService(_database);
             _overflowRewardSink = overflowRewardSink
                 ?? RejectingInventoryOverflowRewardSink.Instance;
             _mailboxService = mailboxService;

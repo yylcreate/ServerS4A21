@@ -4,6 +4,7 @@ using DfoServer.Game.Events.GuardianAltar;
 using DfoServer.Game.Events.Joust;
 using DfoServer.Game.Events.PcRoomTimePoint;
 using DfoServer.Game.Events.TotalAttendance;
+using DfoServer.Game.Events.SeriaLuck;
 using DfoServer.Infrastructure;
 
 namespace DfoServer.Game.Events
@@ -16,14 +17,18 @@ namespace DfoServer.Game.Events
         {
             Database = database ?? throw new ArgumentNullException(nameof(database));
             _repository = new GameEventRepository(Database);
+            SeriaLuckUi = new SeriaLuckUiService(Database);
         }
 
         internal IGameDatabase Database { get; }
 
         internal GuardianAltarOpeningService GuardianAltarOpening { get; } = new();
 
+        internal SeriaLuckUiService SeriaLuckUi { get; }
+
         internal void Initialize()
         {
+            SeriaLuckUi.Initialize();
             if (!GuardianAltarOpening.TryConfigureEnvironment(out var openingError))
                 FileLogger.Log("[GuardianAltarEntry] invalid entry-only window; disabled: "
                     + openingError);

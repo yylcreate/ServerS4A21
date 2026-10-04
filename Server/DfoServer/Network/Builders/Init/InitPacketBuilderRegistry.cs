@@ -1,4 +1,5 @@
 using DfoServer.Game.Inventory;
+using DfoServer.Game.Events.SeriaLuck;
 using DfoServer.Game.SelectCharacter;
 using DfoServer.Game.Session;
 using DfoServer.Infrastructure;
@@ -28,6 +29,12 @@ namespace DfoServer.Network.Builders
         public InitPacketBuilderRegistry(
             IGameDatabase database,
             ISessionDirectory sessions)
+            : this(database, sessions, null)
+        {
+        }
+
+        internal InitPacketBuilderRegistry(IGameDatabase database,
+            ISessionDirectory sessions, SeriaLuckUiService seriaLuckUi)
         {
             _database = database ?? throw new ArgumentNullException(nameof(database));
             var collectBoxProgressRepository = new CollectBoxProgressRepository(
@@ -79,6 +86,7 @@ namespace DfoServer.Network.Builders
 
             
             Register(new EventInfoBodyBuilder(_database));
+            Register(new SeriaLuckGaugeBodyBuilder(seriaLuckUi ?? new SeriaLuckUiService(_database)));
             Register(new HotkeyConfigBodyBuilder());                                    
             Register(new CharacterOptionBodyBuilder());
 
