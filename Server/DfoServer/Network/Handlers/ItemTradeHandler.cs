@@ -65,6 +65,18 @@ namespace DfoServer.Network.Handlers
                 && _bindings.TryGetValue(b.Sessions[1].SessionId, out x) && ReferenceEquals(x, b);
         }
 
+        internal bool HasActiveTrade(EnhancedClientSession session)
+        {
+            if (session == null)
+                return false;
+            var binding = Find(session); // Release directory lock before Trade.SyncRoot.
+            if (binding == null || !binding.Sessions.Any(s => ReferenceEquals(s, session)))
+                return false;
+            lock (binding.Trade.SyncRoot)
+                return binding.Trade.Active && !binding.Trade.Closed && binding.Trade.IsCurrent
+                    && Registered(binding) && Current(binding, 0) && Current(binding, 1);
+        }
+
         internal async Task Request(EnhancedClientSession s, GamePacketHeader h, byte[] body)
         {
             if (!ItemTradeRequest.TryPeer(body, false, out var uid, out var peer, out _)) return;

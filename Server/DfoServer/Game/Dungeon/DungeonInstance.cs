@@ -415,6 +415,13 @@ namespace DfoServer.Game.Dungeon
             }
         }
 
+        internal bool IsCurrentLoadingGeneration(long generation)
+        {
+            lock (_syncRoot)
+                return generation > 0 && _state != DungeonRoomState.Closed
+                    && _loadingGeneration == generation;
+        }
+
         internal DungeonRoomLoadingReadyResult MarkLoadingReady(
             DungeonRunIdentity participant,
             IReadOnlyList<DungeonRunIdentity> activeParticipants)

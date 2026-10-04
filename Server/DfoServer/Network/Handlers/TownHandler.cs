@@ -16,6 +16,7 @@ using DfoServer.Network.Builders.Party;
 using DfoServer.Network.Parsers.Town;
 using System;
 using System.Collections.Generic;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace DfoServer.Network.Handlers
@@ -34,18 +35,18 @@ namespace DfoServer.Network.Handlers
             private TownProjectionGuard(
                 DungeonRunIdentity endedRun,
                 DungeonSelectionContext selection,
-                Func<bool> raidReturnCurrent = null)
+                Func<bool> authorizedReturnCurrent = null)
             {
                 EndedRun = endedRun;
                 Selection = selection;
-                RaidReturnCurrent = raidReturnCurrent;
+                AuthorizedReturnCurrent = authorizedReturnCurrent;
             }
 
             internal DungeonRunIdentity EndedRun { get; }
             internal DungeonSelectionContext Selection { get; }
-            internal Func<bool> RaidReturnCurrent { get; }
+            internal Func<bool> AuthorizedReturnCurrent { get; }
 
-            internal static TownProjectionGuard ForRaidReturn(Func<bool> current) =>
+            internal static TownProjectionGuard ForAuthorizedReturn(Func<bool> current) =>
                 new TownProjectionGuard(default(DungeonRunIdentity), null, current);
 
             internal static TownProjectionGuard ForEndedRun(
@@ -73,6 +74,7 @@ namespace DfoServer.Network.Handlers
             _dungeonGiveupPartyDeparture;
         private Func<Task> _publishTownPartyLists;
         private Func<EnhancedClientSession, byte, byte, Task> _raidTownAreaChanged;
+        private Func<EnhancedClientSession, Func<bool>, Task<bool>> _restoreGuardianControls;
 
         private readonly InventoryRefreshSender _refresh;
 
@@ -140,6 +142,10 @@ namespace DfoServer.Network.Handlers
         {
             _raidTownAreaChanged = handler;
         }
+
+        internal void ConfigureGuardianControlsRestore(
+            Func<EnhancedClientSession, Func<bool>, Task<bool>> restore)
+            => _restoreGuardianControls = restore ?? throw new ArgumentNullException(nameof(restore));
 
         // 构建某在线会话玩家的完整 USERINFO subtype1（属性/装备/当前频道技能）。
         // 同屏时仅推 subtype0(精简外观)客户端能渲染但判定"对方不在城镇/不可邀请"; self 进游戏收的是 subtype0+subtype1
@@ -213,6 +219,7 @@ namespace DfoServer.Network.Handlers
         public async Task Handle_ENUM_CMDPACKET_SET_USER_POSITION(EnhancedClientSession session, GamePacketHeader header, byte[] body)
         {
             if (body == null || body.Length < 7) return;
+            var controlsSource = session.GuardianAltarControls;
             var movementSequence = session.Player.NextTownMovementSequence();
             var gotoPosX = BitConverter.ToInt16(body, 0);
             var gotoPosY = BitConverter.ToInt16(body, 2);
@@ -251,6 +258,10 @@ namespace DfoServer.Network.Handlers
                     positionPacket,
                     session.ListenerPort);
             }
+            if (controlsSource != null && header.cmd == 1
+                && header.type == (ushort)CmdPacketTypeA21.SET_USER_POSITION)
+                await TryRestoreGuardianControlsAsync(session, default(TownProjectionGuard),
+                    controlsSource);
         }
 
         public async Task Handle_ENUM_CMDPACKET_GET_PCROOM_TIME_POINT_ITEM(
@@ -290,9 +301,12 @@ namespace DfoServer.Network.Handlers
         private async Task SetUserAreaCoreAsync(
             EnhancedClientSession session,
             byte[] body,
-            TownProjectionGuard projectionGuard)
+            TownProjectionGuard projectionGuard,
+            EnhancedClientSession.GuardianAltarControlProjectionSource expectedControlsSource = null,
+            Action controlsRestored = null)
         {
             if (body == null || body.Length < 6) return;
+            var controlsSource = expectedControlsSource ?? session?.GuardianAltarControls;
             if (!CanContinueTownProjection(session, projectionGuard))
                 return;
             var gotoTownId = body[0];
@@ -364,7 +378,9 @@ namespace DfoServer.Network.Handlers
                     $"listener={session.ListenerPort}");
             }
 
-            await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(0x00, 0x0017, TownAreaNotificationBuilder.BuildUserArea(selfSnapshot)));
+            await SendTownProjectionPacketAsync(session, projectionGuard,
+                GamePacketEnvelopeBuilder.Build(0x00, (ushort)NotiPacketTypeA21.USER_AREA,
+                    TownAreaNotificationBuilder.BuildUserArea(selfSnapshot)));
             if (!CanContinueTownProjection(session, projectionGuard))
                 return;
 
@@ -390,6 +406,80 @@ namespace DfoServer.Network.Handlers
                 return;
 
             PersistPosition(session, forceImmediate: true, source: "set_user_area");
+            if (await TryRestoreGuardianControlsAsync(session, projectionGuard, controlsSource))
+                controlsRestored?.Invoke();
+        }
+
+        private bool IsCurrentGuardianControlsSource(EnhancedClientSession session,
+            TownProjectionGuard guard, EnhancedClientSession.GuardianAltarControlProjectionSource source)
+            => source != null && ReferenceEquals(session.GuardianAltarControls, source)
+                && IsCurrentGuardianControlsScope(session, guard, source);
+
+        private bool IsCurrentGuardianControlsScope(EnhancedClientSession session,
+            TownProjectionGuard guard, EnhancedClientSession.GuardianAltarControlProjectionSource source)
+            => source != null && CanContinueTownProjection(session, guard)
+                && ReferenceEquals(session.GameSession, source.Generation)
+                && ReferenceEquals(session.Account, source.Account)
+                && session.Player.CharacterId == source.CharacterId
+                && session.Account?.AccountId == source.AccountId
+                && session.Player.UserId == source.UserId
+                && SessionDirectory.IsTownPresence(session.Player)
+                && session.Player.CurrentDungeonSelection == null && !session.Player.DungeonSelectionPending
+                && session.Player.CurrentDungeonRunGeneration == source.RunGeneration
+                && session.Player.CurrentDungeonSelectionGeneration == source.SelectionGeneration
+                && (_sessions == null || (_sessions.TryGet(source.CharacterId, out var current)
+                    && ReferenceEquals(current, session)));
+
+        private async Task<EnhancedClientSession.GuardianAltarControlProjectionSource> TryReleaseGuardianActivityAsync(
+            EnhancedClientSession session, TownProjectionGuard guard,
+            EnhancedClientSession.GuardianAltarControlProjectionSource source)
+        {
+            bool Current() => IsCurrentGuardianControlsSource(session, guard, source);
+            if (!Current()) return null;
+            if (!source.ActivityReleasePending) return source;
+            var prepared = false;
+            // A21 0x1147D8B: type3 skips the result UI; 0x1147E46..6F
+            // stops the activity clocks and clears manager+497 synchronously.
+            // This is a control release, not a successful terminal fact.
+            var packet = GamePacketEnvelopeBuilder.Build(0,
+                (ushort)NotiPacketTypeA21.ADVANCE_ALTAR_EPLP_STATE,
+                GuardianAltarClearBodyBuilder.BuildEplpState(3, 0));
+            await session.SendPreparedPacketBatchAsync(() =>
+            {
+                if (!Current()) return Array.Empty<byte[]>();
+                prepared = true;
+                return new[] { packet };
+            }, Current);
+            if (!prepared || !Current()) return null;
+            var released = source with { ActivityReleasePending = false };
+            if (!session.TryReplaceGuardianControlsSource(source, released)) return null;
+            FileLogger.Log($"[GuardianAltarEntry] activity controls released cid={source.CharacterId} "
+                + $"runGeneration={source.RunGeneration}");
+            return released;
+        }
+
+        private async Task<bool> TryRestoreGuardianControlsAsync(
+            EnhancedClientSession session, TownProjectionGuard guard,
+            EnhancedClientSession.GuardianAltarControlProjectionSource source)
+        {
+            source = await TryReleaseGuardianActivityAsync(session, guard, source);
+            bool Current() => IsCurrentGuardianControlsSource(session, guard, source);
+            if (!Current())
+                return false;
+            var restore = _restoreGuardianControls;
+            if (restore == null || !await restore(session, Current))
+            {
+                if (Current())
+                    throw new InvalidOperationException("Guardian normal controls projection is incomplete.");
+                return false;
+            }
+            if (Current() && session.TryCompleteGuardianControlsRestore(source))
+            {
+                FileLogger.Log($"[GuardianAltarEntry] normal controls restored cid={source.CharacterId} "
+                    + $"runGeneration={source.RunGeneration} selectionGeneration={source.SelectionGeneration}");
+                return true;
+            }
+            return false;
         }
 
         // 进本离开城镇的 USER_AREA 远程移除见 TownAreaRosterDepartureNotifier。
@@ -486,28 +576,30 @@ namespace DfoServer.Network.Handlers
             // 再按远程插入顺序发他人 USERINFO0 + USER_AREA。
             // 14932：0x17(无 USERINFO) -> 0x18 -> 他人 USERINFO 看不到先到的人；
             // 已在场玩家能看到后来者，是因为收的是 USERINFO0 + 0x17。
-            await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(0x00, 0x0018,
+            await SendTownProjectionPacketAsync(session, projectionGuard,
+                GamePacketEnvelopeBuilder.Build(0x00, (ushort)NotiPacketTypeA21.AREA_USERS,
                 TownAreaNotificationBuilder.BuildAreaUsers(townId, areaId, roster)));
             if (!CanContinueTownProjection(session, projectionGuard))
                 return;
 
             var selfAppearance = GamePacketEnvelopeBuilder.Build(
                 0x00,
-                0x0002,
+                (ushort)NotiPacketTypeA21.USERINFO,
                 AppearanceService.BuildNoti2Body(session.Player, _database));
-            await session.SendPacketAsync(selfAppearance);
+            await SendTownProjectionPacketAsync(session, projectionGuard, selfAppearance);
             if (!CanContinueTownProjection(session, projectionGuard))
                 return;
 
             foreach (var o in others)
             {
-                await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(0x00, 0x0002,
+                await SendTownProjectionPacketAsync(session, projectionGuard,
+                    GamePacketEnvelopeBuilder.Build(0x00, (ushort)NotiPacketTypeA21.USERINFO,
                     AppearanceService.BuildNoti2Body(
                         o.Player,
                         _database)));
                 if (!CanContinueTownProjection(session, projectionGuard))
                     return;
-                await session.SendPacketAsync(
+                await SendTownProjectionPacketAsync(session, projectionGuard,
                     BuildCoPresenceInsert(
                         TownAreaNotificationBuilder.CreateCurrentSnapshot(o.Player)));
                 if (!CanContinueTownProjection(session, projectionGuard))
@@ -557,7 +649,7 @@ namespace DfoServer.Network.Handlers
             }
             if (peerProjections.Count > 0)
                 await Task.WhenAll(peerProjections);
-            if (_publishTownPartyLists != null)
+            if (_publishTownPartyLists != null && CanContinueTownProjection(session, projectionGuard))
                 await _publishTownPartyLists();
         }
 
@@ -594,6 +686,43 @@ namespace DfoServer.Network.Handlers
         {
             await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(0x00, 0x001E, FinishLoadingBuilder.BuildNotification()));
             await _growthCapsule.SendExpProgressAsync(session, "finish-loading");
+        }
+
+        internal Task<bool> TrySendFinishLoadingCompletionAsync(
+            EnhancedClientSession session,
+            Func<bool> canContinue,
+            Action onReleased = null)
+            => SendFinishLoadingCompletionCoreAsync(
+                canContinue,
+                (packet, fence) => session.TrySendPacketAsync(
+                    packet, CancellationToken.None, fence),
+                () => _growthCapsule.SendExpProgressAsync(session, "finish-loading"), onReleased);
+
+        // Shared guarded path: the transport must evaluate the same source
+        // fence inside its send lock. The ordinary unguarded town call above
+        // retains its existing wire and follow-up behavior.
+        internal static async Task<bool> SendFinishLoadingCompletionCoreAsync(
+            Func<bool> canContinue,
+            Func<byte[], Func<bool>, Task<bool>> send,
+            Func<Task> afterCompletion = null,
+            Action onReleased = null)
+        {
+            ArgumentNullException.ThrowIfNull(canContinue);
+            ArgumentNullException.ThrowIfNull(send);
+            if (!canContinue())
+                return false;
+            var packet = GamePacketEnvelopeBuilder.Build(
+                0, (ushort)NotiPacketTypeA21.FINISH_LOADING,
+                FinishLoadingBuilder.BuildNotification());
+            if (!await send(packet, canContinue) || !canContinue())
+                return false;
+            // A local mechanism observes the successful release before an
+            // unrelated follow-up. Growth notification failure cannot undo a
+            // FINISH_LOADING frame that the client has already received.
+            onReleased?.Invoke();
+            if (afterCompletion != null)
+                await afterCompletion();
+            return true;
         }
 
         public async Task Handle_ENUM_CMDPACKET_TELEPORT(EnhancedClientSession session, GamePacketHeader header, byte[] body)
@@ -1143,6 +1272,79 @@ namespace DfoServer.Network.Handlers
                 await Handle_ENUM_CMDPACKET_GIVEUP_GAME(session, header, body);
         }
 
+        internal Task<bool> TryHandleDelayedDungeonGiveupAsync(
+            EnhancedClientSession session,
+            DungeonParticipantRoomIdentity expectedRoom,
+            Func<bool> canContinue)
+            => TryHandleDelayedDungeonGiveupCoreAsync(
+                session, expectedRoom, canContinue,
+                sourceRun => HandleGiveupFromRunAsync(session,
+                    new GamePacketHeader
+                    {
+                        cmd = 1,
+                        type = (ushort)CmdPacketTypeA21.GIVEUP_GAME,
+                    }, sourceRun),
+                _ => Dungeon.DungeonRunLifecycle.EndRunAsync(
+                    session, DungeonRunEndReason.EntryRejected,
+                    expectedRoom.Run, _dungeonInstances));
+
+        // Timer/projection cleanup is not a client's request to exit whatever
+        // run happens to be current. Keep the source room through the cohort
+        // wait, then claim the existing ending transition before releasing the
+        // run lock. The normal client entry keeps its rerouting semantics.
+        internal static async Task<bool> TryHandleDelayedDungeonGiveupCoreAsync(
+            EnhancedClientSession session,
+            DungeonParticipantRoomIdentity expectedRoom,
+            Func<bool> canContinue,
+            Func<DungeonRun, Task> giveupFromRun,
+            Func<DungeonRun, Task> ensureEnded)
+        {
+            ArgumentNullException.ThrowIfNull(canContinue);
+            ArgumentNullException.ThrowIfNull(giveupFromRun);
+            ArgumentNullException.ThrowIfNull(ensureEnded);
+            var player = session?.Player;
+            var sourceRun = player?.CurrentRun;
+            if (!expectedRoom.IsValid || sourceRun == null
+                || !player.IsCurrentDungeonParticipantRoom(expectedRoom)
+                || !canContinue())
+                return false;
+
+            var gate = sourceRun.EntryPartySelectionCohort?.TransitionGate;
+            if (gate != null)
+                await gate.WaitAsync();
+            try
+            {
+                // Never hold this monitor over persistence or network awaits.
+                // MOVE_MAP publishes its room under the same run lock and
+                // cannot reserve another projection after TryBeginEnding.
+                lock (sourceRun.SyncRoot)
+                {
+                    if (!ReferenceEquals(player.CurrentRun, sourceRun)
+                        || !player.IsCurrentDungeonParticipantRoom(expectedRoom)
+                        || !canContinue()
+                        || !sourceRun.TryBeginEnding())
+                        return false;
+                }
+                try
+                {
+                    await giveupFromRun(sourceRun);
+                    return true;
+                }
+                finally
+                {
+                    // An exception before the normal EndRun must not leave a
+                    // claimed Ending run attached. Production uses the same
+                    // expected-run ending owner; a replacement is never ended.
+                    if (ReferenceEquals(player.CurrentRun, sourceRun))
+                        await ensureEnded(sourceRun);
+                }
+            }
+            finally
+            {
+                gate?.Release();
+            }
+        }
+
         private async Task HandleGiveupFromRunAsync(
             EnhancedClientSession session,
             GamePacketHeader header,
@@ -1230,6 +1432,18 @@ namespace DfoServer.Network.Handlers
             bool sendCommandResponse,
             Func<Task> afterRunEnded = null)
         {
+            var controlsSource = session?.GuardianAltarControls;
+            var releaseGuardianControls = header.type == (ushort)CmdPacketTypeA21.GIVEUP_GAME
+                && session?.Player?.CurrentRun?.Instance.Mechanisms.GuardianAltar != null
+                && session.Player.IsCurrentDungeonRun(runIdentity)
+                && controlsSource != null
+                && ReferenceEquals(session.GameSession, controlsSource.Generation)
+                && ReferenceEquals(session.Account, controlsSource.Account)
+                && session.Account?.AccountId == controlsSource.AccountId
+                && session.Player.CharacterId == controlsSource.CharacterId
+                && session.Player.UserId == controlsSource.UserId
+                && controlsSource.RunGeneration == runIdentity.RunGeneration
+                && controlsSource.SelectionGeneration == session.Player.CurrentDungeonSelectionGeneration;
             if (!await Dungeon.DungeonRunLifecycle.EndRunAsync(
                     session,
                     DfoServer.Game.Dungeon.DungeonRunEndReason.ReturnToTown,
@@ -1240,10 +1454,18 @@ namespace DfoServer.Network.Handlers
             }
             try
             {
-                var projectionGuard = TownProjectionGuard.ForEndedRun(runIdentity);
+                var endedRunGuard = TownProjectionGuard.ForEndedRun(runIdentity);
+                var projectionGuard = endedRunGuard;
+                var controlsRestoreCompleted = false;
                 if (!CanContinueTownProjection(session, projectionGuard))
                 {
                     return false;
+                }
+                if (releaseGuardianControls)
+                {
+                    var pending = controlsSource with { ActivityReleasePending = true };
+                    if (!session.TryReplaceGuardianControlsSource(controlsSource, pending)) return false;
+                    controlsSource = pending;
                 }
                 Dungeon.DungeonRunLifecycle.ApplyTownReturnAnchor(
                     session.Player,
@@ -1251,12 +1473,24 @@ namespace DfoServer.Network.Handlers
                     session.ListenerPort);
                 session.Player.UserState = 0x00;
 
+                if (releaseGuardianControls)
+                {
+                    // Keep this return's precise source through every queued
+                    // Town write. Its successful restore may clear that source;
+                    // a replacement menu or epoch must still stop the old tail.
+                    projectionGuard = TownProjectionGuard.ForAuthorizedReturn(() =>
+                        IsCurrentGuardianControlsScope(session, endedRunGuard, controlsSource)
+                        && (ReferenceEquals(session.GuardianAltarControls, controlsSource)
+                            || (controlsRestoreCompleted && session.GuardianAltarControls == null)));
+                    if (!CanContinueTownProjection(session, projectionGuard)) return false;
+                }
+
                 // A21 客户端抓包中，GIVEUP_GAME/BACK_2_VILLAGE 的 CMD 成功响应
                 // body=[01] 位于 USER_STATE 之前。客户端先用 CMD 响应结束副本
                 // 请求状态，再开始消费城镇 USER_STATE/USER_AREA/AREA_USERS。
                 if (sendCommandResponse)
                 {
-                    await session.SendPacketAsync(
+                    await SendTownProjectionPacketAsync(session, projectionGuard,
                         BuildReturnToTownSuccessPacket(header.type));
                     if (!CanContinueTownProjection(session, projectionGuard))
                     {
@@ -1264,10 +1498,17 @@ namespace DfoServer.Network.Handlers
                     }
                 }
 
+                if (releaseGuardianControls)
+                {
+                    var released = await TryReleaseGuardianActivityAsync(session, projectionGuard, controlsSource);
+                    if (released == null) return false;
+                    controlsSource = released;
+                }
+
                 // A21 回城顺序的第一个城镇投影包是 USER_STATE(0x0003)。
                 // 该包不能只更新 PlayerContext 后省略；客户端会以它确认
                 // 角色已离开副本，再消费 USER_AREA/AREA_USERS 的城镇坐标。
-                await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(
+                await SendTownProjectionPacketAsync(session, projectionGuard, GamePacketEnvelopeBuilder.Build(
                     0x00,
                     (ushort)NotiPacketTypeA21.USER_STATE,
                     EnterSelectDungeonStateBuilder.BuildUserState(session.Player)));
@@ -1279,7 +1520,9 @@ namespace DfoServer.Network.Handlers
                 await SetUserAreaCoreAsync(
                     session,
                     BuildTownAreaProjectionBody(session.Player),
-                    projectionGuard);
+                    projectionGuard,
+                    releaseGuardianControls ? controlsSource : null,
+                    releaseGuardianControls ? () => controlsRestoreCompleted = true : null);
                 if (!CanContinueTownProjection(session, projectionGuard))
                 {
                     return false;
@@ -1358,7 +1601,34 @@ namespace DfoServer.Network.Handlers
                 }
             }
 
-            await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(
+            return await ProjectTownReturnCoreAsync(session, projectionGuard);
+        }
+
+        // The menu owner already acknowledged a current BACK_2_VILLAGE under
+        // the send lock and holds the existing character transition gate.
+        // Reuse ordinary selection return projections without fabricating a
+        // DungeonSelectionContext or changing the current town anchor.
+        internal async Task<bool> ProjectGuardianMenuReturnAsync(
+            EnhancedClientSession session, Func<bool> current)
+        {
+            ArgumentNullException.ThrowIfNull(current);
+            var guard = TownProjectionGuard.ForAuthorizedReturn(current);
+            if (!CanContinueTownProjection(session, guard)
+                || !CanChangeRaidArea(session, session.Player.CurTownId, session.Player.CurAreaId)
+                || !GameChannelSpawnPolicy.CanEnterTown(session.ListenerPort, session.Player.CurTownId))
+                return false;
+            if (!await ProjectTownReturnCoreAsync(session, guard))
+                return false;
+            return await SendTownAccountStateAsync(session, "guardian-menu-return", guard)
+                && CanContinueTownProjection(session, guard);
+        }
+
+        private async Task<bool> ProjectTownReturnCoreAsync(
+            EnhancedClientSession session, TownProjectionGuard projectionGuard)
+        {
+            if (!CanContinueTownProjection(session, projectionGuard))
+                return false;
+            await SendTownProjectionPacketAsync(session, projectionGuard, GamePacketEnvelopeBuilder.Build(
                 0x00,
                 (ushort)NotiPacketTypeA21.USER_STATE,
                 EnterSelectDungeonStateBuilder.BuildUserState(session.Player)));
@@ -1544,7 +1814,7 @@ namespace DfoServer.Network.Handlers
             {
                 if (!CanContinueTownProjection(session, projectionGuard))
                     return;
-                await session.SendPacketAsync(packet);
+                await SendTownProjectionPacketAsync(session, projectionGuard, packet);
             }
 
             if (packets.Length > 0)
@@ -1672,19 +1942,46 @@ namespace DfoServer.Network.Handlers
             }
         }
 
-        private async Task SendTownAccountStateAsync(
+        private async Task<bool> SendTownAccountStateAsync(
             EnhancedClientSession session,
             string reason,
             TownProjectionGuard projectionGuard)
         {
             if (!CanContinueTownProjection(session, projectionGuard))
-                return;
+                return false;
             var accountId = session?.Account?.AccountId ?? 0;
             var characterId = session?.Player?.CharacterId ?? 0;
             if (accountId <= 0 || characterId <= 0)
-                return;
+                return false;
 
             var summary = _honorLevel.LoadSummary(accountId);
+            if (!CanContinueTownProjection(session, projectionGuard))
+                return false;
+            if (projectionGuard.AuthorizedReturnCurrent != null)
+            {
+                async Task SendCurrentAsync(byte[] packet)
+                {
+                    if (!await TrySendTownProjectionPacketAsync(session, projectionGuard, packet))
+                        throw new OperationCanceledException("Town return source expired before write.");
+                }
+                var sent = await UserInfoBroadcastService.SendSubtype0Async(
+                    session.Player, accountId,
+                    body => SendCurrentAsync(GamePacketEnvelopeBuilder.Build(0,
+                        (ushort)NotiPacketTypeA21.USERINFO, body)),
+                    _characterRepository, _subtype0Repository, _honorLevel,
+                    $"{reason} subtype0", summary);
+                if (!sent || !CanContinueTownProjection(session, projectionGuard))
+                    return false;
+                try
+                {
+                    await _honorLevel.SendInfoAsync(session, ProtocolName, reason, summary, SendCurrentAsync);
+                }
+                catch (OperationCanceledException) when (!CanContinueTownProjection(session, projectionGuard))
+                {
+                    return false;
+                }
+                return CanContinueTownProjection(session, projectionGuard);
+            }
             await UserInfoBroadcastService.SendSubtype0Async(
                 session,
                 _characterRepository,
@@ -1693,17 +1990,18 @@ namespace DfoServer.Network.Handlers
                 $"{reason} subtype0",
                 summary);
             if (!CanContinueTownProjection(session, projectionGuard))
-                return;
+                return false;
 
             await _honorLevel.SendInfoAsync(session, ProtocolName, reason, summary);
+            return CanContinueTownProjection(session, projectionGuard);
         }
 
         private static bool CanContinueTownProjection(
             EnhancedClientSession session,
             TownProjectionGuard projectionGuard)
         {
-            if (projectionGuard.RaidReturnCurrent != null)
-                return projectionGuard.RaidReturnCurrent();
+            if (projectionGuard.AuthorizedReturnCurrent != null)
+                return projectionGuard.AuthorizedReturnCurrent();
 
             if (projectionGuard.Selection != null)
             {
@@ -1716,6 +2014,31 @@ namespace DfoServer.Network.Handlers
                 || Dungeon.DungeonRunLifecycle.CanProjectTownState(
                     session,
                     projectionGuard.EndedRun);
+        }
+
+        private static async Task SendTownProjectionPacketAsync(
+            EnhancedClientSession session, TownProjectionGuard guard, byte[] packet)
+        {
+            await TrySendTownProjectionPacketAsync(session, guard, packet);
+        }
+
+        private static async Task<bool> TrySendTownProjectionPacketAsync(
+            EnhancedClientSession session, TownProjectionGuard guard, byte[] packet)
+        {
+            if (guard.AuthorizedReturnCurrent == null)
+            {
+                await session.SendPacketAsync(packet);
+                return true;
+            }
+            var prepared = false;
+            await session.SendPreparedPacketBatchAsync(() =>
+            {
+                if (!CanContinueTownProjection(session, guard))
+                    return Array.Empty<byte[]>();
+                prepared = true;
+                return new[] { packet };
+            });
+            return prepared;
         }
 
         internal static byte[] BuildUserLeavePacket(ushort userId)
@@ -1791,7 +2114,7 @@ namespace DfoServer.Network.Handlers
 
             var player = session.Player;
             var generation = player.CurrentDungeonRunGeneration;
-            var guard = TownProjectionGuard.ForRaidReturn(Current);
+            var guard = TownProjectionGuard.ForAuthorizedReturn(Current);
             if (!Current())
                 return true;
             await session.SendPacketAsync(BuildReturnToTownSuccessPacket(packetType));

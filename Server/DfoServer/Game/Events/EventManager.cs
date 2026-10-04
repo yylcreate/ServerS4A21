@@ -1,6 +1,7 @@
 using System;
 using DfoServer.Game.Events.DailyAttendanceAnytime;
 using DfoServer.Game.Events.FatigueAcceleration;
+using DfoServer.Game.Events.GuardianAltar;
 using DfoServer.Game.Events.Joust;
 using DfoServer.Game.Events.PcRoomTimePoint;
 using DfoServer.Game.Events.TotalAttendance;
@@ -21,12 +22,18 @@ namespace DfoServer.Game.Events
 
         internal IGameDatabase Database { get; }
 
+        internal GuardianAltarOpeningService GuardianAltarOpening { get; } = new();
+
         internal FatigueAccelerationEntryService FatigueAccelerationEntry { get; }
 
         internal void Initialize()
         {
             FatigueAccelerationEntry.Initialize(Environment.GetEnvironmentVariable(
                 FatigueAccelerationEntryService.EntryEnvironmentVariable));
+
+            if (!GuardianAltarOpening.TryConfigureEnvironment(out var openingError))
+                FileLogger.Log("[GuardianAltarEntry] invalid entry-only window; disabled: "
+                    + openingError);
 
             var joustConfig = JoustConfigProvider.Instance;
             joustConfig.Warmup();

@@ -1548,6 +1548,63 @@ CREATE TABLE IF NOT EXISTS character_npc_favor (
 );
 CREATE INDEX IF NOT EXISTS idx_character_npc_favor_daily
     ON character_npc_favor(character_id, gift_day_id);
+
+-- 守护者祭坛角色进度。首次角色初始化与每日免费票据替换由领域 Service
+-- 在同一事务提交；这些持久事实不属于入口排期或普通副本 runtime。
+CREATE TABLE IF NOT EXISTS character_guardian_altar (
+    character_id INTEGER NOT NULL REFERENCES characters(character_id) ON DELETE CASCADE,
+    ridable_id INTEGER NOT NULL CHECK(ridable_id BETWEEN 1 AND 2147483647),
+    free_tickets INTEGER NOT NULL CHECK(free_tickets BETWEEN 0 AND 2147483647),
+    secondary_tickets INTEGER NOT NULL CHECK(secondary_tickets BETWEEN 0 AND 2147483647),
+    stage_stars INTEGER NOT NULL CHECK(stage_stars BETWEEN 0 AND 2147483647),
+    other_stars INTEGER NOT NULL CHECK(other_stars BETWEEN 0 AND 2147483647),
+    available_stars INTEGER NOT NULL CHECK(available_stars BETWEEN 0 AND 2147483647),
+    survival_best_phase INTEGER NOT NULL CHECK(survival_best_phase BETWEEN 0 AND 32767),
+    star_reset_count INTEGER NOT NULL CHECK(star_reset_count BETWEEN 0 AND 32767),
+    reserved28 INTEGER NOT NULL CHECK(reserved28 BETWEEN 0 AND 4294967295),
+    menu_hint_flag INTEGER NOT NULL CHECK(menu_hint_flag IN (0, 1)),
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY(character_id, ridable_id),
+    CHECK(free_tickets + secondary_tickets <= 2147483647),
+    CHECK(stage_stars + other_stars <= 2147483647),
+    CHECK(available_stars <= stage_stars + other_stars)
+);
+CREATE TABLE IF NOT EXISTS character_guardian_altar_stages (
+    character_id INTEGER NOT NULL,
+    ridable_id INTEGER NOT NULL,
+    dungeon_id INTEGER NOT NULL CHECK(dungeon_id BETWEEN 1 AND 2147483647),
+    progress INTEGER NOT NULL CHECK(progress BETWEEN -1 AND 2147483647),
+    PRIMARY KEY(character_id, ridable_id, dungeon_id),
+    FOREIGN KEY(character_id, ridable_id) REFERENCES character_guardian_altar(character_id, ridable_id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS character_guardian_altar_purchases (
+    character_id INTEGER NOT NULL,
+    ridable_id INTEGER NOT NULL,
+    shop_type INTEGER NOT NULL CHECK(shop_type BETWEEN 0 AND 2),
+    resource_id INTEGER NOT NULL CHECK(resource_id BETWEEN 1 AND 2147483647),
+    level INTEGER NOT NULL CHECK(level BETWEEN 0 AND 32767),
+    price INTEGER NOT NULL CHECK(price BETWEEN 0 AND 32767),
+    PRIMARY KEY(character_id, ridable_id, shop_type, resource_id),
+    FOREIGN KEY(character_id, ridable_id) REFERENCES character_guardian_altar(character_id, ridable_id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS character_guardian_altar_slots (
+    character_id INTEGER NOT NULL,
+    ridable_id INTEGER NOT NULL,
+    slot_type INTEGER NOT NULL CHECK(slot_type BETWEEN 1 AND 2),
+    slot_index INTEGER NOT NULL CHECK(slot_index BETWEEN 0 AND 5),
+    locked INTEGER NOT NULL CHECK(locked IN (0, 1)),
+    resource_id INTEGER NOT NULL CHECK(resource_id BETWEEN 0 AND 2147483647),
+    PRIMARY KEY(character_id, ridable_id, slot_type, slot_index),
+    FOREIGN KEY(character_id, ridable_id) REFERENCES character_guardian_altar(character_id, ridable_id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS character_guardian_altar_achievements (
+    character_id INTEGER NOT NULL,
+    ridable_id INTEGER NOT NULL,
+    achievement_id INTEGER NOT NULL CHECK(achievement_id BETWEEN 1 AND 2147483647),
+    claimed INTEGER NOT NULL CHECK(claimed IN (0, 1)),
+    PRIMARY KEY(character_id, ridable_id, achievement_id),
+    FOREIGN KEY(character_id, ridable_id) REFERENCES character_guardian_altar(character_id, ridable_id) ON DELETE CASCADE
+);
 CREATE TRIGGER IF NOT EXISTS guild_member_prevent_soft_delete
 BEFORE UPDATE OF delete_flag ON characters
 WHEN NEW.delete_flag <> 0 AND EXISTS (

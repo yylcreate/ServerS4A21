@@ -6,6 +6,15 @@ namespace DfoServer.Game.Dungeon
 {
     public static class DungeonRunTimerKeys
     {
+        public static readonly RunTimerKey GuardianAltarWaveSchedule =
+            new RunTimerKey("guardian-altar", "wave-schedule");
+
+        public static readonly RunTimerKey GuardianAltarClearPresentation =
+            new RunTimerKey("guardian-altar", "clear-presentation");
+
+        public static readonly RunTimerKey GuardianAltarReturnToTown =
+            new RunTimerKey("guardian-altar", "return-to-town");
+
         public static readonly RunTimerKey ElevatorStage =
             new RunTimerKey("elevator", "stage");
 
