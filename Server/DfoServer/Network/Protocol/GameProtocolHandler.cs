@@ -77,6 +77,8 @@ namespace DfoServer.Network
         private readonly IGameDatabase _database;
         private readonly GameProtocolWorldDependencies _worldDependencies;
         private readonly bool _ownsWorldDependencies;
+        private readonly GuardianAltarOpeningCoordinator _guardianAltarOpening;
+        private readonly bool _ownsGuardianAltarOpening;
         private readonly GameProtocolSocialHandlers _socialHandlers;
         private readonly GameCommandRegistry _cmdDispatch;
 
@@ -147,6 +149,7 @@ namespace DfoServer.Network
                     udpRelay,
                     pvpUdpRelay,
                     inventory.InventoryRefreshSender);
+            _ownsGuardianAltarOpening = featureHandlers == null;
             featureHandlers ??= ServerRuntimeBuilder
                 .CreateGameProtocolFeatureHandlers(
                     core,
@@ -220,6 +223,9 @@ namespace DfoServer.Network
                 featureHandlers.EventDailyAttendanceAnytime;
             _eventTotalAttendanceHandler = featureHandlers.EventTotalAttendance;
             _npcFavorHandler = featureHandlers.NpcFavor;
+            _guardianAltarOpening = featureHandlers.GuardianAltarOpening;
+            _guardianAltarOpening?.ConfigureDungeonEntry(_dungeonHandler,
+                _socialHandlers.Trade.HasActiveTrade, _worldDependencies.MercenaryRestrictions);
             _pvpChannelInfoHandler = socialHandlers.PvpChannelInfo;
             _pvpRoomHandler = socialHandlers.PvpRoom;
             _characterSessionLifecycle = characterSessionLifecycle;
@@ -283,10 +289,20 @@ namespace DfoServer.Network
             });
             _cmdDispatch.RegisterGroup("event-joust", RegisterEventJoustHandlers);
             _cmdDispatch.RegisterGroup("npc-favor", _npcFavorHandler.RegisterHandlers);
+            if (_guardianAltarOpening != null)
+            {
+                _cmdDispatch.RegisterGroup("guardian-altar-entry", handlers =>
+                    _guardianAltarOpening.RegisterEntryHandlers(handlers,
+                        _socialHandlers.Trade.HasActiveTrade,
+                        _worldDependencies.MercenaryRestrictions));
+                _cmdDispatch.RegisterGroup("guardian-altar-runtime", _dungeonHandler.RegisterGuardianAltarRuntimeHandlers);
+            }
         }
 
         public void Dispose()
         {
+            if (_ownsGuardianAltarOpening)
+                _guardianAltarOpening?.Dispose();
             _socialHandlers.Dispose();
             if (_ownsWorldDependencies)
                 _worldDependencies.Dispose();
@@ -703,7 +719,7 @@ namespace DfoServer.Network
         private void RegisterDungeonHandlers(GameCommandRegistry.GameCommandRegistrationGroup d)
         {
             d[0x000F] = _dungeonHandler.Handle_ENUM_CMDPACKET_ENTER_SELECT_DUNGEON;
-            d[0x0010] = _dungeonHandler.Handle_ENUM_CMDPACKET_SELECT_DUNGEON;
+            d[(ushort)CmdPacketTypeA21.SELECT_DUNGEON] = _dungeonHandler.Handle_ENUM_CMDPACKET_SELECT_DUNGEON;
             d[(ushort)CmdPacketTypeA21.CRACK_OF_DIMENSION] =
                 _dungeonHandler.Handle_ENUM_CMDPACKET_CRACK_OF_DIMENSION;
             d[(ushort)CmdPacketTypeA21.REQUEST_CIRCLE_ENTER] =
@@ -785,7 +801,7 @@ namespace DfoServer.Network
             d[(ushort)CmdPacketTypeA21.FINISH_LOADING] =
                 _dungeonLoading.HandleFinishLoadingAsync;
             d[0x002A] = _dungeonLoading.HandleGiveupGameAsync;
-            d[0x0084] = (s, h, b) => HandleRaidAwareDungeonExit(s, h, b, _townHandler.Handle_ENUM_CMDPACKET_GIVEUP_GAME, "back-to-village");
+            d[(ushort)CmdPacketTypeA21.BACK_2_VILLAGE] = HandleBackToVillageAsync;
             d[0x00ED] = _townHandler.Handle_ENUM_CMDPACKET_TELEPORT;
             d[(ushort)CmdPacketTypeA21.GET_PCROOM_TIME_POINT_ITEM] =
                 _eventPcRoomTimePointHandler.HandleAsync;
@@ -797,6 +813,17 @@ namespace DfoServer.Network
                 _townHandler.Handle_ENUM_CMDPACKET_PARTY_TELEPORT;
             d[(ushort)CmdPacketTypeA21.SOLO_TELEPOART] =
                 _townHandler.Handle_ENUM_CMDPACKET_SOLO_TELEPOART;
+        }
+
+        private async Task HandleBackToVillageAsync(
+            EnhancedClientSession session, GamePacketHeader header, byte[] body)
+        {
+            if (_guardianAltarOpening != null
+                && await _guardianAltarOpening.TryHandleMenuReturnAsync(
+                    session, header, body, _townHandler.ProjectGuardianMenuReturnAsync))
+                return;
+            await HandleRaidAwareDungeonExit(session, header, body,
+                _townHandler.Handle_ENUM_CMDPACKET_GIVEUP_GAME, "back-to-village");
         }
 
         private void RegisterSettingsHandlers(GameCommandRegistry.GameCommandRegistrationGroup d)

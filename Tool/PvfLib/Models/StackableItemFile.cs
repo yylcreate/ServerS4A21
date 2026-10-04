@@ -196,6 +196,7 @@ namespace PvfLib
         public int LotteryUseNeedItemCount { get; set; }
         public int CoolTime { get; set; } = -1;
         public string CooltimeGroup { get; set; }
+        public int? AdvanceAltarNeedGage { get; set; }
         public bool HasCooltimeMaintenance { get; set; }
         public bool HasEffectMaintenance { get; set; }
         public int StatChangeDurationMilliseconds { get; set; } = -1;
@@ -364,6 +365,18 @@ namespace PvfLib
                     }
                     case "cool time": stk.CoolTime = ParseInt(data); break;
                     case "cooltime group": stk.CooltimeGroup = data; break;
+                    case "advance altar need gage":
+                    {
+                        // A missing scalar remains null; a present definition
+                        // must not become a fabricated zero-cost summon.
+                        GuardianAltarScriptReader.SingleChild(root, "advance altar need gage");
+                        GuardianAltarScriptReader.RequireLeaf(node);
+                        var needGage = GuardianAltarScriptReader.SingleInteger(node, content);
+                        if (needGage < 0)
+                            throw new InvalidOperationException("Advance Altar need gage must be non-negative");
+                        stk.AdvanceAltarNeedGage = needGage;
+                        break;
+                    }
                     case "cooltime maintenance": stk.HasCooltimeMaintenance = true; break;
                     case "effect maintenance": stk.HasEffectMaintenance = true; break;
                     case "stat change duration": ParseStatChangeDuration(data, stk); break;

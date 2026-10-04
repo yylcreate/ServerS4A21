@@ -28,6 +28,7 @@ namespace DfoServer.Game.Dungeon
         ImpossibleParty = 1,
         ImpossibleSolo = 2,
         Licensed = 3,
+        GuardianAltar = 4,
     }
 
     public sealed class DungeonDropPolicy
@@ -47,6 +48,8 @@ namespace DfoServer.Game.Dungeon
         // Licensed dungeons use their dedicated ETC reward projection. Their
         // ordinary monster, world, area and independent drop pools are closed.
         public static DungeonDropPolicy Licensed { get; } =
+            new DungeonDropPolicy(DungeonMonsterDropSource.None);
+        public static DungeonDropPolicy GuardianAltar { get; } =
             new DungeonDropPolicy(DungeonMonsterDropSource.None);
 
         private DungeonDropPolicy(DungeonMonsterDropSource allowedSources)
@@ -110,5 +113,9 @@ namespace DfoServer.Game.Dungeon
                 sourcePath,
                 DungeonDropDefinitionKind.Licensed,
                 DungeonDropPolicy.Licensed);
+
+        internal static DungeonDropDefinition CreateGuardianAltar(int dungeonId)
+            => new DungeonDropDefinition(dungeonId, -1, -1, string.Empty,
+                DungeonDropDefinitionKind.GuardianAltar, DungeonDropPolicy.GuardianAltar);
     }
 }

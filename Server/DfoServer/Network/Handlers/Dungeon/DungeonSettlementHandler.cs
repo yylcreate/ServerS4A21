@@ -30,6 +30,11 @@ namespace DfoServer.Network.Handlers.Dungeon
             _bloodAltarClearedProjection;
         private Func<EnhancedClientSession, GamePacketHeader, byte[], Task<bool>>
             _bloodAltarEplpHandler;
+        private Func<EnhancedClientSession, GamePacketHeader, byte[], Task<bool>> _guardianAltarEplpHandler;
+
+        internal void ConfigureGuardianAltarEplp(
+            Func<EnhancedClientSession, GamePacketHeader, byte[], Task<bool>> handler)
+            => _guardianAltarEplpHandler = handler ?? throw new ArgumentNullException(nameof(handler));
 
         private const int SetPlayResultRankPointOffset = 10;
         // 成长之契约经验加成从 PVF premiumlist_new.etc 读取(PremiumEffectProvider)。
@@ -2242,6 +2247,9 @@ namespace DfoServer.Network.Handlers.Dungeon
 
         internal async Task HandleEplpCommand(EnhancedClientSession session, GamePacketHeader header, byte[] body)
         {
+            if (_guardianAltarEplpHandler != null
+                && await _guardianAltarEplpHandler(session, header, body))
+                return;
             if (await _svc.DeathTower.TryHandleEplpCommandAsync(
                     session,
                     header,

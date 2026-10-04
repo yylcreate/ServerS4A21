@@ -34,6 +34,27 @@ namespace DfoServer.Network
 
         public GameSession GameSession { get; set; }
 
+        // Only a pending client projection. Ordinary skill/item ownership stays
+        // in the existing repositories and the session-owned InventoryLease.
+        private GuardianAltarControlProjectionSource _guardianAltarControls;
+        internal GuardianAltarControlProjectionSource GuardianAltarControls
+        {
+            get => Volatile.Read(ref _guardianAltarControls);
+            set => Volatile.Write(ref _guardianAltarControls, value);
+        }
+
+        internal bool TryCompleteGuardianControlsRestore(GuardianAltarControlProjectionSource source)
+            => ReferenceEquals(Interlocked.CompareExchange(ref _guardianAltarControls, null, source), source);
+
+        internal bool TryReplaceGuardianControlsSource(GuardianAltarControlProjectionSource source,
+            GuardianAltarControlProjectionSource replacement)
+            => source != null && replacement != null && ReferenceEquals(
+                Interlocked.CompareExchange(ref _guardianAltarControls, replacement, source), source);
+
+        internal sealed record GuardianAltarControlProjectionSource(
+            GameSession Generation, AccountRecord Account, int CharacterId, int AccountId, ushort UserId,
+            long RunGeneration, long SelectionGeneration, bool ActivityReleasePending = false);
+
         // 玩家当前打开的收集箱 PVF [Index] 值(0388请求体末尾字节, 见 CollectionBoxHandler)
         public int SelectedCollectionBoxIndex { get; set; }
 
@@ -98,19 +119,21 @@ namespace DfoServer.Network
             }
         }
 
-        internal Task SendPreparedPacketBatchAsync(Func<IReadOnlyList<byte[]>> prepare)
+        internal Task SendPreparedPacketBatchAsync(Func<IReadOnlyList<byte[]>> prepare,
+            Func<bool> canWritePacket = null)
         {
             return SendPreparedPacketBatchCoreAsync(_sendLock, prepare, packet =>
             {
                 PacketFileLogger.Log("SEND", packet);
                 return Stream.WriteAsync(packet, 0, packet.Length);
-            });
+            }, canWritePacket);
         }
 
         internal static async Task SendPreparedPacketBatchCoreAsync(
             SemaphoreSlim sendLock,
             Func<IReadOnlyList<byte[]>> prepare,
-            Func<byte[], Task> writePacket)
+            Func<byte[], Task> writePacket,
+            Func<bool> canWritePacket = null)
         {
             ArgumentNullException.ThrowIfNull(sendLock);
             ArgumentNullException.ThrowIfNull(prepare);
@@ -121,7 +144,11 @@ namespace DfoServer.Network
                 var packets = prepare()
                     ?? throw new InvalidOperationException("Packet batch preparation returned null");
                 foreach (var packet in packets)
+                {
+                    if (canWritePacket != null && !canWritePacket())
+                        throw new OperationCanceledException("Prepared packet batch source expired before write.");
                     await writePacket(packet);
+                }
             }
             finally
             {

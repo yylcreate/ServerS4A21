@@ -5,6 +5,7 @@ using DfoServer.Game.Events.RecommendedDungeons;
 using DfoServer.Game.Events.TotalAttendance;
 using DfoServer.Game.Mercenary;
 using DfoServer.Game.Quests;
+using DfoServer.Game.Session;
 using DfoServer.Game.SelectCharacter;
 using DfoServer.Infrastructure;
 using DfoServer.Network.Builders;
@@ -27,6 +28,7 @@ namespace DfoServer.Network.Handlers
         private readonly TournamentDungeonCoordinator _tournament;
         private readonly BloodAltarDungeonCoordinator _bloodAltar;
         private readonly DungeonTutorialHandler _tutorial;
+        private GuardianAltarDungeonCoordinator _guardianAltar;
 
         public DungeonHandler(
             Game.ReviveCoin.ReviveCoinService reviveCoinService,
@@ -142,9 +144,54 @@ namespace DfoServer.Network.Handlers
                 DungeonRoomIdentity, Task> rejected)
             => _map.ConfigureLoadingProjectionStarted(callback, rejected);
 
+        internal void ConfigureGuardianAltarEntry(
+            Game.Events.GuardianAltar.GuardianAltarOpeningService opening,
+            Game.Events.GuardianAltar.IGuardianAltarProgressService progress,
+            Func<Game.Events.GuardianAltar.GuardianAltarMenuDefinition> definition,
+            CharacterTransitionCoordinator transitions,
+            Func<EnhancedClientSession, bool> hasTrade,
+            IMercenaryRestrictionService mercenaries,
+            Func<EnhancedClientSession, DungeonRunIdentity, Func<bool>, Func<Task<bool>>, Task> returnToStageSelection = null)
+        {
+            if (_guardianAltar != null)
+                throw new InvalidOperationException("Guardian dungeon entry has already been configured.");
+            _guardianAltar = new GuardianAltarDungeonCoordinator(opening, progress, definition,
+                _services.Sessions, transitions, _services.InstanceRegistry, hasTrade, mercenaries,
+                uid => _services.PartyManager?.GetPartyByUser(uid) != null,
+                _map.RegisterDedicatedLoadingProjection,
+                async (session, identity) => await _services.TownReturn.ReturnAsync(session, identity),
+                onEntered: async (session, identity) =>
+                {
+                    if (!session.Player.IsCurrentDungeonRun(identity)) return;
+                    var anchor = session.Player.CurrentRun.TownReturnAnchor;
+                    await TownAreaRosterDepartureNotifier.NotifyOldAreaDepartureAsync(_services.Sessions,
+                        session, anchor.TownId, anchor.AreaId);
+                    if (session.Player.IsCurrentDungeonRun(identity))
+                        await Game.Friends.UnitedFriendSystem.NotifyUserStateChanged(session, _services.Sessions);
+                }, persistentEffects: _services.PersistentEffects);
+            if (returnToStageSelection != null)
+                _guardianAltar.ConfigureStageSelectionReturn((session, identity, current) =>
+                    returnToStageSelection(session, identity, current,
+                        () => _services.TownReturn.ReturnAsync(session, identity)));
+            _combat.ConfigureGuardianAltar(_guardianAltar.TryCompleteAsync,
+                _guardianAltar.TryHandleCenterDeathAsync, _guardianAltar.TryHandleCharacterDeathAsync,
+                _guardianAltar.TryRejectUseCoinAsync);
+            _settlement.ConfigureGuardianAltarEplp(_guardianAltar.TryHandleEplpCommandAsync);
+        }
+
+        internal void RegisterGuardianAltarRuntimeHandlers(GameCommandRegistry.GameCommandRegistrationGroup handlers)
+            => _guardianAltar?.RegisterRuntimeHandlers(handlers);
+
+        internal void OnGuardianAltarLoadingReleased(DungeonRun run,
+            DungeonRoomIdentity room, long loadingGeneration)
+            => GuardianAltarDungeonCoordinator.OnLoadingReleased(run, room, loadingGeneration);
+
         internal void ConfigureTownPresenceProjection(
             Func<EnhancedClientSession, DungeonRunIdentity, Task> projection)
             => _services.TownReturn.ConfigureTownPresenceProjection(projection);
+
+        internal Task<bool> RestoreGuardianControlsAsync(EnhancedClientSession session, Func<bool> current)
+            => _services.ProgressNotifications.RestoreGuardianControlsAsync(session, current);
 
         internal void ConfigureRejectedPartySelectionReturn(
             Func<EnhancedClientSession, DungeonSelectionContext, Task> callback)
@@ -156,8 +203,12 @@ namespace DfoServer.Network.Handlers
         public Task Handle_ENUM_CMDPACKET_ENTER_SELECT_DUNGEON(EnhancedClientSession session, GamePacketHeader header, byte[] body)
             => _entry.HandleEnterSelectDungeon(session, header, body);
 
-        public Task Handle_ENUM_CMDPACKET_SELECT_DUNGEON(EnhancedClientSession session, GamePacketHeader header, byte[] body)
-            => _entry.HandleSelectDungeon(session, header, body);
+        public async Task Handle_ENUM_CMDPACKET_SELECT_DUNGEON(EnhancedClientSession session, GamePacketHeader header, byte[] body)
+        {
+            if (_guardianAltar != null && await _guardianAltar.TryHandleSelectDungeonAsync(session, header, body))
+                return;
+            await _entry.HandleSelectDungeon(session, header, body);
+        }
 
         public Task Handle_ENUM_CMDPACKET_CRACK_OF_DIMENSION(EnhancedClientSession session, GamePacketHeader header, byte[] body)
             => _entry.HandleCrackOfDimension(session, header, body);

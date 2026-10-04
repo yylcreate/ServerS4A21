@@ -6,6 +6,9 @@ namespace DfoServer.Game.Dungeon
 {
     internal sealed class DungeonDynamicActorPolicy
     {
+        internal static readonly DungeonDynamicActorPolicy GuardianAltar =
+            new(false, false, false, false, false, false, false);
+
         internal static readonly DungeonDynamicActorPolicy BloodAltar =
             new DungeonDynamicActorPolicy(
                 grantsMonsterExperience: false,

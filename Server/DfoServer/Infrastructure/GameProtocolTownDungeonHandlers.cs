@@ -18,6 +18,7 @@ namespace DfoServer.Infrastructure
             Dungeon = dungeon ?? throw new ArgumentNullException(nameof(dungeon));
             Dungeon.ConfigureTownPresenceProjection(
                 Town.ProjectDungeonTownPresenceAsync);
+            Town.ConfigureGuardianControlsRestore(Dungeon.RestoreGuardianControlsAsync);
             Dungeon.ConfigureRejectedPartySelectionReturn(
                 Town.ReturnRejectedPartySelectionToTownAsync);
         }

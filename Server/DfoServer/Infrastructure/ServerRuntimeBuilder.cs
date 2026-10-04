@@ -4,6 +4,7 @@ using DfoServer.Game.Characters;
 using DfoServer.Game.DailyReset;
 using DfoServer.Game.Dungeon;
 using DfoServer.Game.Events;
+using DfoServer.Game.Events.GuardianAltar;
 using DfoServer.Game.Events.DailyAttendanceAnytime;
 using DfoServer.Game.Events.Joust;
 using DfoServer.Game.Events.PcRoomTimePoint;
@@ -806,7 +807,19 @@ namespace DfoServer.Infrastructure
                 new EventTotalAttendanceHandler(
                     inventory.TotalAttendance);
 
-            return new GameProtocolFeatureHandlers(
+            var guardianDefinition = new Lazy<GuardianAltarMenuDefinition>(GuardianAltarMenuDefinition.Load);
+            var guardianProgress = new GuardianAltarProgressService(core.Database,
+                core.DailyResetService, () => guardianDefinition.Value,
+                inventory.MailboxService);
+            core.DungeonPersistentEffects.BindGuardianAltarProgressService(guardianProgress);
+            var guardianAltarOpening = new GuardianAltarOpeningCoordinator(
+                core.EventManager.GuardianAltarOpening,
+                world.Sessions,
+                world.CharacterTransitions,
+                ClockService.Instance,
+                progress: guardianProgress, definition: () => guardianDefinition.Value);
+
+            var handlers = new GameProtocolFeatureHandlers(
                 lotteryItem,
                 new PetCreatureHandler(
                     core.SelectCharacterDataSource,
@@ -866,7 +879,10 @@ namespace DfoServer.Infrastructure
                 eventTotalAttendanceHandler,
                 new NpcFavorHandler(
                     core.Database,
-                    inventory.InventoryRefreshSender));
+                    inventory.InventoryRefreshSender),
+                guardianAltarOpening);
+            guardianAltarOpening.Start();
+            return handlers;
         }
 
         internal CharacterSessionLifecycleCoordinator
@@ -982,7 +998,8 @@ namespace DfoServer.Infrastructure
                 socialHandlers.PvpRoom,
                 inventory.InventoryRefreshSender,
                 core.Database,
-                core.DailyResetService);
+                core.DailyResetService,
+                featureHandlers.GuardianAltarOpening);
         }
 
         public void Dispose()
@@ -991,6 +1008,7 @@ namespace DfoServer.Infrastructure
                 return;
 
             _disposed = true;
+            _gameProtocolFeatureHandlers?.GuardianAltarOpening?.Dispose();
             _gameProtocolSocialHandlers?.Dispose();
             _gameProtocolWorld?.Dispose();
         }
