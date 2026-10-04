@@ -323,9 +323,17 @@ namespace DfoServer.SelfTests
                     packet.Command == 0
                     && packet.Type == (ushort)NotiPacketTypeA21.EQUIPMENT_RENTAL_LIST)
                 && !initSequence.Exists(packet =>
-                    packet.Command == 0 && packet.Type == 0x0357)
-                && !initSequence.Exists(packet =>
-                    packet.Command == 0 && packet.Type == 0x019D),
+                    packet.Command == 0 && packet.Type == 0x0357),
+                ref failures);
+            var eventInfoIndex = initSequence.FindIndex(packet =>
+                packet.Command == 0 && packet.Type == (ushort)NotiPacketTypeA21.EVENT_INFO);
+            var seriaGaugeIndex = initSequence.FindIndex(packet =>
+                packet.Command == 0 && packet.Type == (ushort)NotiPacketTypeA21.BOOSTER_GAGE);
+            Check(
+                "A21 select-character init projects Seria luck gauge exactly once after EVENT_INFO",
+                eventInfoIndex >= 0 && seriaGaugeIndex == eventInfoIndex + 1
+                && initSequence.Count(packet => packet.Command == 0
+                    && packet.Type == (ushort)NotiPacketTypeA21.BOOSTER_GAGE) == 1,
                 ref failures);
 
             var enterFirst = EnterSelectDungeonStateBuilder

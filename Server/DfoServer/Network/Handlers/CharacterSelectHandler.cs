@@ -91,7 +91,8 @@ namespace DfoServer.Network.Handlers
             IMercenaryRestrictionService mercenaryRestrictions = null,
             IGameDatabase database = null,
             DailyResetService dailyResetService = null,
-            MailboxService mailboxService = null)
+            MailboxService mailboxService = null,
+            Game.Events.SeriaLuck.SeriaLuckUiService seriaLuckUi = null)
         {
             _database = database ?? GameDatabase.CreateDefault();
             _selectCharacterDataSource = selectCharacterDataSource ?? throw new ArgumentNullException(nameof(selectCharacterDataSource));
@@ -111,7 +112,7 @@ namespace DfoServer.Network.Handlers
             _pvpSkillRepository = new Game.Skills.SqlitePvpSkillRepository(
                 _database);
             _initPacketBuilders = new Network.Builders.InitPacketBuilderRegistry(
-                _database, _sessions);
+                _database, _sessions, seriaLuckUi);
             if (mailboxService != null)
             {
                 _questAssistantGifts = new QuestAssistantGiftService(

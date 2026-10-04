@@ -95,6 +95,7 @@ namespace DfoServer
             ("--selftest-item-purchase-limit", SelfTests.ItemPurchaseLimitSelfTest.Run),
             ("--selftest-lottery-item", SelfTests.LotteryItemSelfTest.Run),
             ("--selftest-magic-box-protocol", SelfTests.MagicBoxProtocolSelfTest.Run),
+            ("--selftest-seria-luck-ui", SelfTests.SeriaLuckUiSelfTest.Run),
             ("--selftest-gold-limit", SelfTests.GoldLimitSelfTest.Run),
             ("--selftest-friends", SelfTests.UnitedFriendSystemSelfTest.Run),
             ("--selftest-a21-one-to-one-chat", SelfTests.A21OneToOneChatSelfTest.Run),
