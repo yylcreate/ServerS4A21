@@ -42,7 +42,7 @@ namespace DfoServer.Network.Builders
 
             Register(new SkillInfoBodyBuilder());              
             Register(new DarkKnightComboSkillInfoBodyBuilder());
-            Register(new QuestListBodyBuilder());              
+            Register(new QuestListBodyBuilder(_database));
             Register(new UserInfoBodyBuilder());
             Register(new UserStateInitBodyBuilder());
             Register(new Pvp.PvpRecordBodyBuilder(_database));

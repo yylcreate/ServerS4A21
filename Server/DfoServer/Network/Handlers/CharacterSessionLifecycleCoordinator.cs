@@ -518,6 +518,7 @@ namespace DfoServer.Network.Handlers
                     if (_eventDungeons != null)
                         await _eventDungeons
                             .NotifyStateOnLoginWhileTransitionHeldAsync(session);
+                    await _townHandler.ProjectAccountDungeonCountsAsync(session);
                     // 上线 hook：初始好友列表已由 init 包流下发
                     // （UnitedServerFriendInfoBodyBuilder），这里只做单向推送——
                     // 0x0112 进入频道 + 同频道补发 0x0111 归零频道文字 + USERINFO 实体。

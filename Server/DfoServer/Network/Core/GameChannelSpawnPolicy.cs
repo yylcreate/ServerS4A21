@@ -62,7 +62,14 @@ namespace DfoServer.Network
         public static GameChannelSpawn Resolve(
             int listenerGamePort,
             int persistedTownId)
+            => Resolve(listenerGamePort, persistedTownId, Town.IsPositionSaveExcluded);
+
+        internal static GameChannelSpawn Resolve(
+            int listenerGamePort,
+            int persistedTownId,
+            Func<int, int, bool> isPositionSaveExcluded)
         {
+            ArgumentNullException.ThrowIfNull(isPositionSaveExcluded);
             if (TryResolveTransientSpawn(listenerGamePort, out var transientSpawn))
                 return transientSpawn;
 
@@ -75,6 +82,16 @@ namespace DfoServer.Network
             if (gate.Town <= 0)
                 throw new InvalidOperationException(
                     $"Town {townId} has no Seria-room gate.");
+
+            // Selection already resolves a Seria-room gate, rather than loading
+            // the persisted area's coordinates. Check that actual destination
+            // without excluding other normal areas in the same town.
+            if (isPositionSaveExcluded(gate.Town, gate.Area))
+            {
+                gate = Town.GetCeraRoomInfo(NormalTownFallbackId);
+                if (gate.Town <= 0 || isPositionSaveExcluded(gate.Town, gate.Area))
+                    throw new InvalidOperationException("The normal fallback has no persistable Seria-room gate.");
+            }
 
             return new GameChannelSpawn(
                 gate.Town,
@@ -160,11 +177,12 @@ namespace DfoServer.Network
             return targetTownId != Channel100TownId && targetTownId != PvpTownId;
         }
 
-        public static bool ShouldPersistPosition(int listenerGamePort)
+        public static bool ShouldPersistPosition(int listenerGamePort, int townId, int areaId)
         {
             return !GameNetworkConfig.IsPvpListener(listenerGamePort)
                    && !GameNetworkConfig.IsChannel100Listener(listenerGamePort)
-                   && !GameNetworkConfig.IsRaidListener(listenerGamePort);
+                   && !GameNetworkConfig.IsRaidListener(listenerGamePort)
+                   && !Town.IsPositionSaveExcluded(townId, areaId);
         }
     }
 }

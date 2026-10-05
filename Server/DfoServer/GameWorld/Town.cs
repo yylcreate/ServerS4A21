@@ -21,12 +21,46 @@ namespace DfoServer.GameWorld
 
     public class Town
     {
+        private static readonly Lazy<VillageSaveConfigFile> PositionSaveDefinition =
+            new Lazy<VillageSaveConfigFile>(() =>
+            {
+                const string path = "etc/serverparameter_chn.etc";
+                var definition = VillageSaveConfigFile.Parse(PvfArchiveAccessor.ReadText(path));
+                if (!definition.IsValid)
+                    throw new InvalidDataException($"{path}: {definition.InvalidReason}");
+                return definition;
+            });
+
+        internal static bool IsPositionSaveExcluded(int townId, int areaId)
+            => PositionSaveDefinition.Value.IsExcluded(townId, areaId);
+
         private static readonly object DungeonGateReturnCacheSync = new object();
         private static readonly Dictionary<long, CeraRoomInfo?> DungeonGateReturnCache =
             new Dictionary<long, CeraRoomInfo?>();
         private static readonly object AreaPermissionCacheSync = new object();
         private static readonly Dictionary<long, TownPermission> AreaPermissionCache =
             new Dictionary<long, TownPermission>();
+
+        internal static bool TryGetArea(int townId, int areaId, out TownArea area)
+        {
+            area = null;
+            try
+            {
+                var townEntry = LstFile.Parse(PvfArchiveAccessor.ReadText("town/town.lst"))?.GetById(townId);
+                if (townEntry == null || string.IsNullOrWhiteSpace(townEntry.FilePath))
+                    return false;
+                var town = TownFile.Parse(PvfArchiveAccessor.ReadText(Path.Combine("town", townEntry.FilePath)));
+                area = town.Areas.SingleOrDefault(candidate => candidate.Id == areaId);
+                if (area == null || string.IsNullOrWhiteSpace(area.MapPath))
+                    return false;
+                return true;
+            }
+            catch (Exception exception)
+            {
+                FileLogger.Log($"[TownArea] resource lookup failed town={townId}:{areaId}: {exception.Message}");
+                return false;
+            }
+        }
 
         public static bool TryGetAreaPermission(
             int townId,

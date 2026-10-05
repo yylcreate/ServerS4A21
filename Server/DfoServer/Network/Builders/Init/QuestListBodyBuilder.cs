@@ -1,4 +1,5 @@
 using DfoServer.Game.SelectCharacter;
+using DfoServer.Game.Events;
 using DfoServer.Game.Quests;
 using DfoServer.Game.Inventory;
 using DfoServer.Game.KnightShield;
@@ -11,6 +12,15 @@ namespace DfoServer.Network.Builders
 {
     public sealed class QuestListBodyBuilder : IInitPacketBuilder
     {
+        private readonly GameEventRepository _events;
+
+        public QuestListBodyBuilder() : this(GameDatabase.CreateDefault()) { }
+
+        internal QuestListBodyBuilder(IGameDatabase database)
+        {
+            _events = new GameEventRepository(database);
+        }
+
         public ushort NotiType => (ushort)NotiPacketTypeA21.ACCEPTABLE_QUEST_LIST;
 
         public bool TryBuild(SelectCharacterDataSnapshot snapshot, int occurrenceIndex, out byte[] body)
@@ -34,7 +44,12 @@ namespace DfoServer.Network.Builders
                     ? PetCreatureEvolutionRuntimeService.LoadEligiblePetCreatureEvolutionQuestKinds(lease.Inventory)
                     : null;
 
-            body = BuildBody(level, job, growType, clearedFlags, allowedCreatureKinds);
+            init.EventInfoSnapshot ??= _events.LoadEventInfoSnapshot();
+            var advertisedEventIds = new HashSet<int>();
+            foreach (var entry in init.EventInfoSnapshot.Events)
+                advertisedEventIds.Add(entry.EventId);
+            body = BuildBody(level, job, growType, clearedFlags,
+                allowedCreatureKinds, advertisedEventIds);
             return true;
         }
 
@@ -49,6 +64,15 @@ namespace DfoServer.Network.Builders
             int growType,
             Dictionary<int, int> clearedFlags,
             ISet<int> allowedCreatureKinds)
+            => BuildBody(level, job, growType, clearedFlags, allowedCreatureKinds, null);
+
+        public static byte[] BuildBody(
+            int level,
+            int job,
+            int growType,
+            Dictionary<int, int> clearedFlags,
+            ISet<int> allowedCreatureKinds,
+            ISet<int> advertisedEventIds)
         {
             var clearedSet = new HashSet<int>(clearedFlags.Keys);
             var questIds = GameWorld.QuestData.ComputeAcceptableQuests(
@@ -57,14 +81,16 @@ namespace DfoServer.Network.Builders
                 growType,
                 clearedSet,
                 clearedFlags,
-                allowedCreatureKinds);
+                allowedCreatureKinds,
+                advertisedEventIds);
             AppendGuardianShieldOpenQuests(
                 questIds,
                 level,
                 job,
                 growType,
                 clearedSet,
-                clearedFlags);
+                clearedFlags,
+                advertisedEventIds);
 
             var writer = new GamePacketWriter();
             writer.WriteByte((byte)level);
@@ -81,7 +107,8 @@ namespace DfoServer.Network.Builders
             int job,
             int growType,
             HashSet<int> clearedSet,
-            Dictionary<int, int> clearedFlags)
+            Dictionary<int, int> clearedFlags,
+            ISet<int> advertisedEventIds)
         {
             if (job != KnightShieldDataProvider.GuardianJob)
                 return;
@@ -107,7 +134,8 @@ namespace DfoServer.Network.Builders
                     continue;
 
                 var quest = QuestCatalog.Get(openQuestId);
-                if (quest == null || quest.IsEvent)
+                if (!QuestEventAvailabilityPolicy.IsAvailable(quest,
+                        eventId => advertisedEventIds?.Contains(eventId) == true))
                     continue;
                 if (!QuestRelationIndex.MeetsCharacterRestrictions(
                         openQuestId,

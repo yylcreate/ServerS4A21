@@ -3,6 +3,7 @@ using DfoServer.Game.CharacterData;
 using DfoServer.Game.Characters;
 using DfoServer.Game.Dungeon;
 using DfoServer.Game.Friends;
+using DfoServer.Game.Events.EpicRoad;
 using DfoServer.Game.Inventory;
 using DfoServer.Game.Quests;
 using DfoServer.Game.SelectCharacter;
@@ -2667,9 +2668,7 @@ namespace DfoServer.Network.Handlers.Dungeon
             // The first A21 tutorial is a normal flow regardless of the
             // dungeon id selected by the character's job. Ignore stale hell
             // flags so they cannot alter its map projection.
-            run.HellMode = !isA21TutorialEntry
-                && req.HellPartyRequestFlag != 0
-                && DungeonData.IsHellDungeon(req.DungeonId);
+            run.HellMode = ShouldUseManualHellParty(req.DungeonId, isA21TutorialEntry, req.HellPartyRequestFlag);
 
             WarmUpDropConfigs(run.HellMode);
 
@@ -2884,7 +2883,7 @@ namespace DfoServer.Network.Handlers.Dungeon
             // Recheck the absolute opening and party state after asynchronous
             // run preparation, before either existing debit owner commits.
             var eventCommitFailure = string.Empty;
-            var eventSourceCurrent = !_svc.EventDungeons.IsManagedDungeon(run.DungeonId)
+            var eventSourceCurrent = !IsManagedEventDungeon(run.DungeonId)
                 || (ReferenceEquals(session.Player, eventEntryPlayer)
                     && ReferenceEquals(session.Account, eventEntryAccount)
                     && ReferenceEquals(session.GameSession, eventEntryGameSession)
@@ -3137,6 +3136,8 @@ namespace DfoServer.Network.Handlers.Dungeon
             if (_svc.EventDungeons.IsManagedDungeon(run.DungeonId)
                 && _svc.EventDungeonCountsChanged != null)
                 await _svc.EventDungeonCountsChanged(session);
+            if (run.DungeonId == EpicRoadEntryService.DungeonId && _svc.AccountDungeonCountsChanged != null)
+                await _svc.AccountDungeonCountsChanged(session);
             if (!session.Player.IsCurrentDungeonRun(runIdentity))
                 return;
 
@@ -4012,6 +4013,15 @@ namespace DfoServer.Network.Handlers.Dungeon
             out string reason)
         {
             reason = string.Empty;
+            if (request.DungeonId == EpicRoadEntryService.DungeonId)
+            {
+                if (!TryValidateEpicRoadEntry(session, request.Difficulty, out var epicDifficulty, out reason))
+                    return false;
+                request = new SelectDungeonRequest(request.DungeonId, epicDifficulty,
+                    request.Flag1, request.Flag2, request.A21Sentinel,
+                    request.TrailingLength, request.HasNonZeroTrailingBytes);
+                return true;
+            }
             if (!_svc.EventDungeons.IsManagedDungeon(request.DungeonId))
                 return true;
             if (!TryValidateEventDungeonEntry(session, request.DungeonId,
@@ -4027,6 +4037,9 @@ namespace DfoServer.Network.Handlers.Dungeon
             EnhancedClientSession session, DungeonRun run, out string reason)
         {
             reason = string.Empty;
+            if (run.DungeonId == EpicRoadEntryService.DungeonId)
+                return TryValidateEpicRoadEntry(session, run.Difficulty, out var epicDifficulty, out reason)
+                    && run.Difficulty == epicDifficulty;
             if (!_svc.EventDungeons.IsManagedDungeon(run.DungeonId))
                 return true;
             return TryValidateEventDungeonEntry(session, run.DungeonId,
@@ -4036,6 +4049,47 @@ namespace DfoServer.Network.Handlers.Dungeon
             static bool FailDifficulty(out string failure)
             {
                 failure = "designated_difficulty_changed";
+                return false;
+            }
+        }
+
+        private bool IsManagedEventDungeon(int dungeonId)
+            => dungeonId == EpicRoadEntryService.DungeonId || _svc.EventDungeons.IsManagedDungeon(dungeonId);
+
+        internal static bool ShouldUseManualHellParty(int dungeonId, bool isTutorial, byte requestFlag)
+            // This activity's hell actors belong to its native Boss MAPs.
+            // The WDM hell icon does not define a manual party room/ticket.
+            => !isTutorial && dungeonId != EpicRoadEntryService.DungeonId
+                && requestFlag != 0 && DungeonData.IsHellDungeon(dungeonId);
+
+        private bool TryValidateEpicRoadEntry(EnhancedClientSession session, byte requestedDifficulty,
+            out byte difficulty, out string reason)
+        {
+            difficulty = 0;
+            reason = "epic_road_unavailable";
+            var player = session?.Player;
+            var service = _svc.EpicRoadEntry;
+            if (player == null || service == null || !service.TryValidateDungeon(player.Level,
+                    _svc.PartyManager?.GetPartyByUser(player.UserId)?.Count ?? 1,
+                    player.CurTownId, player.CurAreaId, requestedDifficulty, out difficulty, out reason))
+                return false;
+            try
+            {
+                var cleared = new QuestRepository(_svc.ConnectionString).LoadClearedFlags(player.CharacterId);
+                reason = TownAreaPermissionPolicy.GetDenyReason(service.Definition.TargetPermission,
+                    player.Level, quest => cleared.ContainsKey(quest));
+                if (reason != null)
+                    return false;
+                return AccountDungeonCountProjection.TryCreate(EpicRoadEntryService.DungeonId,
+                    service.Definition.AccountMaximumCount,
+                    _svc.EntryLimits.LoadSpecialDungeonLimits(session.Account?.AccountId ?? 0, player.CharacterId),
+                    out _, out reason);
+            }
+            catch (Exception exception) when (exception is Microsoft.Data.Sqlite.SqliteException
+                or InvalidOperationException or System.IO.IOException)
+            {
+                FileLogger.Log($"[EpicRoad] entry state unavailable cid={player.CharacterId}: {exception.Message}");
+                reason = "epic_road_entry_state_unavailable";
                 return false;
             }
         }
@@ -4641,13 +4695,13 @@ namespace DfoServer.Network.Handlers.Dungeon
                 return true;
             }
 
-            if (!_svc.EntryLimits.TryConsumeSpecialDungeonLimit(
-                    accountId,
-                    characterId,
-                    entryLimitDungeonId,
-                    1,
-                    out var result)
-                || result?.Allowed != true)
+            DungeonEntryLimitConsumeResult result;
+            var consumed = entryLimitDungeonId == EpicRoadEntryService.DungeonId
+                ? _svc.EntryLimits.TryConsumeAccountDungeonLimit(accountId, characterId,
+                    entryLimitDungeonId, _svc.EpicRoadEntry?.Definition.AccountMaximumCount ?? 0, out result)
+                : _svc.EntryLimits.TryConsumeSpecialDungeonLimit(accountId, characterId,
+                    entryLimitDungeonId, 1, out result);
+            if (!consumed || result?.Allowed != true)
             {
                 FileLogger.Log(
                     $"[{DungeonSharedServices.ProtocolLogName}] " +

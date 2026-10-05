@@ -180,14 +180,14 @@ namespace DfoServer.SelfTests
                         && LoginPacketBuilder.BuildLoginSuccess(port)[3] == environment
                         && !LoginHandler.IsListenerAdmissionAllowed(port, false)
                         && LoginHandler.IsListenerAdmissionAllowed(port, true)
-                        && !GameChannelSpawnPolicy.ShouldPersistPosition(port),
+                        && !GameChannelSpawnPolicy.ShouldPersistPosition(port, GameChannelSpawnPolicy.PvpTownId, 0),
                         ref failures);
                 }
                 Check(
                     "A21 disabled PvP removes its listeners without changing normal login",
                     GameNetworkConfig.BuildGameChannels(includeFreeDuel: false).Count == 16
                     && LoginPacketBuilder.BuildLoginSuccess(10011)[3] == GameNetworkConfig.GeneralChannelEnvironment
-                    && GameChannelSpawnPolicy.ShouldPersistPosition(10011),
+                    && GameChannelSpawnPolicy.ShouldPersistPosition(10011, GameChannelSpawnPolicy.NormalTownFallbackId, 1),
                     ref failures);
                 CheckPvpLobbyInitialization(ref failures);
             }

@@ -355,14 +355,16 @@ namespace DfoServer.GameWorld
             int growType,
             HashSet<int> clearedQuestIds,
             Dictionary<int, int> clearedFlags,
-            ISet<int> allowedCreatureKinds)
+            ISet<int> allowedCreatureKinds,
+            ISet<int> advertisedEventIds = null)
             => QuestRelationIndex.ComputeAcceptableQuests(
                 characterLevel,
                 characterJob,
                 growType,
                 clearedQuestIds,
                 clearedFlags,
-                allowedCreatureKinds);
+                allowedCreatureKinds,
+                advertisedEventIds);
 
 
         public static List<int> GetCollisionQuests(int questId)

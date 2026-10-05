@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 
 namespace PvfLib
 {
@@ -92,6 +93,8 @@ namespace PvfLib
         public bool IsAccountQuest { get; set; }
         public bool IgnoreQuestLevel4Exp { get; set; }
         public bool IsEvent { get; set; }
+        public int ShowQuestOnEventId { get; private set; } = -1;
+        public bool IsEventVisibilityValid { get; private set; } = true;
         public int CreatureKind { get; set; } = -1;
         public int CreatureLevel { get; set; } = -1;
         public int ExpertJobType { get; set; } = -1;
@@ -107,6 +110,7 @@ namespace PvfLib
 
             var root = new ScriptParser().Parse(content);
             var qst = new QuestFile { Root = root, Content = content };
+            var hasEventVisibility = false;
 
             foreach (var node in root.Children)
             {
@@ -194,6 +198,29 @@ namespace PvfLib
                     case "account quest": qst.IsAccountQuest = true; break;
                     case "ignore quest level 4 exp": qst.IgnoreQuestLevel4Exp = true; break;
                     case "event": if (ParseInt(data) != 0) qst.IsEvent = true; break;
+                    case "show quest on event":
+                        var eventTokens = new List<string>();
+                        var quotedEventId = false;
+                        foreach (var item in node.DataItems)
+                        {
+                            var eventData = item.GetContent(content);
+                            quotedEventId |= eventData.Contains('`');
+                            eventTokens.AddRange(ScriptValueTokenizer.Tokenize(eventData));
+                        }
+                        if (hasEventVisibility || eventTokens.Count != 1
+                            || quotedEventId || node.Children.Count != 0
+                            || !int.TryParse(eventTokens[0], NumberStyles.None,
+                                CultureInfo.InvariantCulture, out var eventId)
+                            || eventId <= 0 || eventId > ushort.MaxValue)
+                        {
+                            qst.IsEventVisibilityValid = false;
+                        }
+                        else
+                        {
+                            qst.ShowQuestOnEventId = eventId;
+                        }
+                        hasEventVisibility = true;
+                        break;
                     case "creature kind": qst.CreatureKind = ParseInt(data); break;
                     case "creature level": qst.CreatureLevel = ParseInt(data); break;
                     case "expertjob level":
