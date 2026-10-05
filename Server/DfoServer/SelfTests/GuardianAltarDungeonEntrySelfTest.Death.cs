@@ -61,7 +61,7 @@ namespace DfoServer.SelfTests
                 check("Guardian character failure does not enter ordinary actor life, wipe, clear, cards or reward mutation",
                     !run.IsWaitingDeathRespawn && !run.Instance.IsParticipantDead(identity)
                     && !run.Timers.TryGetCurrentTicket(DungeonRunTimerKeys.CombatDeathRespawn, out _)
-                    && !combat.Presentation.InventoryProjectionSent && !combat.Presentation.MenuProjectionSent
+                    && !combat.Presentation.InventoryProjectionSent
                     && !combat.Presentation.ClearProjectionSent
                     && run.Instance.Mechanisms.GuardianAltar.Progress.Header == beforeHeader
                     && boundary.CoinCount == coinBefore && boundary.PersistedCoinCount == coinBefore

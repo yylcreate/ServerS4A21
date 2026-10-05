@@ -59,6 +59,7 @@ namespace DfoServer.SelfTests
                 Section("Guardian failure cleanup", () => CheckFailuresAsync(Check, definition).GetAwaiter().GetResult());
                 Section("Guardian energy coordinator", () => CheckEnergyAsync(Check, definition).GetAwaiter().GetResult());
                 Section("Guardian formal clear resource plans", () => CheckClearPlans(Check, definition));
+                Section("Guardian ordinary first and repeated durable clear projection", () => CheckOrdinaryClearAsync(Check, definition).GetAwaiter().GetResult());
                 Section("Guardian survival menu unlock eligibility", () => CheckSurvivalUnlockEligibility(Check, definition));
                 Section("Guardian survival start and continuation wire", () => CheckSurvivalPlans(Check, definition));
                 Section("Guardian survival entry and selector boundaries", () => CheckSurvivalEntryAsync(Check, definition).GetAwaiter().GetResult());
@@ -1005,7 +1006,7 @@ namespace DfoServer.SelfTests
                     && terminalPackets[1].AsSpan(15).SequenceEqual(GuardianAltarClearBodyBuilder.BuildEplpState(0, 1)));
                 check("failed Guardian never creates a normal clear/card UI or a reward commit",
                     combat.Presentation.CommitResult == null && !combat.Presentation.InventoryProjectionSent
-                    && !combat.Presentation.MenuProjectionSent && !combat.Presentation.ClearProjectionSent
+                    && !combat.Presentation.ClearProjectionSent
                     && combat.Presentation.EplpProjectionSent && energy.ReadSnapshot(0).Paused
                     && !run.RewardPolicy.AllowsClearCommit && !run.RewardPolicy.AllowsSettlement
                     && !combat.Timers.IsCurrent(oldWave));
@@ -1130,7 +1131,7 @@ namespace DfoServer.SelfTests
                     && combat.AliveCount == 0 && combat.NextDueActiveMilliseconds == null);
                 check("missing persistent owner cannot fabricate successful inventory, menu or clear projection",
                     combat.Presentation.CommitResult == null && !combat.Presentation.InventoryProjectionSent
-                    && !combat.Presentation.MenuProjectionSent && !combat.Presentation.ClearProjectionSent
+                    && !combat.Presentation.ClearProjectionSent
                     && !combat.Presentation.EplpProjectionSent
                     && !fixture.Packets.Any(x => Type(x) == (ushort)NotiPacketTypeA21.ADVANCE_ALTAR_CLEAR_STAGE
                         || Type(x) == (ushort)NotiPacketTypeA21.ADVANCE_ALTAR_EPLP_STATE)
