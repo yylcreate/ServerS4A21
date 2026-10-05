@@ -88,6 +88,27 @@ namespace DfoServer.SelfTests
                 !ConsumeClearArrays(body[..^1])
                 && !ConsumeClearArrays(body[..25].Concat(new byte[3]).Concat(body[25..]).ToArray()));
 
+            // R019 local first-clear capture: the normal result includes its
+            // gained stars and newly unlocked unit without a menu snapshot.
+            var firstRewards = new[] {
+                new GuardianAltarClearRewardRow(0, 2749211, 4),
+                new GuardianAltarClearRewardRow(0, 10006059, 1) };
+            var firstClear = GuardianAltarClearBodyBuilder.BuildClearStage(
+                NormalHeader with { AwardedStars = 3 }, firstRewards,
+                new[] { new GuardianAltarPurchase(0, 3000, 1, 0) },
+                Array.Empty<GuardianAltarAchievement>());
+            check("normal first clear retains the captured 73-byte reward and unlock result",
+                firstClear.SequenceEqual(Convert.FromHexString(
+                    "00000000000000000000000000B70D00000000000003000000"
+                    + "02000000000000001BF3290004000000000000002BAE980001000000"
+                    + "0100000000000000B80B00000100000000000000"))
+                && ConsumeClearArrays(firstClear));
+            var repeatedClear = Clear(NormalHeader, firstRewards);
+            check("normal replay retains rewards without awarding stars or redisplaying unlocks",
+                repeatedClear.Length == 61 && Int32(repeatedClear, 21) == 0
+                && UInt32(repeatedClear, 25) == 2 && UInt32(repeatedClear, 53) == 0
+                && UInt32(repeatedClear, 57) == 0 && ConsumeClearArrays(repeatedClear));
+
             var wide = Clear(NormalHeader with { AwardedStars = int.MaxValue }, new[] {
                 new GuardianAltarClearRewardRow(0, int.MaxValue, int.MaxValue) });
             check("positive Int32 reward and stars fields are not truncated to words or bytes",

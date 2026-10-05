@@ -43,7 +43,6 @@ namespace DfoServer.SelfTests
             check("unbound presentation cannot commit rewards or advance a projection checkpoint",
                 runtime.Fact == null && runtime.CommitResult == null
                 && !runtime.TryCommit(Result()) && !runtime.TryMarkInventoryProjectionSent(fact.EventId)
-                && !runtime.TryMarkMenuProjectionSent(fact.EventId)
                 && !runtime.TryMarkClearProjectionSent(fact.EventId, now)
                 && !runtime.TryMarkEplpProjectionSent(fact.EventId, now));
             var invalid = new[]
@@ -71,10 +70,9 @@ namespace DfoServer.SelfTests
                     !runtime.TryBind(candidate) && ReferenceEquals(fact, runtime.Fact));
             check("success without a committed result cannot authorize any UI projection",
                 !runtime.TryCommit(null) && !runtime.TryMarkInventoryProjectionSent(fact.EventId)
-                && !runtime.TryMarkMenuProjectionSent(fact.EventId)
                 && !runtime.TryMarkClearProjectionSent(fact.EventId, now)
                 && !runtime.TryMarkEplpProjectionSent(fact.EventId, now)
-                && !runtime.InventoryProjectionSent && !runtime.MenuProjectionSent
+                && !runtime.InventoryProjectionSent
                 && !runtime.ClearProjectionSent && !runtime.EplpProjectionSent);
             check("structurally incomplete commit result cannot enable a fake successful presentation",
                 !runtime.TryCommit(new GuardianAltarClearCommitResult())
@@ -95,19 +93,13 @@ namespace DfoServer.SelfTests
             var now = Utc();
             runtime.TryBind(fact);
             runtime.TryCommit(Result());
-            check("ordinary success still requires the committed menu projection before CLEAR",
-                runtime.RequiresMenuProjection);
-            check("successful menu, clear and EPLP projections wait for the earlier checkpoint",
-                !runtime.TryMarkMenuProjectionSent(fact.EventId)
-                && !runtime.TryMarkClearProjectionSent(fact.EventId, now)
+            check("successful clear and EPLP projections wait for committed inventory delivery",
+                !runtime.TryMarkClearProjectionSent(fact.EventId, now)
                 && !runtime.TryMarkEplpProjectionSent(fact.EventId, now)
                 && runtime.EplpDeadlineUtc == default && runtime.ReturnDeadlineUtc == default);
-            check("inventory write completion enables only the next menu checkpoint",
+            check("inventory write completion enables CLEAR without rebuilding the active run's menu",
                 runtime.TryMarkInventoryProjectionSent(fact.EventId) && runtime.InventoryProjectionSent
-                && !runtime.TryMarkClearProjectionSent(fact.EventId, now)
-                && !runtime.TryMarkEplpProjectionSent(fact.EventId, now));
-            check("menu write completion enables clear but cannot skip clear into EPLP",
-                runtime.TryMarkMenuProjectionSent(fact.EventId) && runtime.MenuProjectionSent
+                && !runtime.ClearProjectionSent
                 && !runtime.TryMarkEplpProjectionSent(fact.EventId, now));
             check("first clear projection freezes the four-second EPLP deadline",
                 runtime.TryMarkClearProjectionSent(fact.EventId, now) && runtime.ClearProjectionSent
@@ -125,11 +117,10 @@ namespace DfoServer.SelfTests
             check("duplicate EPLP completion preserves return time and prior checkpoints remain monotonic",
                 runtime.TryMarkEplpProjectionSent(fact.EventId, now.AddMinutes(3))
                 && runtime.TryMarkInventoryProjectionSent(fact.EventId)
-                && runtime.TryMarkMenuProjectionSent(fact.EventId)
                 && runtime.TryMarkClearProjectionSent(fact.EventId, now.AddMinutes(3))
                 && runtime.ReturnDeadlineUtc == now.AddSeconds(54)
                 && runtime.EplpDeadlineUtc == now.AddSeconds(4)
-                && runtime.InventoryProjectionSent && runtime.MenuProjectionSent && runtime.ClearProjectionSent);
+                && runtime.InventoryProjectionSent && runtime.ClearProjectionSent);
         }
 
         private static void CheckFailure(Action<string, bool> check)
@@ -138,14 +129,12 @@ namespace DfoServer.SelfTests
             var fact = Fact(GuardianAltarTerminalResult.Failed);
             var now = Utc();
             runtime.TryBind(fact);
-            check("ordinary failure does not require a successful menu projection", !runtime.RequiresMenuProjection);
             check("failure needs no reward commit and cannot acquire a successful result",
                 runtime.TryCommit(null) && !runtime.TryCommit(Result()) && runtime.CommitResult == null);
-            check("failure cannot record inventory, menu or clear projections",
+            check("failure cannot record inventory or clear projections",
                 !runtime.TryMarkInventoryProjectionSent(fact.EventId)
-                && !runtime.TryMarkMenuProjectionSent(fact.EventId)
                 && !runtime.TryMarkClearProjectionSent(fact.EventId, now)
-                && !runtime.InventoryProjectionSent && !runtime.MenuProjectionSent && !runtime.ClearProjectionSent);
+                && !runtime.InventoryProjectionSent && !runtime.ClearProjectionSent);
             check("failed battle projects EPLP directly without a fabricated clear deadline",
                 runtime.TryMarkEplpProjectionSent(fact.EventId, now) && runtime.EplpProjectionSent
                 && runtime.EplpDeadlineUtc == default && runtime.ReturnDeadlineUtc == now.AddSeconds(50));
@@ -173,11 +162,8 @@ namespace DfoServer.SelfTests
                 && !runtime.TryMarkEplpProjectionSent(fact.EventId, now));
             check("survival result preserves the frozen score and rejects an ordinary successful star result",
                 !runtime.TryCommit(Result()) && runtime.TryCommit(result)
-                && !runtime.RequiresMenuProjection
                 && !runtime.TryMarkClearProjectionSent(fact.EventId, now)
                 && runtime.TryMarkInventoryProjectionSent(fact.EventId)
-                && !runtime.TryMarkMenuProjectionSent(fact.EventId)
-                && !runtime.MenuProjectionSent
                 && runtime.TryMarkClearProjectionSent(fact.EventId, now));
             check("survival result has the existing clear-to-EPLP deadline and repeats do not restart it",
                 !runtime.TryMarkEplpProjectionSent(fact.EventId, now.AddMilliseconds(3999))
@@ -208,15 +194,13 @@ namespace DfoServer.SelfTests
                 var now = Utc();
                 check($"survival {terminal}/{rounds} requires its committed result and inventory before CLEAR",
                     runtime.TryBind(fact, survivalResult: true)
-                    && !runtime.RequiresMenuProjection && !runtime.TryMarkMenuProjectionSent(fact.EventId)
                     && !runtime.TryMarkClearProjectionSent(fact.EventId, now)
                     && runtime.TryCommit(commit)
                     && !runtime.TryMarkClearProjectionSent(fact.EventId, now)
                     && runtime.TryMarkInventoryProjectionSent(fact.EventId)
                     && runtime.TryMarkClearProjectionSent(fact.EventId, now));
-                check($"survival {terminal}/{rounds} cannot invent a menu checkpoint or restart result deadlines",
-                    !runtime.TryMarkMenuProjectionSent(fact.EventId) && !runtime.MenuProjectionSent
-                    && !runtime.TryMarkClearProjectionSent(Guid.NewGuid(), now)
+                check($"survival {terminal}/{rounds} cannot accept a stale event or restart result deadlines",
+                    !runtime.TryMarkClearProjectionSent(Guid.NewGuid(), now)
                     && runtime.TryMarkClearProjectionSent(fact.EventId, now.AddSeconds(2))
                     && runtime.EplpDeadlineUtc == now.AddSeconds(4)
                     && !runtime.TryMarkEplpProjectionSent(fact.EventId, now.AddSeconds(3))
@@ -236,19 +220,18 @@ namespace DfoServer.SelfTests
             runtime.TryBind(fact);
             runtime.TryCommit(committed);
             runtime.TryMarkInventoryProjectionSent(fact.EventId);
-            check("an unrecorded failed menu write leaves the saved commit and inventory checkpoint for retry",
+            check("an unrecorded failed CLEAR write leaves the saved commit and inventory checkpoint for retry",
                 ReferenceEquals(runtime.CommitResult, committed) && runtime.InventoryProjectionSent
-                && !runtime.MenuProjectionSent && !runtime.ClearProjectionSent && !runtime.EplpProjectionSent);
+                && !runtime.ClearProjectionSent && !runtime.EplpProjectionSent);
             var stale = Guid.NewGuid();
             check("stale event cannot advance any checkpoint or establish a deadline",
-                !runtime.TryMarkInventoryProjectionSent(stale) && !runtime.TryMarkMenuProjectionSent(stale)
+                !runtime.TryMarkInventoryProjectionSent(stale)
                 && !runtime.TryMarkClearProjectionSent(stale, now)
                 && !runtime.TryMarkEplpProjectionSent(stale, now)
-                && runtime.InventoryProjectionSent && !runtime.MenuProjectionSent
+                && runtime.InventoryProjectionSent
                 && runtime.EplpDeadlineUtc == default && runtime.ReturnDeadlineUtc == default);
-            runtime.TryMarkMenuProjectionSent(fact.EventId);
             check("retry resumes after the earlier completed inventory checkpoint without losing commit authority",
-                runtime.InventoryProjectionSent && runtime.MenuProjectionSent && !runtime.ClearProjectionSent
+                runtime.InventoryProjectionSent && !runtime.ClearProjectionSent
                 && runtime.TryMarkClearProjectionSent(fact.EventId, now));
             var deadline = runtime.EplpDeadlineUtc;
             check("EPLP write retry keeps its original due time and does not resend or reset successful clear",
@@ -273,7 +256,6 @@ namespace DfoServer.SelfTests
             runtime.TryBind(fact);
             runtime.TryCommit(Result());
             runtime.TryMarkInventoryProjectionSent(fact.EventId);
-            runtime.TryMarkMenuProjectionSent(fact.EventId);
             var unspecified = DateTime.SpecifyKind(now, DateTimeKind.Unspecified);
             var local = DateTime.SpecifyKind(now, DateTimeKind.Local);
             check("implicit or local dates cannot create UTC presentation deadlines",

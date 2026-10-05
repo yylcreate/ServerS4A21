@@ -146,17 +146,12 @@ namespace DfoServer.Network.Handlers.Dungeon
                         }
                         if (!presentation.TryMarkInventoryProjectionSent(fact.EventId)) return;
                     }
-                    // UPDATE_RIDABLE rebuilds the menu, purchases and deployed
-                    // controls. Survival has no unlock/purchase/star changes;
-                    // its result and available tickets are in CLEAR/EPLP.
-                    // Read the committed menu on the next real START_GAME,
-                    // instead of rebuilding those controls on a dead actor.
-                    if (presentation.RequiresMenuProjection && !presentation.MenuProjectionSent)
-                    {
-                        if (!await SendClearFrameAsync(session, NotiPacketTypeA21.ADVANCE_ALTAR_UPDATE_RIDABLE,
-                                GuardianAltarMenuBodyBuilder.BuildUpdateRidable(commit.ProgressSnapshot, 0), Current)) return;
-                        if (!presentation.TryMarkMenuProjectionSent(fact.EventId)) return;
-                    }
+                    // A21 UPDATE_RIDABLE reselects the first unfinished stage
+                    // and rebuilds selection, purchase and slot controls. A
+                    // first clear would select the next stage while this run's
+                    // result scene still owns the current stage. CLEAR carries
+                    // this result's stars and new purchases; the next START_GAME
+                    // reads the complete committed menu through its owner.
                     if (!presentation.ClearProjectionSent)
                     {
                         var body = GuardianAltarClearBodyBuilder.BuildClearStage(

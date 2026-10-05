@@ -12,7 +12,6 @@ namespace DfoServer.Game.Events.GuardianAltar
         private GuardianAltarClearCommitResult _commitResult;
         private bool _survivalResult;
         private bool _inventoryProjectionSent;
-        private bool _menuProjectionSent;
         private bool _clearProjectionSent;
         private bool _eplpProjectionSent;
         private DateTime _eplpDeadlineUtc;
@@ -21,10 +20,6 @@ namespace DfoServer.Game.Events.GuardianAltar
         internal GuardianAltarTerminalFact Fact { get { lock (_syncRoot) return _fact; } }
         internal GuardianAltarClearCommitResult CommitResult { get { lock (_syncRoot) return _commitResult; } }
         internal bool InventoryProjectionSent { get { lock (_syncRoot) return _inventoryProjectionSent; } }
-        // Ordinary clear unlocks stages and purchases. Survival exposes score
-        // through CLEAR and reads the committed menu on the next START_GAME.
-        internal bool RequiresMenuProjection { get { lock (_syncRoot) return _fact?.Result == GuardianAltarTerminalResult.Succeeded && !_survivalResult; } }
-        internal bool MenuProjectionSent { get { lock (_syncRoot) return _menuProjectionSent; } }
         internal bool ClearProjectionSent { get { lock (_syncRoot) return _clearProjectionSent; } }
         internal bool EplpProjectionSent { get { lock (_syncRoot) return _eplpProjectionSent; } }
         internal DateTime EplpDeadlineUtc { get { lock (_syncRoot) return _eplpDeadlineUtc; } }
@@ -83,23 +78,11 @@ namespace DfoServer.Game.Events.GuardianAltar
             }
         }
 
-        internal bool TryMarkMenuProjectionSent(Guid eventId)
-        {
-            lock (_syncRoot)
-            {
-                if (!CanProjectSuccessLocked(eventId) || _survivalResult || !_inventoryProjectionSent)
-                    return false;
-                _menuProjectionSent = true;
-                return true;
-            }
-        }
-
         internal bool TryMarkClearProjectionSent(Guid eventId, DateTime utcNow)
         {
             lock (_syncRoot)
             {
                 if (!CanProjectSuccessLocked(eventId) || !_inventoryProjectionSent
-                    || (!_survivalResult && !_menuProjectionSent)
                     || utcNow.Kind != DateTimeKind.Utc)
                     return false;
                 if (_clearProjectionSent)

@@ -44,8 +44,7 @@ namespace DfoServer.SelfTests
                     && fixture.Run.Effects.GetState(fixture.EffectId) == DungeonEffectState.Committed
                     && fixture.RewardsMatch(scenario.Rounds));
                 check(label + " projects inventory then packed survival CLEAR without rebuilding the battle menu",
-                    presentation.InventoryProjectionSent && !presentation.RequiresMenuProjection
-                    && !presentation.MenuProjectionSent && presentation.ClearProjectionSent
+                    presentation.InventoryProjectionSent && presentation.ClearProjectionSent
                     && !presentation.EplpProjectionSent && fixture.ClearMatches(scenario.Rounds)
                     && fixture.Packets.All(packet => Type(packet) != (ushort)NotiPacketTypeA21.ADVANCE_ALTAR_UPDATE_RIDABLE)
                     && fixture.Packets.Select(Type).SequenceEqual((scenario.Center
@@ -79,7 +78,7 @@ namespace DfoServer.SelfTests
                 check(label + " releases controls once at the deadline using the committed remaining tickets",
                     fixture.Packets.Count == packetCount + 1 && presentation.EplpProjectionSent
                     && fixture.EplpMatches() && fixture.RewardsMatch(scenario.Rounds)
-                    && !presentation.MenuProjectionSent);
+                    && fixture.Packets.All(packet => Type(packet) != (ushort)NotiPacketTypeA21.ADVANCE_ALTAR_UPDATE_RIDABLE));
                 await fixture.Coordinator.TryCompleteAsync(fixture.Session, fixture.Run);
                 check(label + " repeated continuation cannot resend CLEAR/EPLP or consume another ticket",
                     fixture.Packets.Count == packetCount + 1 && fixture.RewardsMatch(scenario.Rounds));
@@ -105,7 +104,7 @@ namespace DfoServer.SelfTests
                     && fixture.Effects.Outbox.Get(fixture.EffectId).PayloadJson == frozen
                     && fixture.Effects.Outbox.Get(fixture.EffectId).State == DungeonPersistentEffectState.Committed
                     && fixture.RewardsMatch(6) && fixture.ClearMatches(6)
-                    && !fixture.Combat.Presentation.MenuProjectionSent);
+                    && fixture.Packets.All(packet => Type(packet) != (ushort)NotiPacketTypeA21.ADVANCE_ALTAR_UPDATE_RIDABLE));
             }
 
             foreach (var failedOpcode in new[] { NotiPacketTypeA21.UPDATE_ITEM_LIST,
@@ -125,7 +124,7 @@ namespace DfoServer.SelfTests
                 check("survival " + failedOpcode + " write failure cannot roll back a committed score or bypass its checkpoint",
                     fixture.WriteFailures == 1 && fixture.RewardsMatch(6)
                     && fixture.Effects.Outbox.Get(fixture.EffectId).State == DungeonPersistentEffectState.Committed
-                    && !presentation.MenuProjectionSent && !presentation.EplpProjectionSent
+                    && !presentation.EplpProjectionSent
                     && (failedOpcode == NotiPacketTypeA21.UPDATE_ITEM_LIST
                         ? !presentation.InventoryProjectionSent && !presentation.ClearProjectionSent
                         : presentation.InventoryProjectionSent
@@ -139,7 +138,8 @@ namespace DfoServer.SelfTests
                 check("survival " + failedOpcode + " retry resumes only unfinished projections over the same durable event",
                     ReferenceEquals(fact, fixture.Combat.TerminalFact) && fixture.RewardsMatch(6)
                     && fixture.Packets.Skip(before).Select(Type).SequenceEqual(expected)
-                    && presentation.ClearProjectionSent && !presentation.MenuProjectionSent);
+                    && presentation.ClearProjectionSent
+                    && fixture.Packets.All(packet => Type(packet) != (ushort)NotiPacketTypeA21.ADVANCE_ALTAR_UPDATE_RIDABLE));
             }
 
             foreach (var change in new[] { "loading generation", "session directory" })
@@ -179,6 +179,7 @@ namespace DfoServer.SelfTests
                 + Guid.NewGuid().ToString("N") + ".db");
             private readonly SemaphoreSlim _sendLock = new(1, 1);
             private readonly GuardianAltarMenuDefinition _definition;
+            private readonly bool _ordinaryMode;
             private readonly GameDatabase _database;
             private readonly GuardianAltarProgressService _progress;
             private readonly SqliteCharacterRepository _characters;
@@ -186,26 +187,32 @@ namespace DfoServer.SelfTests
             private InventoryLease _lease;
             private DungeonCombatHandler _handler;
             private GuardianAltarProgressSnapshot _before;
+            private long _runMonotonicStart;
             internal readonly Fixture Memory;
             internal readonly DungeonPersistentEffectApplicationService Effects;
             internal readonly GuardianAltarDungeonCoordinator Coordinator;
+            private readonly GuardianAltarOpeningCoordinator _ordinaryMenu;
+            private readonly GameCommandRegistry _ordinaryMenuRegistry = new();
             internal EnhancedClientSession Session;
             internal ushort? FailedOpcode;
             internal int WriteFailures;
             internal List<byte[]> Packets => Memory.Packets;
             internal DungeonRun Run => Memory.LastRun;
             internal GuardianAltarCombatRuntime Combat => Run.Instance.Mechanisms.GuardianAltarCombat;
-            private GuardianAltarDungeonStartPlan Plan => Run.Instance.Mechanisms.GuardianAltar;
+            internal GuardianAltarDungeonStartPlan Plan => Run.Instance.Mechanisms.GuardianAltar;
+            internal GuardianAltarProgressSnapshot Before => _before;
             internal DungeonEffectId EffectId => new(Combat.TerminalFact.EventId,
-                DungeonPersistentEffectKinds.GuardianAltarSurvivalCommit, DungeonEffectScope.Player, Run.RunId);
+                Plan.IsSurvival ? DungeonPersistentEffectKinds.GuardianAltarSurvivalCommit
+                    : DungeonPersistentEffectKinds.GuardianAltarClearCommit, DungeonEffectScope.Player, Run.RunId);
             internal int CoinCount => _lease.Inventory.GetMainVirtualCount(ReviveCoinService.WalletSlot)?.Count ?? 0;
             internal int PersistedCoinCount => _database.Read(connection =>
                 InventoryMainVirtualCountRepository.LoadCurrencyCount(connection, null,
                     Session.Player.CharacterId, ReviveCoinService.WalletSlot));
 
-            internal SurvivalDeathFixture(GuardianAltarMenuDefinition definition)
+            internal SurvivalDeathFixture(GuardianAltarMenuDefinition definition, bool ordinaryMode = false)
             {
                 _definition = definition;
+                _ordinaryMode = ordinaryMode;
                 Memory = new Fixture(definition);
                 Memory.Open();
                 _database = new GameDatabase(_path, ServerPaths.SchemaFilePath);
@@ -232,6 +239,15 @@ namespace DfoServer.SelfTests
                     }, utcNow: () => Memory.Now, send: (session, prepare) => SendAsync(session, prepare, () => true),
                     isGuardianDungeon: definition.ContainsDungeon, monotonicMilliseconds: () => Memory.MonotonicMilliseconds,
                     sendPause: SendAsync, combatClock: new ClockService(), persistentEffects: Effects);
+                if (_ordinaryMode)
+                {
+                    _ordinaryMenu = new GuardianAltarOpeningCoordinator(Memory.Opening, Memory.Sessions,
+                        Memory.Transitions, clock: null, utcNow: () => Memory.Now,
+                        sendBatch: (session, prepare) => SendAsync(session, prepare, () => true),
+                        progress: _progress, definition: () => definition);
+                    _ordinaryMenuRegistry.RegisterGroup("guardian-ordinary-clear-menu", group =>
+                        _ordinaryMenu.RegisterEntryHandlers(group, _ => false, Memory.Mercenary));
+                }
             }
 
             internal async Task EnterAsync(int characterId, int clearedRounds)
@@ -242,15 +258,18 @@ namespace DfoServer.SelfTests
                     TownId = Session.Player.CurTownId, AreaId = Session.Player.CurAreaId,
                     PosX = Session.Player.CurPosX, PosY = Session.Player.CurPosY });
                 var initial = _progress.LoadMenu(characterId, Memory.Now.UtcDateTime);
-                var catalog = SurvivalProgress(_definition, initial);
-                var ordinary = catalog.Stages.Where(stage => stage.Progress >= 0).ToArray();
-                foreach (var stage in ordinary)
-                    Sql("INSERT INTO character_guardian_altar_stages(character_id,ridable_id,dungeon_id,progress) "
-                        + $"VALUES({characterId},{_definition.RidableId},{stage.DungeonId},0) "
-                        + "ON CONFLICT(character_id,ridable_id,dungeon_id) DO UPDATE SET progress=excluded.progress;");
-                var stars = ordinary.Length * 3;
-                Sql($"UPDATE character_guardian_altar SET stage_stars={stars},available_stars={stars},menu_hint_flag=0 "
-                    + $"WHERE character_id={characterId};");
+                if (!_ordinaryMode)
+                {
+                    var catalog = SurvivalProgress(_definition, initial);
+                    var ordinary = catalog.Stages.Where(stage => stage.Progress >= 0).ToArray();
+                    foreach (var stage in ordinary)
+                        Sql("INSERT INTO character_guardian_altar_stages(character_id,ridable_id,dungeon_id,progress) "
+                            + $"VALUES({characterId},{_definition.RidableId},{stage.DungeonId},0) "
+                            + "ON CONFLICT(character_id,ridable_id,dungeon_id) DO UPDATE SET progress=excluded.progress;");
+                    var stars = ordinary.Length * 3;
+                    Sql($"UPDATE character_guardian_altar SET stage_stars={stars},available_stars={stars},menu_hint_flag=0 "
+                        + $"WHERE character_id={characterId};");
+                }
                 _before = _progress.LoadMenu(characterId, Memory.Now.UtcDateTime);
                 using (var connection = _database.OpenConnection())
                     _lease = InventoryContext.Register(Session.SessionId, characterId,
@@ -271,17 +290,92 @@ namespace DfoServer.SelfTests
                     new BloodAltarDungeonCoordinator(services, settlement));
                 _handler.ConfigureGuardianAltar(Coordinator.TryCompleteAsync, Coordinator.TryHandleCenterDeathAsync,
                     Coordinator.TryHandleCharacterDeathAsync, Coordinator.TryRejectUseCoinAsync);
-                var dungeonId = _definition.GetEligibleSurvivalDungeonIds(_before).Single();
+                await StartAsync(_ordinaryMode ? _definition.FirstDungeonId
+                    : _definition.GetEligibleSurvivalDungeonIds(_before).Single());
+                if (!_ordinaryMode) await AdvanceAsync(clearedRounds);
+                Packets.Clear();
+            }
+
+            private async Task StartAsync(int dungeonId)
+            {
+                _runMonotonicStart = Memory.MonotonicMilliseconds;
                 await Coordinator.TryHandleSelectDungeonAsync(Session, new GamePacketHeader {
-                    cmd = 1, type = (ushort)CmdPacketTypeA21.SELECT_DUNGEON }, SurvivalRequest(dungeonId));
-                if (Run == null || !Plan.IsSurvival)
-                    throw new InvalidOperationException("Real persistent survival admission failed.");
+                    cmd = 1, type = (ushort)CmdPacketTypeA21.SELECT_DUNGEON },
+                    _ordinaryMode ? Request(dungeonId) : SurvivalRequest(dungeonId));
+                if (Run == null || Plan.IsSurvival == _ordinaryMode)
+                    throw new InvalidOperationException("Real persistent Guardian admission failed.");
                 var release = Memory.LastRoom.MarkLoadingReady(Run.CaptureIdentity(), new[] { Run.CaptureIdentity() });
                 GuardianAltarDungeonCoordinator.OnLoadingReleased(Run, Memory.LastRoom.Identity, release.Generation);
                 await Coordinator.HandlePauseAsync(Session, new GamePacketHeader {
                     cmd = 1, type = (ushort)CmdPacketTypeA21.ADVANCE_ALTAR_PAUSE }, new byte[15]);
-                await AdvanceAsync(clearedRounds);
+            }
+
+            internal async Task RepeatOrdinaryAsync()
+            {
+                if (!_ordinaryMode || !Combat.Presentation.EplpProjectionSent)
+                    throw new InvalidOperationException("Repeated ordinary entry requires a finished result projection.");
+                await Coordinator.TryHandleEplpCommandAsync(Session, new GamePacketHeader {
+                    cmd = 1, type = (ushort)CmdPacketTypeA21.EPLP_COMMAND }, new byte[] { 1, 2 });
+                if (Session.Player.CurrentRun != null)
+                    throw new InvalidOperationException("Ordinary result command did not release its captured run.");
+                _before = ReadProgress();
+                await StartAsync(_definition.FirstDungeonId);
                 Packets.Clear();
+            }
+
+            internal async Task CompleteOrdinaryAsync()
+            {
+                if (!_ordinaryMode) throw new InvalidOperationException("This fixture has a survival plan.");
+                var identity = Run.CaptureParticipantRoomIdentity();
+                var room = Memory.LastRoom;
+                var fence = DungeonLoadingCoordinator.CaptureContinuationFence(Session, Memory.Sessions, Run, room.Identity);
+                var steps = 0;
+                while (!Combat.IsTerminal)
+                {
+                    if (++steps > 64 || Combat.NextDueActiveMilliseconds is not { } due
+                        || !Combat.Timers.TryGetCurrentTicket(DungeonRunTimerKeys.GuardianAltarWaveSchedule, out var ticket))
+                        throw new InvalidOperationException("Ordinary Coordinator schedule stalled before canonical success.");
+                    Memory.MonotonicMilliseconds = checked(_runMonotonicStart + due);
+                    await Coordinator.OnCombatTimerAsync(Session, Run, identity, Memory.LoadingGeneration, ticket, fence)
+                        .WaitAsync(TimeSpan.FromSeconds(5));
+                    foreach (var actor in Run.Instance.Mechanisms.DynamicActors.Capture(room.Identity,
+                        GuardianAltarCombatRuntime.DynamicActorProvider, Memory.LoadingGeneration)
+                        .Where(actor => DungeonKillApplicationService.CanAcceptGuardianActorDeath(Run, actor)))
+                    {
+                        var source = DungeonEventEnvelope.Create(Run, Session.Player.CharacterId,
+                            "guardian-ordinary-clear-selftest");
+                        var death = room.TryRecordActorDeath(source, actor.SequenceId, actor.ActorCode, actor.ActorType);
+                        if (!death.Accepted || !death.Created
+                            || !DungeonKillApplicationService.TryApplyGuardianActorDeath(Run, actor, death.Fact.Source))
+                            throw new InvalidOperationException("Canonical ordinary enemy death was not accepted.");
+                    }
+                    await Coordinator.TryCompleteAsync(Session, Run).WaitAsync(TimeSpan.FromSeconds(5));
+                }
+            }
+
+            internal GuardianAltarProgressSnapshot ReadProgress()
+                => _progress.ReadExistingMenu(Session.Player.CharacterId, 11);
+
+            internal int ItemCount(int itemId)
+            {
+                using var connection = _database.OpenConnection();
+                return InventoryService.LoadFromDb(connection, Session.Player.CharacterId, 11, _database)
+                    .CountMainItem(itemId);
+            }
+
+            internal async Task ShowOrdinaryMenuAsync()
+            {
+                if (!_ordinaryMode || !Combat.Presentation.EplpProjectionSent)
+                    throw new InvalidOperationException("Ordinary menu continuation requires a finished result projection.");
+                await Coordinator.TryHandleEplpCommandAsync(Session, new GamePacketHeader {
+                    cmd = 1, type = (ushort)CmdPacketTypeA21.EPLP_COMMAND }, new byte[] { 1, 1 });
+                if (Session.Player.CurrentRun != null)
+                    throw new InvalidOperationException("Ordinary selection command did not release its captured run.");
+                if (!_ordinaryMenuRegistry.TryGetValue((ushort)CmdPacketTypeA21.ADVANCE_ALTAR_START_GAME, out var handler))
+                    throw new InvalidOperationException("Ordinary START_GAME menu handler is not registered.");
+                await handler(Session, new GamePacketHeader {
+                    cmd = 1, type = (ushort)CmdPacketTypeA21.ADVANCE_ALTAR_START_GAME, length = 14 },
+                    Array.Empty<byte>()).WaitAsync(TimeSpan.FromSeconds(5));
             }
 
             private async Task AdvanceAsync(int rounds)
@@ -416,6 +510,7 @@ namespace DfoServer.SelfTests
             });
             public void Dispose()
             {
+                _ordinaryMenu?.Dispose();
                 Memory.Dispose();
                 if (_lease != null) InventoryContext.Unregister(_lease.SessionId, _lease.CharacterId);
                 _sendLock.Dispose();
