@@ -72,7 +72,8 @@ namespace DfoServer.GameWorld
             int growType,
             HashSet<int> clearedQuestIds,
             Dictionary<int, int> clearedFlags,
-            ISet<int> allowedCreatureKinds)
+            ISet<int> allowedCreatureKinds,
+            ISet<int> advertisedEventIds = null)
         {
             var result = new List<ushort>();
             var prerequisiteState = new QuestPrerequisiteEvaluationState(
@@ -86,7 +87,8 @@ namespace DfoServer.GameWorld
                 var quest = QuestCatalog.Get(questId);
                 if (quest == null
                     || ParseExposedValue(quest.ExposedByNpc) == 0
-                    || quest.IsEvent)
+                    || !QuestEventAvailabilityPolicy.IsAvailable(quest,
+                        eventId => advertisedEventIds?.Contains(eventId) == true))
                 {
                     continue;
                 }
@@ -112,7 +114,8 @@ namespace DfoServer.GameWorld
                     continue;
                 }
 
-                if (!IsSelectableGrade(grade))
+                if (!IsSelectableGrade(grade)
+                    && !(grade == "[special]" && quest.ShowQuestOnEventId > 0))
                     continue;
 
                 if (!MeetsCharacterRestrictions(

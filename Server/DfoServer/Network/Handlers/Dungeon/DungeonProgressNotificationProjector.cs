@@ -259,7 +259,8 @@ namespace DfoServer.Network.Handlers.Dungeon
                     record.Job,
                     record.GrowType,
                     clearedFlags,
-                    allowedCreatureKinds);
+                    allowedCreatureKinds,
+                    Game.Events.GameEventRepository.LoadAdvertisedEventIds(_connectionString));
                 await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(
                     0x00,
                     (ushort)NotiPacketTypeA21.ACCEPTABLE_QUEST_LIST,

@@ -18,6 +18,9 @@ namespace DfoServer
         {
             ("--selftest-a21-startup-protocol", SelfTests.A21StartupProtocolSelfTest.Run),
             ("--selftest-event-dungeon-opening", SelfTests.EventDungeonOpeningSelfTest.Run),
+            ("--selftest-epic-road-resource", SelfTests.EpicRoadResourceSelfTest.Run),
+            ("--selftest-town-position-persistence", SelfTests.TownPositionPersistenceSelfTest.Run),
+            ("--selftest-epic-road-entry", SelfTests.EpicRoadEntrySelfTest.Run),
             ("--selftest-fatigue-acceleration-definition", SelfTests.FatigueAccelerationDefinitionSelfTest.Run),
             ("--selftest-fatigue-acceleration-entry", SelfTests.FatigueAccelerationEntrySelfTest.Run),
             ("--selftest-guardian-altar-menu", SelfTests.GuardianAltarMenuSelfTest.Run),
@@ -88,6 +91,7 @@ namespace DfoServer
             ("--selftest-anton-raid-phase-quest", SelfTests.AntonRaidPhaseQuestSelfTest.Run),
             ("--selftest-quest-progress-batch", SelfTests.QuestProgressBatchSelfTest.Run),
             ("--selftest-quest-chain-availability", SelfTests.QuestChainAvailabilitySelfTest.Run),
+            ("--selftest-quest-event-availability", SelfTests.QuestEventAvailabilitySelfTest.Run),
             ("--selftest-quest-question-branch", SelfTests.QuestQuestionBranchSelfTest.Run),
             ("--selftest-level-up-ticket", SelfTests.LevelUpTicketSelfTest.Run),
             ("--selftest-growup-change", SelfTests.GrowupChangeSelfTest.Run),

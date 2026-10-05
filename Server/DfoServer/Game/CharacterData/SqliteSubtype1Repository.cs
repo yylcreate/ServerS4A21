@@ -192,6 +192,10 @@ namespace DfoServer.Game.CharacterData
                              characterAccountId,
                              characterId))
                 {
+                    // Account counts have a different A21 consumer and wire
+                    // layout. They are projected by the dedicated account NOTI.
+                    if (entry.ScopeType != DungeonLimitScopeType.Character)
+                        continue;
                     snap.Dimensions.Add(new DimensionEntrySnapshot
                     {
                         Key = (uint)entry.DungeonId,

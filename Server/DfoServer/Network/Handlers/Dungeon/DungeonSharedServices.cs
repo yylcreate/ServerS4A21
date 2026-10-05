@@ -64,6 +64,15 @@ namespace DfoServer.Network.Handlers.Dungeon
             EventDungeons { get; private set; } = new();
         internal Func<EnhancedClientSession, System.Threading.Tasks.Task>
             EventDungeonCountsChanged { get; private set; }
+        internal Game.Events.EpicRoad.EpicRoadEntryService EpicRoadEntry { get; private set; }
+        internal Func<EnhancedClientSession, System.Threading.Tasks.Task> AccountDungeonCountsChanged { get; private set; }
+
+        internal void ConfigureEpicRoad(Game.Events.EpicRoad.EpicRoadEntryService service,
+            Func<EnhancedClientSession, System.Threading.Tasks.Task> countsChanged)
+        {
+            EpicRoadEntry = service ?? throw new ArgumentNullException(nameof(service));
+            AccountDungeonCountsChanged = countsChanged ?? throw new ArgumentNullException(nameof(countsChanged));
+        }
 
         internal void ConfigureEventDungeons(
             Game.Events.ScheduledDungeons.EventDungeonOpeningService service,

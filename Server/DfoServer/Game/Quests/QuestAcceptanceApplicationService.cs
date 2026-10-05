@@ -83,6 +83,16 @@ namespace DfoServer.Game.Quests
                             if (!owner.IsCurrentInventoryOwner())
                                 return QuestAcceptResult.Fail(0x17);
 
+                            if (!GameWorld.QuestEventAvailabilityPolicy.IsAvailable(
+                                    GameWorld.QuestCatalog.Get(questId),
+                                    eventId => Events.GameEventRepository.IsAdvertised(
+                                        connection, transaction, eventId)))
+                            {
+                                FileLogger.Log($"[QuestAcceptanceApplicationService] ACCEPT "
+                                    + $"blocked by event availability: quest={questId} cid={characterId}");
+                                return QuestAcceptResult.Fail(21);
+                            }
+
                             if (isDaily
                                 && DailyQuestCompletionCycle.GetCurrentCounter(
                                     connection, transaction, characterId, questId, utcNow) > 0)

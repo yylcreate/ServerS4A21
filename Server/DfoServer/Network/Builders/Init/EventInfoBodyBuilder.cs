@@ -29,7 +29,9 @@ namespace DfoServer.Network.Builders
             int occurrenceIndex,
             out byte[] body)
         {
-            body = Build(_repository.LoadEventInfoSnapshot());
+            var init = snapshot.InitializationSnapshot;
+            init.EventInfoSnapshot ??= _repository.LoadEventInfoSnapshot();
+            body = Build(init.EventInfoSnapshot);
             return true;
         }
 

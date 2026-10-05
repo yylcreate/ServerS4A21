@@ -7,6 +7,7 @@ using DfoServer.Game.Events.PcRoomTimePoint;
 using DfoServer.Game.Events.TotalAttendance;
 using DfoServer.Game.Events.SeriaLuck;
 using DfoServer.Game.Events.ScheduledDungeons;
+using DfoServer.Game.Events.EpicRoad;
 using DfoServer.Infrastructure;
 
 namespace DfoServer.Game.Events
@@ -21,6 +22,7 @@ namespace DfoServer.Game.Events
             _repository = new GameEventRepository(Database);
             FatigueAccelerationEntry = new FatigueAccelerationEntryService(Database);
             SeriaLuckUi = new SeriaLuckUiService(Database);
+            EpicRoadEntry = new EpicRoadEntryService(Database);
         }
 
         internal IGameDatabase Database { get; }
@@ -32,12 +34,17 @@ namespace DfoServer.Game.Events
         internal FatigueAccelerationEntryService FatigueAccelerationEntry { get; }
 
         internal SeriaLuckUiService SeriaLuckUi { get; }
+        internal EpicRoadEntryService EpicRoadEntry { get; }
 
         internal void Initialize()
         {
             SeriaLuckUi.Initialize();
             FatigueAccelerationEntry.Initialize(Environment.GetEnvironmentVariable(
                 FatigueAccelerationEntryService.EntryEnvironmentVariable));
+            EpicRoadEntry.Initialize(Environment.GetEnvironmentVariable(EpicRoadEntryService.EntryEnvironmentVariable));
+            if (EpicRoadEntry.Definition.IsValid)
+                new Game.Dungeon.DungeonEntryLimitService(Database).EnsureAccountDungeonLimit(
+                    EpicRoadEntryService.DungeonId, EpicRoadEntry.Definition.AccountMaximumCount);
 
             if (!GuardianAltarOpening.TryConfigureEnvironment(out var openingError))
                 FileLogger.Log("[GuardianAltarEntry] invalid entry-only window; disabled: "

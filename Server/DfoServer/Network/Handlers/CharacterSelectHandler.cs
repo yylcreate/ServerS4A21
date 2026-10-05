@@ -326,6 +326,7 @@ namespace DfoServer.Network.Handlers
             int slot)
         {
             GameChannelSpawn selectedSpawn = null;
+            var resolvingSpawn = false;
             try
             {
                 // 换角色前丢弃上一个角色的副本局: PlayerContext 实例跨角色复用, 不丢会把
@@ -368,9 +369,11 @@ namespace DfoServer.Network.Handlers
                     var inventory = TryLoadInventoryForLease(
                         record.CharacterId,
                         ResolveAccountId(session, record));
+                    resolvingSpawn = true;
                     selectedSpawn = GameChannelSpawnPolicy.Resolve(
                         session.ListenerPort,
                         record.TownId);
+                    resolvingSpawn = false;
                     session.Player.HydrateFrom(
                         record,
                         selectedSpawn);
@@ -422,16 +425,18 @@ namespace DfoServer.Network.Handlers
 
                     session.Player.AppearanceEntries = record.Appearance ?? Array.Empty<CharacterAppearanceEntry>();
                     if (GameChannelSpawnPolicy.ShouldPersistPosition(
-                            session.ListenerPort))
+                            session.ListenerPort,
+                            selectedSpawn.TownId,
+                            selectedSpawn.AreaId))
                     {
                         _characterRepository.UpdatePosition(
-                            session.Player.CharacterId,
-                            session.Player.CurTownId,
-                            session.Player.CurAreaId,
-                            session.Player.CurPosX,
-                            session.Player.CurPosY,
-                            session.Player.CurDirection,
-                            session.Player.CurAreaState);
+                            record.CharacterId,
+                            selectedSpawn.TownId,
+                            selectedSpawn.AreaId,
+                            selectedSpawn.X,
+                            selectedSpawn.Y,
+                            selectedSpawn.Direction,
+                            selectedSpawn.AreaState);
                     }
                     FileLogger.Log($"[{ProtocolName}] Select character hydrated session {session.SessionId} slot={slot} <- character_id={record.CharacterId} name={record.DisplayName} town={session.Player.CurTownId} area={session.Player.CurAreaId} pos=({session.Player.CurPosX},{session.Player.CurPosY})");
                 }
@@ -442,6 +447,11 @@ namespace DfoServer.Network.Handlers
             }
             catch (Exception ex)
             {
+                if (resolvingSpawn)
+                {
+                    FileLogger.Log($"[{ProtocolName}] Select character spawn rejected: {ex.Message}");
+                    throw;
+                }
                 FileLogger.Log($"[{ProtocolName}] Select character DB load failed: {ex.Message}");
             }
 

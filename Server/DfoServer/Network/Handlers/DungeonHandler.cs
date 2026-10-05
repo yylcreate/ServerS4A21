@@ -143,6 +143,10 @@ namespace DfoServer.Network.Handlers
 
         internal DungeonEntryLimitService EntryLimits => _services.EntryLimits;
 
+        internal void ConfigureEpicRoad(Game.Events.EpicRoad.EpicRoadEntryService service,
+            Func<EnhancedClientSession, Task> countsChanged)
+            => _services.ConfigureEpicRoad(service, countsChanged);
+
         internal void ConfigureEventDungeons(
             Game.Events.ScheduledDungeons.EventDungeonOpeningService service,
             Func<EnhancedClientSession, Task> countsChanged)

@@ -831,6 +831,14 @@ namespace DfoServer.Infrastructure
             townDungeon.Dungeon.ConfigureEventDungeons(
                 core.EventManager.EventDungeons,
                 eventDungeons.NotifyCountsAfterEntryWhileTransitionHeldAsync);
+            var epicRoad = core.EventManager.EpicRoadEntry;
+            var accountDungeonCounts = new AccountDungeonCountNotifier(
+                townDungeon.Dungeon.EntryLimits, world.Sessions,
+                Game.Events.EpicRoad.EpicRoadEntryService.DungeonId,
+                epicRoad.Definition.AccountMaximumCount);
+            townDungeon.Dungeon.ConfigureEpicRoad(epicRoad, accountDungeonCounts.PublishWhileTransitionHeldAsync);
+            townDungeon.Town.ConfigureEpicRoadEntry(epicRoad);
+            townDungeon.Town.ConfigureAccountDungeonCountProjection(accountDungeonCounts.PublishWhileTransitionHeldAsync);
 
             var handlers = new GameProtocolFeatureHandlers(
                 lotteryItem,

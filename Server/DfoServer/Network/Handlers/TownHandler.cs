@@ -3,6 +3,7 @@ using DfoServer.Game.Appearance;
 using DfoServer.Game.CharacterData;
 using DfoServer.Game.Characters;
 using DfoServer.Game.Dungeon;
+using DfoServer.Game.Events.EpicRoad;
 using DfoServer.Game.Friends;
 using DfoServer.Game.Inventory;
 using DfoServer.Game.Raid;
@@ -16,6 +17,7 @@ using DfoServer.Network.Builders.Party;
 using DfoServer.Network.Parsers.Town;
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -75,6 +77,17 @@ namespace DfoServer.Network.Handlers
         private Func<Task> _publishTownPartyLists;
         private Func<EnhancedClientSession, byte, byte, Task> _raidTownAreaChanged;
         private Func<EnhancedClientSession, Func<bool>, Task<bool>> _restoreGuardianControls;
+        private Func<EnhancedClientSession, Task> _accountDungeonCountProjection;
+        private EpicRoadEntryService _epicRoadEntry;
+
+        internal void ConfigureEpicRoadEntry(EpicRoadEntryService entry)
+            => _epicRoadEntry = entry ?? throw new ArgumentNullException(nameof(entry));
+
+        internal void ConfigureAccountDungeonCountProjection(Func<EnhancedClientSession, Task> projection)
+            => _accountDungeonCountProjection = projection ?? throw new ArgumentNullException(nameof(projection));
+
+        internal Task ProjectAccountDungeonCountsAsync(EnhancedClientSession session)
+            => _accountDungeonCountProjection?.Invoke(session) ?? Task.CompletedTask;
 
         private readonly InventoryRefreshSender _refresh;
 
@@ -182,33 +195,45 @@ namespace DfoServer.Network.Handlers
         {
             try
             {
-                if (session?.Player == null || session.Player.CharacterId <= 0)
+                var player = session?.Player;
+                if (player == null || player.CharacterId <= 0)
                     return;
+                var characterId = player.CharacterId;
+                var townId = player.CurTownId;
+                var areaId = player.CurAreaId;
+                var x = player.CurPosX;
+                var y = player.CurPosY;
+                var direction = player.CurDirection;
+                var areaState = player.CurAreaState;
                 if (!GameChannelSpawnPolicy.ShouldPersistPosition(
-                        session.ListenerPort))
+                        session.ListenerPort,
+                        townId,
+                        areaId))
                     return;
 
                 var now = DateTime.UtcNow;
                 if (!forceImmediate)
                 {
-                    if (now - session.Player.LastPositionPersistAt < PositionPersistThrottle)
+                    if (now - player.LastPositionPersistAt < PositionPersistThrottle)
                         return;
                 }
 
-                var gate = GameWorld.Town.GetCeraRoomInfo(session.Player.CurTownId);
-                if (gate.Town <= 0)
+                var gate = GameWorld.Town.GetCeraRoomInfo(townId);
+                if (gate.Town <= 0 || !ReferenceEquals(session.Player, player)
+                    || player.CharacterId != characterId)
                     return;
 
                 _characterRepository.UpdatePosition(
-                    session.Player.CharacterId,
-                    session.Player.CurTownId,
-                    session.Player.CurAreaId,
-                    session.Player.CurPosX,
-                    session.Player.CurPosY,
-                    session.Player.CurDirection,
-                    session.Player.CurAreaState);
-                session.Player.LastPositionPersistAt = now;
-                FileLogger.Log($"[{ProtocolName}] Persisted position ({source}) character_id={session.Player.CharacterId} town={session.Player.CurTownId} area={session.Player.CurAreaId} pos=({session.Player.CurPosX},{session.Player.CurPosY})");
+                    characterId,
+                    townId,
+                    areaId,
+                    x,
+                    y,
+                    direction,
+                    areaState);
+                if (ReferenceEquals(session.Player, player) && player.CharacterId == characterId)
+                    player.LastPositionPersistAt = now;
+                FileLogger.Log($"[{ProtocolName}] Persisted position ({source}) character_id={characterId} town={townId} area={areaId} pos=({x},{y})");
             }
             catch (Exception ex)
             {
@@ -314,6 +339,39 @@ namespace DfoServer.Network.Handlers
             var gotoPosX = BitConverter.ToInt16(body, 2);
             var gotoPosY = BitConverter.ToInt16(body, 4);
 
+            // The resource NPC's A21 menu sends SET_USER_AREA. Validate only
+            // the external transition into this event town; existing run/selection
+            // returns retain their authorized source and remain available after closure.
+            if (gotoTownId == EpicRoadEntryService.TargetTownId
+                && session.Player.CurTownId != EpicRoadEntryService.TargetTownId
+                && !projectionGuard.EndedRun.IsValid && projectionGuard.Selection == null
+                && projectionGuard.AuthorizedReturnCurrent == null)
+            {
+                if (!TryValidateEpicRoadTownEntry(session, gotoAreaId, out var epicReason))
+                {
+                    FileLogger.Log($"[EpicRoad] town entry rejected cid={session.Player.CharacterId} reason={epicReason}");
+                    await ChannelTownRestrictionSender.SendCurrentAreaAsync(session);
+                    return;
+                }
+                var sourcePlayer = session.Player;
+                var sourceAccount = session.Account;
+                var sourceGameSession = session.GameSession;
+                var sourceCharacterId = sourcePlayer.CharacterId;
+                var sourceUserId = sourcePlayer.UserId;
+                var sourceAccountId = sourceAccount.AccountId;
+                var sourceRunGeneration = sourcePlayer.CurrentDungeonRunGeneration;
+                var sourceSelectionGeneration = sourcePlayer.CurrentDungeonSelectionGeneration;
+                projectionGuard = TownProjectionGuard.ForAuthorizedReturn(() =>
+                    ReferenceEquals(session.Player, sourcePlayer) && ReferenceEquals(session.Account, sourceAccount)
+                    && ReferenceEquals(session.GameSession, sourceGameSession)
+                    && sourcePlayer.CharacterId == sourceCharacterId && sourcePlayer.UserId == sourceUserId
+                    && sourceAccount.AccountId == sourceAccountId
+                    && sourcePlayer.CurrentDungeonRunGeneration == sourceRunGeneration
+                    && sourcePlayer.CurrentDungeonSelectionGeneration == sourceSelectionGeneration
+                    && (_sessions == null || (_sessions.TryGet(sourceCharacterId, out var registered)
+                        && ReferenceEquals(registered, session))));
+            }
+
             if (!CanChangeRaidArea(session, gotoTownId, gotoAreaId))
             {
                 FileLogger.Log(
@@ -408,6 +466,8 @@ namespace DfoServer.Network.Handlers
             PersistPosition(session, forceImmediate: true, source: "set_user_area");
             if (await TryRestoreGuardianControlsAsync(session, projectionGuard, controlsSource))
                 controlsRestored?.Invoke();
+            if (gotoTownId == EpicRoadEntryService.TargetTownId && CanContinueTownProjection(session, projectionGuard))
+                await ProjectAccountDungeonCountsAsync(session);
         }
 
         private bool IsCurrentGuardianControlsSource(EnhancedClientSession session,
@@ -830,7 +890,9 @@ namespace DfoServer.Network.Handlers
             var previousTownId = player.CurTownId;
             var previousAreaId = player.CurAreaId;
             var persistPosition = GameChannelSpawnPolicy.ShouldPersistPosition(
-                session.ListenerPort);
+                session.ListenerPort,
+                ceraRoomInfo.Town,
+                ceraRoomInfo.Area);
             if (!TeleportConsumableCommitService.TryCommit(
                     lease,
                     request.ItemTemplateId,
@@ -1089,6 +1151,48 @@ namespace DfoServer.Network.Handlers
                         .LoadClearedFlags(cid)
                         .ContainsKey(questId));
             return reason == null;
+        }
+
+        internal bool TryValidateEpicRoadTownEntry(EnhancedClientSession session, byte targetAreaId, out string reason)
+        {
+            reason = "epic_road_entry_unavailable";
+            var player = session?.Player;
+            if (player == null || player.CharacterId <= 0 || player.UserId == 0
+                || (session.Account?.AccountId ?? 0) <= 0 || session.GameSession == null
+                || player.CurrentRun != null || player.DungeonSelectionPending || player.UserState != 0
+                || !player.TownPresenceReady || _epicRoadEntry?.IsEnabled() != true
+                || targetAreaId != EpicRoadEntryService.TargetAreaId)
+                return false;
+            if (_sessions != null && (!_sessions.TryGet(player.CharacterId, out var current)
+                    || !ReferenceEquals(current, session)))
+            {
+                reason = "epic_road_stale_town_source";
+                return false;
+            }
+            // Visibility is owned by the event member and NPC hide-town rule.
+            // This NPC is not in the static MAP NPC table; requiring a static
+            // placement would reject every legal event entry in this archive.
+            if (_epicRoadEntry.Definition.EntranceHiddenTownIds.Contains(player.CurTownId)
+                || !Town.TryGetArea(player.CurTownId, player.CurAreaId, out _))
+            {
+                reason = "epic_road_town_source_not_allowed";
+                return false;
+            }
+            try
+            {
+                var cleared = new Game.Quests.QuestRepository(_database.ConnectionString)
+                    .LoadClearedFlags(player.CharacterId);
+                reason = TownAreaPermissionPolicy.GetDenyReason(_epicRoadEntry.Definition.TargetPermission,
+                    player.Level, quest => cleared.ContainsKey(quest));
+                return reason == null;
+            }
+            catch (Exception exception) when (exception is Microsoft.Data.Sqlite.SqliteException
+                or InvalidOperationException or System.IO.IOException)
+            {
+                FileLogger.Log($"[EpicRoad] town permission unavailable cid={player.CharacterId}: {exception.Message}");
+                reason = "epic_road_town_permission_unavailable";
+                return false;
+            }
         }
 
         // 组队传送同房间判定: 队员当前 town/area 必须与队长完全一致。
@@ -2037,7 +2141,7 @@ namespace DfoServer.Network.Handlers
                     return Array.Empty<byte[]>();
                 prepared = true;
                 return new[] { packet };
-            });
+            }, () => CanContinueTownProjection(session, guard));
             return prepared;
         }
 
