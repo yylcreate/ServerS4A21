@@ -175,7 +175,7 @@ namespace DfoServer.SelfTests
             {
                 using (var command = connection.CreateCommand())
                 {
-                    command.CommandText = @"
+                    command.CommandText = MigrationSelfTestFixture.RemoveGuildContributionColumns + @"
 DROP TABLE IF EXISTS event_daily_attendance_anytime_clear_events;
 DROP TABLE IF EXISTS event_daily_attendance_anytime_daily;
 DROP TABLE IF EXISTS event_daily_attendance_anytime_account;
@@ -184,6 +184,7 @@ DROP TABLE IF EXISTS event_total_attendance_account;
 DROP TABLE IF EXISTS account_recommend_dungeon_clear_stats;
 DELETE FROM game_event_state WHERE event_id=2208;
 DELETE FROM game_event_state WHERE event_id=2370;
+DROP TABLE guild_dungeon_progress;
 UPDATE schema_metadata SET schema_version=15 WHERE singleton_id=1;
 PRAGMA user_version=15;";
                     command.ExecuteNonQuery();

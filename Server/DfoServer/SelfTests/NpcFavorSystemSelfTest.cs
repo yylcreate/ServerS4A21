@@ -723,8 +723,9 @@ BEGIN SELECT RAISE(ABORT, 'selftest'); END;";
                 {
                     using var command = connection.CreateCommand();
                     command.Transaction = transaction;
-                    command.CommandText = @"
+                    command.CommandText = MigrationSelfTestFixture.RemoveGuildContributionColumns + @"
 DROP TABLE character_npc_favor;
+DROP TABLE guild_dungeon_progress;
 PRAGMA user_version=32;
 UPDATE schema_metadata SET schema_version=32;
 CREATE TRIGGER reject_npc_favor_migration
@@ -733,6 +734,12 @@ BEGIN SELECT RAISE(ABORT, 'selftest'); END;";
                     command.ExecuteNonQuery();
                 });
 
+                Check("the v32 fixture excludes later guild dungeon progress storage", database.Read(connection =>
+                {
+                    using var command = connection.CreateCommand();
+                    command.CommandText = "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='guild_dungeon_progress';";
+                    return Convert.ToInt64(command.ExecuteScalar()) == 0;
+                }), ref failures);
                 var failed = false;
                 using (var connection = database.OpenConnection())
                 {
@@ -753,12 +760,14 @@ BEGIN SELECT RAISE(ABORT, 'selftest'); END;";
 SELECT
     (SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='character_npc_favor'),
     (SELECT schema_version FROM schema_metadata),
-    (SELECT user_version FROM pragma_user_version);";
+    (SELECT user_version FROM pragma_user_version),
+    (SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='guild_dungeon_progress');";
                     using var reader = command.ExecuteReader();
                     return reader.Read()
                         && reader.GetInt32(0) == 0
                         && reader.GetInt32(1) == 32
-                        && reader.GetInt32(2) == 32;
+                        && reader.GetInt32(2) == 32
+                        && reader.GetInt32(3) == 0;
                 });
                 Check(
                     "failed v33 migration rolls table creation and both versions back",
@@ -785,12 +794,14 @@ SELECT
 SELECT
     (SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='character_npc_favor'),
     (SELECT schema_version FROM schema_metadata),
-    (SELECT user_version FROM pragma_user_version);";
+    (SELECT user_version FROM pragma_user_version),
+    (SELECT COUNT(*) FROM pragma_table_info('guild_dungeon_progress') WHERE name='month_id' AND ""notnull""=1);";
                     using var reader = command.ExecuteReader();
                     return reader.Read()
                         && reader.GetInt32(0) == 1
                         && reader.GetInt32(1) == SqliteMigrations.CurrentVersion
-                        && reader.GetInt32(2) == SqliteMigrations.CurrentVersion;
+                        && reader.GetInt32(2) == SqliteMigrations.CurrentVersion
+                        && reader.GetInt32(3) == 1;
                 });
                 Check(
                     "v33 migration creates NPC favor storage and is idempotent",

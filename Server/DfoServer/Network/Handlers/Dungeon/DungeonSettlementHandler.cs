@@ -846,10 +846,16 @@ namespace DfoServer.Network.Handlers.Dungeon
             var ownSlot = run.EntryPartySlotIndex;
             if (ownSlot >= seats.Length)
                 ownSlot = 0;
-            seats[ownSlot] = new ClearRewardFreeCardSeat(
-                ownSettlement.FreeGold.GoldAmount,
-                ownSettlement.FreeItem.ItemId,
-                ownSettlement.FreeItem.StackCount);
+            var ownGuildReward = run.Instance.GuildDungeonAdmission != null;
+            lock (run.SyncRoot)
+            {
+                if (ownGuildReward && ownSettlement.GuildDungeonClear == null)
+                    return seats;
+                seats[ownSlot] = new ClearRewardFreeCardSeat(
+                    ownSettlement.FreeGold.GoldAmount,
+                    ownSettlement.FreeItem.ItemId,
+                    ownSettlement.FreeItem.StackCount);
+            }
 
             if (roster == null)
                 roster = CardRewardCoordinator.CaptureCardRewardRoster(run);
@@ -863,17 +869,17 @@ namespace DfoServer.Network.Handlers.Dungeon
                 var partySlot = peerRun.EntryPartySlotIndex;
                 if (partySlot >= seats.Length || partySlot == ownSlot)
                     continue;
-                DungeonSettlementRuntime peerSettlement;
+                var peerGuildReward = peerRun.Instance.GuildDungeonAdmission != null;
                 lock (peerRun.SyncRoot)
                 {
-                    peerSettlement = peerRun.SettlementRuntime;
+                    var peerSettlement = peerRun.SettlementRuntime;
+                    if (peerSettlement == null || (peerGuildReward && peerSettlement.GuildDungeonClear == null))
+                        continue;
+                    seats[partySlot] = new ClearRewardFreeCardSeat(
+                        peerSettlement.FreeGold.GoldAmount,
+                        peerSettlement.FreeItem.ItemId,
+                        peerSettlement.FreeItem.StackCount);
                 }
-                if (peerSettlement == null)
-                    continue;
-                seats[partySlot] = new ClearRewardFreeCardSeat(
-                    peerSettlement.FreeGold.GoldAmount,
-                    peerSettlement.FreeItem.ItemId,
-                    peerSettlement.FreeItem.StackCount);
             }
             return seats;
         }
@@ -1035,6 +1041,29 @@ namespace DfoServer.Network.Handlers.Dungeon
                 }
 
                 _svc.PersistentMechanisms.ConfigureLinkedChallenge(run);
+                var guildAdmission = run.Instance.GuildDungeonAdmission;
+                if (guildAdmission != null)
+                {
+                    if (!session.Player.IsCurrentDungeonRun(identity))
+                    {
+                        run.Effects.TryFail(authoritativeReservation);
+                        return false;
+                    }
+                    var guildEffect = new DungeonEffectId(clearFact.SourceEventId,
+                        DungeonPersistentEffectKinds.GuildDungeonClearCommit, DungeonEffectScope.Persistent, guildAdmission.GuildId);
+                    var guildContribution = run.Instance.GetOrCreateGuildDungeonContribution(clearFact,
+                        _svc.GuildDungeons.CurrentMonthId, run.Instance.ParticipantEffects.GetRoster(
+                            clearFact.SourceEventId, DungeonParticipantEffectAudience.Instance));
+                    if (!_svc.PersistentEffects.TryApplyGuildDungeonClear(guildEffect, guildAdmission, out var guildClearResult, out var guildError,
+                            guildContribution))
+                    {
+                        FileLogger.Log("[GuildDungeon] clear persistence deferred: " + guildError);
+                        run.Effects.TryFail(authoritativeReservation);
+                        return false;
+                    }
+                    settlement.FreezeGuildDungeonReward(run, guildClearResult);
+                    await _svc.GuildDungeonProgress.SendAsync(session, "dungeon-clear", includeContribution: true);
+                }
                 if (!await ExecuteSettlementEffectAsync(
                         session,
                         run,
@@ -1350,6 +1379,7 @@ namespace DfoServer.Network.Handlers.Dungeon
             var shouldScheduleCardRewardFlow = standardPresentation
                 && ShouldScheduleCardRewardFlow(run.DungeonId);
             var isDimensionDungeon = DungeonData.IsDimensionDungeon(run.DungeonId);
+            var isGuildDungeon = run.Instance.GuildDungeonAdmission != null;
             var dungeonLevel = DungeonData.GetDungeonBasicLv(run.DungeonId);
             if (dungeonLevel <= 0)
                 throw new InvalidOperationException(
@@ -1419,7 +1449,7 @@ namespace DfoServer.Network.Handlers.Dungeon
                 ? ClearRewardGenerator.GenerateFreeGoldCard(rewardContext, lcg)
                 : default;
             var freeItem = default(ClearRewardGenerator.CardReward);
-            if (shouldScheduleCardRewardFlow)
+            if (shouldScheduleCardRewardFlow && !isGuildDungeon)
             {
                 if (isDimensionDungeon)
                 {
@@ -2454,7 +2484,9 @@ namespace DfoServer.Network.Handlers.Dungeon
                 clearFact.Source,
                 DungeonParticipantEffectAudience.Instance,
                 roster,
-                out _);
+                out var frozenClearRoster);
+            if (run.Instance.GuildDungeonAdmission != null)
+                run.Instance.GetOrCreateGuildDungeonContribution(clearFact, _svc.GuildDungeons.CurrentMonthId, frozenClearRoster);
 
             if (factCreated)
                 await CullRemainingBlockingActorsOnClearAsync(session, run, clearFact);
@@ -2890,7 +2922,8 @@ namespace DfoServer.Network.Handlers.Dungeon
                 ushort participantUserId,
                 DungeonRun candidateRun,
                 long attachmentGeneration,
-                byte partySlot)
+                byte partySlot,
+                int accountId)
             {
                 if (candidateRun == null
                     || characterId <= 0
@@ -2909,7 +2942,8 @@ namespace DfoServer.Network.Handlers.Dungeon
                     snapshot.RunIdentity,
                     snapshot.RoomIdentity,
                     attachmentGeneration,
-                    partySlot));
+                    partySlot,
+                    accountId));
             }
 
             var sourcePlayer = sourceSession?.Player;
@@ -2938,7 +2972,8 @@ namespace DfoServer.Network.Handlers.Dungeon
                         participant.CharacterId,
                         out var participantSlot)
                             ? participantSlot
-                            : byte.MaxValue));
+                            : byte.MaxValue,
+                    participant.AccountId));
             }
 
             if (sourcePlayer == null)
@@ -2953,7 +2988,8 @@ namespace DfoServer.Network.Handlers.Dungeon
                     sourcePlayer.CharacterId,
                     out var sourceSlot)
                         ? sourceSlot
-                        : (byte)0);
+                        : (byte)0,
+                accountId: sourceSession.Account?.AccountId ?? 0);
 
             var sessions = _svc.Sessions;
             if (party == null || sessions == null)
@@ -2969,7 +3005,8 @@ namespace DfoServer.Network.Handlers.Dungeon
                     player?.UserId ?? 0,
                     player?.CurrentRun,
                     attachmentGeneration: 0,
-                    partySlot: member.SlotIndex);
+                    partySlot: member.SlotIndex,
+                    accountId: memberSession.Account?.AccountId ?? 0);
             }
 
             return result;

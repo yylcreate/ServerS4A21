@@ -163,7 +163,7 @@ namespace DfoServer.Game.ExpertJob
             out ExpertJobStoreSession store)
         {
             store = null;
-            if (townId == 0 || ownerUserId == 0)
+            if (townId == 0 || townId == Guilds.GuildAgitAccessPolicy.TownId || ownerUserId == 0)
                 return false;
 
             lock (_syncRoot)
@@ -210,7 +210,8 @@ namespace DfoServer.Game.ExpertJob
             out ExpertJobStoreSession store)
         {
             store = null;
-            if (visitorSessionId == Guid.Empty || visitorCharacterId <= 0)
+            if (visitorSessionId == Guid.Empty || visitorCharacterId <= 0
+                || townId == Guilds.GuildAgitAccessPolicy.TownId)
                 return false;
 
             lock (_syncRoot)
@@ -310,6 +311,8 @@ namespace DfoServer.Game.ExpertJob
 
         public IReadOnlyList<ExpertJobStoreSession> GetStoresInArea(byte townId, byte areaId)
         {
+            if (townId == Guilds.GuildAgitAccessPolicy.TownId)
+                return Array.Empty<ExpertJobStoreSession>();
             var result = new List<ExpertJobStoreSession>();
             lock (_syncRoot)
             {
@@ -384,7 +387,7 @@ namespace DfoServer.Game.ExpertJob
                 return false;
             }
 
-            if (isInDungeon || isInParty
+            if (townId == Guilds.GuildAgitAccessPolicy.TownId || isInDungeon || isInParty
                 || !TryValidateKind(expertJobType, command, disjointMachineState, enchanterState))
             {
                 errorCode = ErrorInvalidState;

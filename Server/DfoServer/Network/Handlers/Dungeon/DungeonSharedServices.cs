@@ -38,6 +38,8 @@ namespace DfoServer.Network.Handlers.Dungeon
             FatigueAcceleration { get; }
         internal Game.Dungeon.DungeonItemAcquisitionService ItemAcquisition { get; }
         internal DungeonPersistentMechanismCoordinator PersistentMechanisms { get; }
+        internal Game.Guilds.GuildDungeonService GuildDungeons { get; }
+        internal GuildDungeonProgressNotifier GuildDungeonProgress { get; }
         internal SqliteCharacterRepository CharacterRepository { get; }
         internal SqliteSubtype1Repository Subtype1Repository { get; }
         internal SqliteCharacterStateRepository CharacterStateRepository { get; }
@@ -246,6 +248,8 @@ namespace DfoServer.Network.Handlers.Dungeon
             PersistentMechanisms = new DungeonPersistentMechanismCoordinator(
                 CharacterStateRepository,
                 AntonAwakeningProgress);
+            GuildDungeons = new Game.Guilds.GuildDungeonService(Database);
+            GuildDungeonProgress = new GuildDungeonProgressNotifier(Database, GuildDungeons, Sessions);
             DeathTower = new DeathTowerCoordinator(
                 ConnectionString,
                 sendExpGrantNotification: (session, settlement) =>

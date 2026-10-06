@@ -607,7 +607,9 @@ namespace DfoServer.Game.Dungeon
                         entry.Run,
                         entry.RunIdentity,
                         roomIdentity,
-                        entry.AttachmentGeneration));
+                        entry.AttachmentGeneration,
+                        byte.MaxValue,
+                        entry.AccountId));
                 }
             }
 
@@ -663,7 +665,9 @@ namespace DfoServer.Game.Dungeon
                         entry.Run,
                         entry.RunIdentity,
                         roomIdentity,
-                        entry.AttachmentGeneration));
+                        entry.AttachmentGeneration,
+                        byte.MaxValue,
+                        entry.AccountId));
                 }
             }
 

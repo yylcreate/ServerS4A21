@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
+using System.Linq;
 using System.Threading;
 
 namespace DfoServer.Game.Dungeon
@@ -918,6 +919,8 @@ namespace DfoServer.Game.Dungeon
             ushort SequenceId)> _recordedKillActors =
                 new HashSet<(long, RoomKey, ushort)>();
         private DungeonSelectionSnapshot _selection;
+        private Game.Guilds.GuildDungeonAdmissionSnapshot _guildDungeonAdmission;
+        private Game.Guilds.GuildDungeonClearContribution _guildDungeonContribution;
         private DungeonClearedFact _clearedFact;
         private SecretShop.SecretShopRoll _secretShopRoll;
         private DungeonInstanceState _state = DungeonInstanceState.Created;
@@ -1045,6 +1048,46 @@ namespace DfoServer.Game.Dungeon
         internal DungeonDiagnosticJournal Diagnostics { get; } =
             new DungeonDiagnosticJournal();
         public DungeonSelectionSnapshot Selection { get { lock (_syncRoot) return _selection; } }
+        internal Game.Guilds.GuildDungeonAdmissionSnapshot GuildDungeonAdmission
+        { get { lock (_syncRoot) return _guildDungeonAdmission; } }
+
+        internal bool TryFreezeGuildDungeonAdmission(Game.Guilds.GuildDungeonAdmissionSnapshot admission)
+        {
+            lock (_syncRoot)
+            {
+                if (_guildDungeonAdmission != null || admission == null
+                    || admission.DungeonId != DungeonId || admission.Difficulty != Difficulty)
+                    return false;
+                _guildDungeonAdmission = admission;
+                return true;
+            }
+        }
+        internal Game.Guilds.GuildDungeonClearContribution GetOrCreateGuildDungeonContribution(
+            DungeonClearedFact clearFact, int monthId, IReadOnlyList<DungeonParticipantRosterEntry> roster)
+        {
+            lock (_syncRoot)
+            {
+                if (_guildDungeonAdmission == null || clearFact == null || !ReferenceEquals(clearFact, _clearedFact)
+                    || !Game.Guilds.GuildDungeonMonth.IsValid(monthId) || roster == null)
+                    throw new InvalidOperationException("Guild contribution requires the current shared clear and its frozen roster.");
+                if (_guildDungeonContribution != null)
+                    return _guildDungeonContribution;
+                if (roster.Any(row => row == null || row.RunIdentity.PartyDungeonInstanceId != PartyDungeonInstanceId))
+                    throw new InvalidOperationException("Guild clear participants must belong to this physical instance.");
+                var grouped = roster.GroupBy(row => row.CharacterId).ToArray();
+                int memberCount = grouped.Length;
+                if (memberCount < 1 || memberCount > 4)
+                    throw new InvalidOperationException("Guild contribution requires one to four distinct participants.");
+                if (grouped.Any(rows => rows.Any(row => row.AccountId <= 0)
+                    || rows.Select(row => row.AccountId).Distinct().Count() != 1))
+                    throw new InvalidOperationException("Guild clear requires original account identities for every frozen character.");
+                var participants = grouped.OrderBy(rows => rows.Key).Select(rows =>
+                    new Game.Guilds.GuildDungeonContributionParticipant(rows.Key, rows.First().AccountId)).ToArray();
+                _guildDungeonContribution = new Game.Guilds.GuildDungeonClearContribution(clearFact.SourceEventId, monthId, memberCount)
+                { Participants = Array.AsReadOnly(participants) };
+                return _guildDungeonContribution;
+            }
+        }
         public DungeonClearedFact ClearedFact { get { lock (_syncRoot) return _clearedFact; } }
         public DungeonInstanceState State { get { lock (_syncRoot) return _state; } }
         public int VisitedRoomCount { get { lock (_syncRoot) return _rooms.Count; } }

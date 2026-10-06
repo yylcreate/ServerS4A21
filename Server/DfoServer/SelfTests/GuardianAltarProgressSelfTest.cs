@@ -72,13 +72,17 @@ namespace DfoServer.SelfTests
             Sql(database, "INSERT INTO accounts(account_id,m_id,password_hash) VALUES(1,'guardian-migration','');"
                 + "INSERT INTO characters(character_id,account_id,name,level) VALUES(1,1,'guardian',70);");
             foreach (var table in Tables) Sql(database, "DROP TABLE " + table + ";");
-            Sql(database, "PRAGMA user_version=33; UPDATE schema_metadata SET schema_version=33;"
+            Sql(database, MigrationSelfTestFixture.RemoveGuildContributionColumns
+                + "DROP TABLE guild_dungeon_progress; PRAGMA user_version=33; UPDATE schema_metadata SET schema_version=33;"
                 + "CREATE TRIGGER reject_guardian_migration BEFORE UPDATE OF schema_version ON schema_metadata "
                 + "WHEN NEW.schema_version=34 BEGIN SELECT RAISE(ABORT,'guardian-migration-test'); END;");
+            check("the v33 fixture excludes later guild dungeon progress storage",
+                Scalar(database, "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='guild_dungeon_progress';") == 0);
             check("failed v34 migration rolls back every table and both schema versions",
                 Throws<SqliteException>(() => Apply(database)) && CountTables(database) == 0
                 && Scalar(database, "PRAGMA user_version;") == 33
-                && Scalar(database, "SELECT schema_version FROM schema_metadata;") == 33);
+                && Scalar(database, "SELECT schema_version FROM schema_metadata;") == 33
+                && Scalar(database, "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='guild_dungeon_progress';") == 0);
             Sql(database, "DROP TRIGGER reject_guardian_migration;");
             Apply(database);
             Apply(database);
@@ -86,6 +90,7 @@ namespace DfoServer.SelfTests
                 CountTables(database) == 5 && Schema(database) == freshSchema
                 && Scalar(database, "PRAGMA user_version;") == SqliteMigrations.CurrentVersion
                 && Scalar(database, "SELECT schema_version FROM schema_metadata;") == SqliteMigrations.CurrentVersion
+                && Scalar(database, "SELECT COUNT(*) FROM pragma_table_info('guild_dungeon_progress') WHERE name='month_id' AND \"notnull\"=1;") == 1
                 && Scalar(database, "SELECT level FROM characters WHERE character_id=1;") == 70);
             Sql(database, "UPDATE schema_metadata SET baseline_id='wrong-guardian-baseline';");
             check("wrong database baseline is rejected without altering schema",

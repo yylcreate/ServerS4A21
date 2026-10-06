@@ -3,6 +3,7 @@ using DfoServer.Game.Appearance;
 using DfoServer.Game.DailyReset;
 using DfoServer.Game.Characters;
 using DfoServer.Game.Friends;
+using DfoServer.Game.Guilds;
 using DfoServer.Game.Inventory;
 using DfoServer.Game.KnightShield;
 using DfoServer.Game.Mercenary;
@@ -15,6 +16,7 @@ using DfoServer.Game.SelectCharacter;
 using DfoServer.GameWorld;
 using DfoServer.Infrastructure;
 using DfoServer.Network.Builders;
+using DfoServer.Network.Builders.Guilds;
 using DfoServer.Network.Builders.Pvp;
 using DfoServer.Network.Parsers;
 using DfoServer.Network.Parsers.Pvp;
@@ -373,6 +375,10 @@ namespace DfoServer.Network.Handlers
                     selectedSpawn = GameChannelSpawnPolicy.Resolve(
                         session.ListenerPort,
                         record.TownId);
+                    if (selectedSpawn.TownId == GuildAgitAccessPolicy.TownId
+                        && new GuildRepository(_database).GetForMember(record.CharacterId) == null)
+                        selectedSpawn = GameChannelSpawnPolicy.Resolve(
+                            session.ListenerPort, GameChannelSpawnPolicy.NormalTownFallbackId);
                     resolvingSpawn = false;
                     session.Player.HydrateFrom(
                         record,
@@ -606,6 +612,25 @@ namespace DfoServer.Network.Handlers
             await SendHonorLevelInfoAsync(session, "select-character-ready", characterList.Honor);
             await _growthCapsule.SendExpProgressAsync(
                 session, "select-character-ready", honor: characterList.Honor);
+            await ProjectGuildEntranceAsync(session);
+            await new Dungeon.GuildDungeonProgressNotifier(_database, new GuildDungeonService(_database), _sessions)
+                .SendAsync(session, "select-character-ready");
+        }
+
+        // Called with the existing selection transition held, AFTER all init
+        // packets: another init reader can otherwise clear the native agit state.
+        internal async Task ProjectGuildEntranceAsync(EnhancedClientSession session)
+        {
+            int id = session?.Player?.CharacterId ?? 0;
+            if (id <= 0 || _sessions == null
+                || !_sessions.TryGet(id, out var current) || !ReferenceEquals(current, session)
+                || !InventoryContext.TryGetOwnedLease(session.SessionId, id, out _))
+                return;
+            var roster = new GuildRepository(_database).GetRosterForMember(id);
+            if (roster == null) return; // Character init already restores nonmembership.
+            await session.SendPacketAsync(GuildJoinPacketBuilder.Rank(
+                roster.Members.Single(member => member.CharacterId == id).Rank));
+            await session.SendPacketAsync(GuildInfoPacketBuilder.Build(roster));
         }
 
         public async Task Handle_ENUM_CMDPACKET_GET_USERINFO(EnhancedClientSession session, GamePacketHeader header, byte[] body)

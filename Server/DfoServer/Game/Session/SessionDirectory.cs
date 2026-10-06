@@ -254,7 +254,10 @@ namespace DfoServer.Game.Session
         internal static bool IsShareableTownArea(
             byte townId,
             byte areaId)
-            => !GameWorld.Town.IsCeraRoom(townId, areaId);
+            // Basic agit entry has no shared guild-instance owner yet. Do not
+            // treat identical resource coordinates as one cross-guild room.
+            => townId != Guilds.GuildAgitAccessPolicy.TownId
+                && !GameWorld.Town.IsCeraRoom(townId, areaId);
 
         internal static async Task<bool> TrySendBestEffortAsync(
             Func<CancellationToken, Task> send,

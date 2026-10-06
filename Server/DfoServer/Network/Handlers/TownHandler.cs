@@ -5,6 +5,7 @@ using DfoServer.Game.Characters;
 using DfoServer.Game.Dungeon;
 using DfoServer.Game.Events.EpicRoad;
 using DfoServer.Game.Friends;
+using DfoServer.Game.Guilds;
 using DfoServer.Game.Inventory;
 using DfoServer.Game.Raid;
 using DfoServer.Game.Session;
@@ -37,16 +38,22 @@ namespace DfoServer.Network.Handlers
             private TownProjectionGuard(
                 DungeonRunIdentity endedRun,
                 DungeonSelectionContext selection,
-                Func<bool> authorizedReturnCurrent = null)
+                Func<bool> authorizedReturnCurrent = null,
+                Func<bool> clientTransitionCurrent = null)
             {
                 EndedRun = endedRun;
                 Selection = selection;
                 AuthorizedReturnCurrent = authorizedReturnCurrent;
+                ClientTransitionCurrent = clientTransitionCurrent;
             }
 
             internal DungeonRunIdentity EndedRun { get; }
             internal DungeonSelectionContext Selection { get; }
             internal Func<bool> AuthorizedReturnCurrent { get; }
+            internal Func<bool> ClientTransitionCurrent { get; }
+
+            internal static TownProjectionGuard ForClientTransition(Func<bool> current) =>
+                new TownProjectionGuard(default(DungeonRunIdentity), null, clientTransitionCurrent: current);
 
             internal static TownProjectionGuard ForAuthorizedReturn(Func<bool> current) =>
                 new TownProjectionGuard(default(DungeonRunIdentity), null, current);
@@ -79,6 +86,14 @@ namespace DfoServer.Network.Handlers
         private Func<EnhancedClientSession, Func<bool>, Task<bool>> _restoreGuardianControls;
         private Func<EnhancedClientSession, Task> _accountDungeonCountProjection;
         private EpicRoadEntryService _epicRoadEntry;
+        private GuildRepository _guilds;
+        private CharacterTransitionCoordinator _guildTransitions;
+
+        internal void ConfigureGuildEntrance(GuildRepository guilds, CharacterTransitionCoordinator transitions)
+        {
+            _guilds = guilds ?? throw new ArgumentNullException(nameof(guilds));
+            _guildTransitions = transitions ?? throw new ArgumentNullException(nameof(transitions));
+        }
 
         internal void ConfigureEpicRoadEntry(EpicRoadEntryService entry)
             => _epicRoadEntry = entry ?? throw new ArgumentNullException(nameof(entry));
@@ -318,10 +333,33 @@ namespace DfoServer.Network.Handlers
             EnhancedClientSession session,
             GamePacketHeader header,
             byte[] body)
-            => SetUserAreaCoreAsync(
-                session,
-                body,
-                default(TownProjectionGuard));
+        {
+            // Guild mutations take these same gates. Entry and exit cannot
+            // race a queued removal, reconnect or character selection.
+            if (_guildTransitions != null && body?.Length >= 6
+                && (body[0] == GuildAgitAccessPolicy.TownId
+                    || session.Player.CurTownId == GuildAgitAccessPolicy.TownId))
+            {
+                var player = session.Player;
+                var account = session.Account;
+                var gameSession = session.GameSession;
+                int cid = player.CharacterId;
+                ushort uid = player.UserId;
+                var runGeneration = player.CurrentDungeonRunGeneration;
+                var selectionGeneration = player.CurrentDungeonSelectionGeneration;
+                bool Current() => ReferenceEquals(session.Player, player)
+                    && ReferenceEquals(session.Account, account) && ReferenceEquals(session.GameSession, gameSession)
+                    && player.CharacterId == cid && player.UserId == uid
+                    && player.CurrentDungeonRunGeneration == runGeneration
+                    && player.CurrentDungeonSelectionGeneration == selectionGeneration
+                    && _guildTransitions.IsCurrent(session)
+                    && InventoryContext.TryGetOwnedLease(session.SessionId, cid, out _);
+                return _guildTransitions.RunIfCurrentAsync(session, () => Current()
+                    ? SetUserAreaCoreAsync(session, body, TownProjectionGuard.ForClientTransition(Current))
+                    : Task.CompletedTask);
+            }
+            return SetUserAreaCoreAsync(session, body, default(TownProjectionGuard));
+        }
 
         private async Task SetUserAreaCoreAsync(
             EnhancedClientSession session,
@@ -338,6 +376,34 @@ namespace DfoServer.Network.Handlers
             var gotoAreaId = body[1];
             var gotoPosX = BitConverter.ToInt16(body, 2);
             var gotoPosY = BitConverter.ToInt16(body, 4);
+
+            if (gotoTownId == GuildAgitAccessPolicy.TownId)
+            {
+                if (!CanRestoreGuildAgitArea(session, gotoAreaId, projectionGuard)
+                    && !TryValidateGuildAgitEntry(session, gotoAreaId, out var guildReason))
+                {
+                    FileLogger.Log($"[GuildAgit] entry rejected cid={session.Player.CharacterId}: {guildReason}");
+                    await ChannelTownRestrictionSender.SendCurrentAreaAsync(session);
+                    return;
+                }
+                var player = session.Player;
+                var account = session.Account;
+                var gameSession = session.GameSession;
+                int cid = player.CharacterId;
+                ushort uid = player.UserId;
+                var runGeneration = player.CurrentDungeonRunGeneration;
+                var selectionGeneration = player.CurrentDungeonSelectionGeneration;
+                var sourceGuard = projectionGuard;
+                projectionGuard = TownProjectionGuard.ForAuthorizedReturn(() =>
+                    CanContinueTownProjection(session, sourceGuard)
+                    && ReferenceEquals(session.Player, player) && ReferenceEquals(session.Account, account)
+                    && ReferenceEquals(session.GameSession, gameSession)
+                    && player.CharacterId == cid && player.UserId == uid
+                    && player.CurrentDungeonRunGeneration == runGeneration
+                    && player.CurrentDungeonSelectionGeneration == selectionGeneration
+                    && _guildTransitions.IsCurrent(session)
+                    && InventoryContext.TryGetOwnedLease(session.SessionId, cid, out _));
+            }
 
             // The resource NPC's A21 menu sends SET_USER_AREA. Validate only
             // the external transition into this event town; existing run/selection
@@ -850,6 +916,13 @@ namespace DfoServer.Network.Handlers
             }
 
             var targetTownId = (int)request.TargetTownId;
+            if (targetTownId == GuildAgitAccessPolicy.TownId)
+            {
+                // A town-selection item is not a guild-entrance authorization.
+                // Reject before consuming it or persisting an agit gate anchor.
+                await ChannelTownRestrictionSender.SendCurrentAreaAsync(session);
+                return;
+            }
             if (!GameChannelSpawnPolicy.CanEnterTown(
                     session.ListenerPort,
                     targetTownId))
@@ -978,6 +1051,12 @@ namespace DfoServer.Network.Handlers
                     $"[{ProtocolName}] PARTY_TELEPORT rejected invalid body: " +
                     $"cid={session?.Player?.CharacterId ?? 0} " +
                     $"length={body?.Length ?? 0}");
+                return;
+            }
+
+            if (request.TownId == GuildAgitAccessPolicy.TownId)
+            {
+                await ChannelTownRestrictionSender.SendCurrentAreaAsync(session);
                 return;
             }
 
@@ -1150,6 +1229,59 @@ namespace DfoServer.Network.Handlers
                     && new Game.Quests.QuestRepository(_database.ConnectionString)
                         .LoadClearedFlags(cid)
                         .ContainsKey(questId));
+            return reason == null;
+        }
+
+        private bool CanRestoreGuildAgitArea(EnhancedClientSession session, byte targetAreaId,
+            TownProjectionGuard guard)
+        {
+            // The return owner already applied its exact frozen anchor. A
+            // selection is still present until the final town projection, so
+            // this restoration must not be mistaken for a new client entry.
+            // A removed member can restore that anchor and then leave the agit.
+            var player = session?.Player;
+            return (guard.Selection != null || guard.EndedRun.IsValid)
+                && CanContinueTownProjection(session, guard)
+                && player != null && player.CurTownId == GuildAgitAccessPolicy.TownId
+                && player.CurAreaId == targetAreaId
+                && _guildTransitions?.IsCurrent(session) == true
+                && InventoryContext.TryGetOwnedLease(session.SessionId, player.CharacterId, out _)
+                && Town.TryGetArea(GuildAgitAccessPolicy.TownId, targetAreaId, out _);
+        }
+
+        internal bool TryValidateGuildAgitEntry(EnhancedClientSession session, byte targetAreaId, out string reason)
+        {
+            reason = "guild_agit_source_unavailable";
+            var player = session?.Player;
+            if (_guilds == null || _guildTransitions == null || player == null
+                || !_guildTransitions.IsCurrent(session) || player.CharacterId <= 0 || player.UserId == 0
+                || session.Account?.AccountId <= 0 || session.Account == null || session.GameSession == null
+                || !InventoryContext.TryGetOwnedLease(session.SessionId, player.CharacterId, out _)
+                || !SessionDirectory.IsTownPresence(player) || player.DungeonSelectionPending
+                || player.CurrentDungeonSelection != null)
+                return false;
+            if (_guilds.GetForMember(player.CharacterId) == null)
+            {
+                reason = "guild_agit_not_member";
+                return false;
+            }
+            var fromPersonalRoom = Town.IsCeraRoom(player.CurTownId, player.CurAreaId)
+                && targetAreaId == GuildAgitAccessPolicy.BasicAreaId;
+            var withinAgit = player.CurTownId == GuildAgitAccessPolicy.TownId
+                && Town.TryGetArea(GuildAgitAccessPolicy.TownId, player.CurAreaId, out _)
+                && Town.TryGetArea(GuildAgitAccessPolicy.TownId, targetAreaId, out _)
+                && (player.CurAreaId == targetAreaId
+                    || Town.HasDirectAreaConnection(GuildAgitAccessPolicy.TownId, player.CurAreaId, targetAreaId));
+            if (!fromPersonalRoom && !withinAgit)
+            {
+                reason = "guild_agit_route_unavailable";
+                return false;
+            }
+            if (!Town.TryGetAreaPermission(GuildAgitAccessPolicy.TownId, targetAreaId, out var permission))
+                return false;
+            var cleared = new Game.Quests.QuestRepository(_database.ConnectionString)
+                .LoadClearedFlags(player.CharacterId);
+            reason = TownAreaPermissionPolicy.GetDenyReason(permission, player.Level, cleared.ContainsKey);
             return reason == null;
         }
 
@@ -2104,6 +2236,9 @@ namespace DfoServer.Network.Handlers
             EnhancedClientSession session,
             TownProjectionGuard projectionGuard)
         {
+            if (projectionGuard.ClientTransitionCurrent != null
+                && !projectionGuard.ClientTransitionCurrent())
+                return false;
             if (projectionGuard.AuthorizedReturnCurrent != null)
                 return projectionGuard.AuthorizedReturnCurrent();
 
@@ -2129,7 +2264,7 @@ namespace DfoServer.Network.Handlers
         private static async Task<bool> TrySendTownProjectionPacketAsync(
             EnhancedClientSession session, TownProjectionGuard guard, byte[] packet)
         {
-            if (guard.AuthorizedReturnCurrent == null)
+            if (guard.AuthorizedReturnCurrent == null && guard.ClientTransitionCurrent == null)
             {
                 await session.SendPacketAsync(packet);
                 return true;

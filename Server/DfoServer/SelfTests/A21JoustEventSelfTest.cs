@@ -360,7 +360,7 @@ namespace DfoServer.SelfTests
             {
                 using (var command = connection.CreateCommand())
                 {
-                    command.CommandText = @"
+                    command.CommandText = MigrationSelfTestFixture.RemoveGuildContributionColumns + @"
 DROP TABLE IF EXISTS event_joust_history;
 DROP TABLE IF EXISTS event_joust_match_results;
 DROP TABLE IF EXISTS event_joust_results;
@@ -371,6 +371,7 @@ DROP TABLE IF EXISTS event_joust_rules;
 DROP TABLE IF EXISTS game_event_info_extra;
 DROP TABLE IF EXISTS game_event_info_details;
 DROP TABLE IF EXISTS game_event_state;
+DROP TABLE guild_dungeon_progress;
 UPDATE schema_metadata SET schema_version=9 WHERE singleton_id=1;
 PRAGMA user_version=9;";
                     command.ExecuteNonQuery();

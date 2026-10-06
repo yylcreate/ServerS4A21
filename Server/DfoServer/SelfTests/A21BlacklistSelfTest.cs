@@ -54,18 +54,24 @@ namespace DfoServer.SelfTests
             check("ASCII BLOB add/list/delete round trips", repo.Add(101, "GUMA").Status == BlacklistResult.Success
                 && repo.List(101).Single().Name == "GUMA" && repo.Remove(101, "GUMA"));
             check("new database has empty blacklist at current schema", repo.List(101).Count == 0 && Scalar("PRAGMA user_version") == Sqlite.SqliteMigrations.CurrentVersion);
-            Sql("DROP TABLE character_blacklist; PRAGMA user_version=31; UPDATE schema_metadata SET schema_version=31;");
+            Sql(MigrationSelfTestFixture.RemoveGuildContributionColumns
+                + "DROP TABLE character_blacklist; DROP TABLE guild_dungeon_progress;"
+                + "PRAGMA user_version=31; UPDATE schema_metadata SET schema_version=31;");
+            check("the v31 fixture excludes later guild dungeon progress storage",
+                Scalar("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='guild_dungeon_progress'") == 0);
             Sql("CREATE TRIGGER reject_blacklist_migration BEFORE UPDATE OF schema_version ON schema_metadata BEGIN SELECT RAISE(ABORT,'test'); END;");
             bool migrationFailed = false;
             using (var c = db.OpenConnection())
                 try { Sqlite.SqliteMigrations.Apply(c); } catch (SqliteException) { migrationFailed = true; }
             check("failed migration rolls back table and versions", migrationFailed && Scalar("PRAGMA user_version") == 31
-                && Scalar("SELECT COUNT(*) FROM sqlite_master WHERE name='character_blacklist'") == 0);
+                && Scalar("SELECT schema_version FROM schema_metadata") == 31
+                && Scalar("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('character_blacklist','guild_dungeon_progress')") == 0);
             Sql("DROP TRIGGER reject_blacklist_migration;");
             using (var c = db.OpenConnection()) { Sqlite.SqliteMigrations.Apply(c); Sqlite.SqliteMigrations.Apply(c); }
             check("v31 migration preserves characters and advances both versions", Scalar("SELECT COUNT(*) FROM characters") == 3
                 && Scalar("PRAGMA user_version") == Sqlite.SqliteMigrations.CurrentVersion
-                && Scalar("SELECT schema_version FROM schema_metadata") == Sqlite.SqliteMigrations.CurrentVersion);
+                && Scalar("SELECT schema_version FROM schema_metadata") == Sqlite.SqliteMigrations.CurrentVersion
+                && Scalar("SELECT COUNT(*) FROM pragma_table_info('guild_dungeon_progress') WHERE name='month_id' AND \"notnull\"=1") == 1);
             check("captured permanent request decodes strict GBK", BlacklistHandler.TryParseName(Convert.FromHexString("06000000BAA3C9AADEB1"), out var captured) && captured.Length == 3);
             foreach (var bytes in new[] { Array.Empty<byte>(), Name(""), Name("甲").Concat(new byte[] { 0 }).ToArray(),
                 new byte[] { 255,255,255,127 }, new byte[] { 1,0,0,0,0x81 }, Name("\0"), Name(new string('中', 15)) })

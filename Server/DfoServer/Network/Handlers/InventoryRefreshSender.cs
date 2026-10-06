@@ -45,13 +45,26 @@ namespace DfoServer.Network.Handlers
 
         public async Task SendNoti2AppearanceUpdate(EnhancedClientSession session)
         {
+            var packet = PrepareNoti2AppearanceUpdate(session);
+            await session.SendPacketAsync(packet);
+            await BroadcastNoti2AppearanceUpdateToArea(session, packet);
+        }
+
+        // This remains the appearance owner: preparation updates runtime entries
+        // and persists UpdateAppearance before building the existing NOTI 2 body.
+        internal byte[] PrepareNoti2AppearanceUpdate(EnhancedClientSession session)
+        {
             var noti2Body = AppearanceService.UpdateAndBroadcast(
                 session.Player,
                 _characterRepository,
                 _database);
             var packet = GamePacketEnvelopeBuilder.Build(0x00, 0x0002, noti2Body);
             FileLogger.Log($"[{ProtocolName}] NOTI 2 appearance update: {session.Player.AppearanceEntries.Length} entries, body={noti2Body.Length}B");
-            await session.SendPacketAsync(packet);
+            return packet;
+        }
+
+        internal async Task BroadcastNoti2AppearanceUpdateToArea(EnhancedClientSession session, byte[] packet)
+        {
             if (_sessions == null
                 || session?.Player == null
                 || session.Player.CharacterId <= 0
