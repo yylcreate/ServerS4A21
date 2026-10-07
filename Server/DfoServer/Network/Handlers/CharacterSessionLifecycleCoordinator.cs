@@ -249,6 +249,7 @@ namespace DfoServer.Network.Handlers
             }
             finally
             {
+                GuildStatBuffNotifier.CancelForSession(session);
                 if (characterId > 0)
                 {
                     try
@@ -495,6 +496,8 @@ namespace DfoServer.Network.Handlers
                     EpicBuffPotionBuffNotifier.ScheduleRemoveForCurrentEffect(
                         session,
                         selectedCharacterId);
+                    await GuildStatBuffNotifier.ApplyForCharacterAsync(
+                        session, _database, selectedCharacterId, _characterTransitions);
                     await session.GameSession.QuestManager
                         .SyncItemSeekingQuestProgressAsync(null);
                     await PetCreatureRuntimeService.BeginTownAsync(
@@ -753,6 +756,7 @@ namespace DfoServer.Network.Handlers
             if (session?.Player == null)
                 return;
 
+            GuildStatBuffNotifier.CancelForSession(session);
             session.Player.CharacterId = 0;
             session.Player.UserId = 0;
             session.Player.PvpGrade = 0;
@@ -999,6 +1003,7 @@ namespace DfoServer.Network.Handlers
             if (displaced == null)
                 return;
 
+            GuildStatBuffNotifier.CancelForSession(displaced);
             try
             {
                 await _expertJobStoreHandler.CloseSessionAsync(
@@ -1089,6 +1094,7 @@ namespace DfoServer.Network.Handlers
             int characterId,
             EnhancedClientSession session)
         {
+            GuildStatBuffNotifier.CancelForCharacter(session, characterId);
             var removed = false;
             try
             {

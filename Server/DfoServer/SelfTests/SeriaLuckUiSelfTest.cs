@@ -6,6 +6,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Reflection;
 using System.Runtime.CompilerServices;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using DfoServer.Game.Accounts;
@@ -13,6 +14,7 @@ using DfoServer.Game.Characters;
 using DfoServer.Game.Events;
 using DfoServer.Game.Events.SeriaLuck;
 using DfoServer.Game.Inventory;
+using DfoServer.Game.Mailbox;
 using DfoServer.Game.SelectCharacter;
 using DfoServer.Game.Session;
 using DfoServer.Infrastructure;
@@ -292,6 +294,10 @@ detail_flag=1,flag_a=7,sort_order=4,updated_at='saved metadata' WHERE event_id=2
                     && GaugePacket(full, 35, 40));
                 var source = SeriaLuckGaugeProjection.Capture(session, fixture.Lease);
                 var ninth = fixture.Open(1, out last, out var persistenceFailed);
+                Console.WriteLine($"SERIA_NINTH observed committed={ninth} persistenceFailed={persistenceFailed} "
+                    + $"error={last?.ErrorCode} double={last?.SeriaLuckDoubleTriggered} rewards={last?.DoubleRewards.Count} "
+                    + $"before={last?.SeriaLuckValueBefore} after={last?.SeriaLuckValueAfter} "
+                    + $"durableLuck={fixture.Luck} remainingBoxes={fixture.Lease.Inventory.CountMainItem(2682272)}");
                 check("ninth real opening consumes the full counter, commits double rewards and returns to progress one",
                     ninth && !persistenceFailed && last.SeriaLuckDoubleTriggered
                     && last.DoubleRewards.Count > 0 && last.SeriaLuckValueBefore == 8 && last.SeriaLuckValueAfter == 1
@@ -299,10 +305,12 @@ detail_flag=1,flag_a=7,sort_order=4,updated_at='saved metadata' WHERE event_id=2
                     && SeriaLuckGaugeProjection.TryBuildPacket(fixture.Ui, last, out var reset)
                     && GaugePacket(reset, 40, 5));
                 var inventoryRows = fixture.Text("SELECT group_concat(hex(item_core),'|') FROM (SELECT item_core FROM character_inventory_items ORDER BY list_type,slot_index);");
+                var mailboxRows = fixture.MailboxSnapshot();
                 session.TcpClient.Dispose();
                 check("transport failure after the reward transaction never regrants or advances progress",
                     !await source.SendAsync(fixture.Ui, last) && fixture.Luck == 1
-                    && fixture.Text("SELECT group_concat(hex(item_core),'|') FROM (SELECT item_core FROM character_inventory_items ORDER BY list_type,slot_index);") == inventoryRows);
+                    && fixture.Text("SELECT group_concat(hex(item_core),'|') FROM (SELECT item_core FROM character_inventory_items ORDER BY list_type,slot_index);") == inventoryRows
+                    && fixture.MailboxSnapshot() == mailboxRows);
             }
             using (var fixture = new Fixture())
             {
@@ -320,12 +328,14 @@ detail_flag=1,flag_a=7,sort_order=4,updated_at='saved metadata' WHERE event_id=2
                 fixture.CreateSession(); fixture.PrepareBoxes(2); fixture.SetLuck(7);
                 fixture.Sql(@"CREATE TRIGGER seria_ui_force_rollback BEFORE UPDATE OF seria_luck_value ON accounts
 BEGIN SELECT RAISE(ABORT,'seria UI transaction fixture'); END;");
+                var mailboxRows = fixture.MailboxSnapshot();
                 var committed = fixture.Open(1, out _, out var failed);
                 using var connection = fixture.Database.OpenConnection();
                 var reloaded = InventoryService.LoadFromDb(connection, fixture.CharacterId, 1, fixture.Database);
                 check("failed owner transaction reloads the source and keeps account progress unchanged",
                     !committed && failed && fixture.Luck == 7
-                    && fixture.Lease.Inventory.CountMainItem(2682272) == 2 && reloaded.CountMainItem(2682272) == 2);
+                    && fixture.Lease.Inventory.CountMainItem(2682272) == 2 && reloaded.CountMainItem(2682272) == 2
+                    && fixture.MailboxSnapshot() == mailboxRows);
             }
             using (var fixture = new Fixture())
             {
@@ -401,6 +411,7 @@ BEGIN SELECT RAISE(ABORT,'seria UI transaction fixture'); END;");
             internal readonly int CharacterId = Interlocked.Add(ref _nextCharacter, 3);
             internal readonly GameDatabase Database;
             internal readonly SeriaLuckUiService Ui;
+            private readonly IInventoryOverflowRewardSink _overflowRewardSink;
             internal InventoryLease Lease;
             internal int Luck => checked((int)Number("SELECT seria_luck_value FROM accounts WHERE account_id=1;"));
 
@@ -411,6 +422,11 @@ BEGIN SELECT RAISE(ABORT,'seria UI transaction fixture'); END;");
                 Sql("INSERT INTO accounts(account_id,m_id,password_hash) VALUES(1,'seria-ui-one',''),(2,'seria-ui-two','');"
                     + $"INSERT INTO characters(character_id,account_id,name,job,level) VALUES({CharacterId},1,'seria-ui-a',0,50),"
                     + $"({CharacterId + 1},1,'seria-ui-b',0,50),({CharacterId + 2},2,'seria-ui-c',0,50);");
+                // The real runtime supplies its transaction-bound mailbox sink.
+                // A null sink rejects legitimate multiple rewards whose PVF
+                // stack limit is one, making this random-resource fixture flaky.
+                _overflowRewardSink = new MailboxInventoryOverflowRewardSink(
+                    new MailboxService(new MailboxRepository(Database)));
                 Ui = new SeriaLuckUiService(Database, () => BoosterGageConfigFile.Parse(Config()));
             }
 
@@ -451,7 +467,42 @@ BEGIN SELECT RAISE(ABORT,'seria UI transaction fixture'); END;");
             internal bool Open(int count, out BoosterUseResult result, out bool failed)
                 => InventorySpecialConsumableCommitService.TryCommitBoosterItem(Lease,
                     new BoosterUseRequest { ExpectedItemTemplateId = 2682272, RequestedCount = count },
-                    "[swordman]", null, out result, out failed);
+                    "[swordman]", _overflowRewardSink, out result, out failed);
+
+            internal string MailboxSnapshot() => Database.Read(connection =>
+            {
+                using var transaction = connection.BeginTransaction(deferred: true);
+                var snapshot = new Dictionary<string, List<object[]>>();
+                foreach (var table in new[] { "mailbox_messages", "mailbox_recipients", "mailbox_attachments",
+                    "mailbox_campaigns", "mailbox_campaign_deliveries", "mailbox_system_mail_audit",
+                    "mailbox_system_mail_audit_attachments" })
+                {
+                    using var command = connection.CreateCommand();
+                    command.Transaction = transaction;
+                    command.CommandText = "SELECT * FROM " + table + " ORDER BY rowid;";
+                    using var reader = command.ExecuteReader();
+                    var rows = new List<object[]>();
+                    while (reader.Read())
+                    {
+                        var row = new object[reader.FieldCount];
+                        for (var index = 0; index < row.Length; index++)
+                            row[index] = reader.IsDBNull(index) ? null : reader.GetValue(index);
+                        rows.Add(row);
+                    }
+                    snapshot.Add(table, rows);
+                }
+                using (var command = connection.CreateCommand())
+                {
+                    command.Transaction = transaction;
+                    command.CommandText = "SELECT name,seq FROM sqlite_sequence WHERE name LIKE 'mailbox_%' ORDER BY name;";
+                    using var reader = command.ExecuteReader();
+                    var rows = new List<object[]>();
+                    while (reader.Read()) rows.Add(new[] { reader.GetValue(0), reader.GetValue(1) });
+                    snapshot.Add("mailbox_sequences", rows);
+                }
+                transaction.Commit();
+                return JsonSerializer.Serialize(snapshot);
+            });
 
             internal void Sql(string sql) => Database.Write((connection, transaction) =>
             {

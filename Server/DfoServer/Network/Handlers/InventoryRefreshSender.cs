@@ -290,6 +290,20 @@ namespace DfoServer.Network.Handlers
             return SendUpdateItemList(session, InventoryListType.Main, InventoryService.MainVirtualCurrencySlotStart);
         }
 
+        internal async Task SendGoldUpdate(EnhancedClientSession session, Func<bool> canSend)
+        {
+            var (cid, aid) = SessionOwnerResolver.Resolve(session);
+            await SessionDirectory.TrySendBestEffortAsync(async ct =>
+                await session.SendPreparedPacketBatchAsync(() =>
+                {
+                    if (ct.IsCancellationRequested || !canSend()) return Array.Empty<byte[]>();
+                    return new[] { GamePacketEnvelopeBuilder.Build(0, (ushort)NotiPacketTypeA21.UPDATE_ITEM_LIST,
+                        ItemListUpdateBuilder.BuildUpdateBody(cid, aid, InventoryListType.Main,
+                            new[] { InventoryService.MainVirtualCurrencySlotStart })) };
+                }, () => !ct.IsCancellationRequested && canSend()).WaitAsync(ct),
+                $"guild gold update cid={cid}");
+        }
+
         public Task SendGoldUpdate(EnhancedClientSession session, int updatedGold)
         {
             var (cid, _) = SessionOwnerResolver.Resolve(session);

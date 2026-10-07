@@ -21,14 +21,15 @@ namespace DfoServer.Game.Guilds
             using var cmd = c.CreateCommand();
             cmd.CommandText = @"SELECT g.guild_id,g.name,g.promotion,g.leader_character_id,COUNT(m.character_id),
 g.announcement,g.recommended_server_id,g.recommended_channel_id,
-typeof(g.recommended_server_id),typeof(g.recommended_channel_id)
+typeof(g.recommended_server_id),typeof(g.recommended_channel_id),g.points
 FROM guilds g JOIN guild_members m ON m.guild_id=g.guild_id WHERE g.name=@name GROUP BY g.guild_id;";
             cmd.Parameters.AddWithValue("@name", name);
             using var reader = cmd.ExecuteReader();
             if (!reader.Read()) return null;
             var recommended = ReadRecommendedChannel(reader, 6, 8);
             return new GuildSearchResult(new GuildRecord(reader.GetInt32(0), reader.GetString(1),
-                reader.GetString(2), reader.GetInt32(3), reader.GetString(5), recommended.ServerId, recommended.ChannelId),
+                reader.GetString(2), reader.GetInt32(3), reader.GetString(5), recommended.ServerId, recommended.ChannelId,
+                ReadUnsigned(reader, 10, "points")),
                 checked((ushort)reader.GetInt32(4)));
         });
 
@@ -56,7 +57,9 @@ WHERE g.leader_character_id=@leader ORDER BY a.applied_at,c.character_id;";
         internal GuildRoster GetRosterForMember(int characterId, int monthId = 0) => Database.Read(c =>
         {
             int resolvedMonthId = GuildDungeonMonth.ResolveMonthId(monthId);
+            using var transaction = c.BeginTransaction(deferred: true);
             using var cmd = c.CreateCommand();
+            cmd.Transaction = transaction;
             cmd.CommandText = @"SELECT g.guild_id,g.name,g.promotion,g.leader_character_id,
 leader.name,member.character_id,member.account_id,member.name,member.level,member.job,member.grow_type,
 MIN(2147483647,MAX(0,unixepoch('now')-unixepoch(COALESCE(d.last_logout_at,member.updated_at)))),
@@ -66,7 +69,7 @@ self.contribution_total,self.contribution_month_id,self.contribution_month_value
 typeof(g.contribution_total),typeof(g.contribution_month_id),typeof(g.contribution_month_value),
 typeof(self.contribution_total),typeof(self.contribution_month_id),typeof(self.contribution_month_value),
 g.recommended_server_id,g.recommended_channel_id,
-typeof(g.recommended_server_id),typeof(g.recommended_channel_id)
+typeof(g.recommended_server_id),typeof(g.recommended_channel_id),g.points
 FROM guild_members self JOIN guilds g ON g.guild_id=self.guild_id
 JOIN characters leader ON leader.character_id=g.leader_character_id
 JOIN guild_members m ON m.guild_id=g.guild_id
@@ -84,7 +87,7 @@ WHERE self.character_id=@character ORDER BY member.character_id;";
             {
                 var recommended = ReadRecommendedChannel(reader, 27, 29);
                 guild ??= new GuildRecord(reader.GetInt32(0), reader.GetString(1), reader.GetString(2), reader.GetInt32(3),
-                    reader.GetString(12), recommended.ServerId, recommended.ChannelId);
+                    reader.GetString(12), recommended.ServerId, recommended.ChannelId, ReadUnsigned(reader, 31, "points"));
                 guildContribution ??= ProjectContribution(ReadContribution(reader, 15, 21), resolvedMonthId);
                 requesterContribution ??= ProjectContribution(ReadContribution(reader, 18, 24), resolvedMonthId);
                 leaderName ??= ReadCharacterName(reader, 4);
@@ -95,8 +98,11 @@ WHERE self.character_id=@character ORDER BY member.character_id;";
             if (guild == null) return null;
             var requester = members.Find(member => member.CharacterId == characterId)
                 ?? throw new System.IO.InvalidDataException("Guild contribution roster has no active requesting member.");
+            reader.Close();
+            var contents = GetPurchasedContents(c, guild.Id, transaction);
+            transaction.Commit();
             return new GuildRoster(guild, leaderName, members, characterId, guildContribution,
-                new GuildMemberContributionSnapshot(characterId, requester.AccountId, requesterContribution));
+                new GuildMemberContributionSnapshot(characterId, requester.AccountId, requesterContribution), contents);
         });
 
         // characters.name is normally a GBK BLOB; legacy/tool-created TEXT is
@@ -115,11 +121,11 @@ WHERE self.character_id=@character ORDER BY member.character_id;";
             => Scalar(c, t, "SELECT EXISTS(SELECT 1 FROM characters WHERE character_id=@v AND delete_flag=0);", id) != 0;
         internal static GuildRecord GetForMember(SqliteConnection c, SqliteTransaction t, int characterId)
             => ReadGuild(c, t, @"SELECT g.guild_id,g.name,g.promotion,g.leader_character_id,g.announcement,
-g.recommended_server_id,g.recommended_channel_id,typeof(g.recommended_server_id),typeof(g.recommended_channel_id)
+g.recommended_server_id,g.recommended_channel_id,typeof(g.recommended_server_id),typeof(g.recommended_channel_id),g.points
 FROM guilds g JOIN guild_members m ON m.guild_id=g.guild_id WHERE m.character_id=@v;", characterId);
         internal static GuildRecord Get(SqliteConnection c, SqliteTransaction t, int guildId)
             => ReadGuild(c, t, @"SELECT guild_id,name,promotion,leader_character_id,announcement,
-recommended_server_id,recommended_channel_id,typeof(recommended_server_id),typeof(recommended_channel_id)
+recommended_server_id,recommended_channel_id,typeof(recommended_server_id),typeof(recommended_channel_id),points
 FROM guilds WHERE guild_id=@v;", guildId);
 
         internal static GuildRecord Insert(SqliteConnection c, SqliteTransaction t, int leaderId, string name, string promotion)
@@ -200,7 +206,7 @@ WHERE guild_id=@guild AND character_id=@character);", guildId, characterId);
             if (!reader.Read()) return null;
             var recommended = ReadRecommendedChannel(reader, 5, 7);
             return new GuildRecord(reader.GetInt32(0), reader.GetString(1), reader.GetString(2), reader.GetInt32(3),
-                reader.GetString(4), recommended.ServerId, recommended.ChannelId);
+                reader.GetString(4), recommended.ServerId, recommended.ChannelId, ReadUnsigned(reader, 9, "points"));
         }
         private static (int ServerId, int ChannelId) ReadRecommendedChannel(SqliteDataReader reader, int valueOrdinal, int typeOrdinal)
         {

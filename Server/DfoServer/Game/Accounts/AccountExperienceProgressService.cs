@@ -66,6 +66,28 @@ namespace DfoServer.Game.Accounts
             return _growthCapsuleRepository.LoadSummary(accountId);
         }
 
+        internal AccountExperienceProgressSummary LoadCurrentSummary(int accountId)
+        {
+            if (accountId <= 0)
+                return BuildSummary(accountId, default);
+
+            AccountExperienceProgressTotals totals;
+            using (var connection = new SqliteConnection(_connectionString))
+            {
+                connection.Open();
+                using (var transaction = connection.BeginTransaction(deferred: true))
+                {
+                    totals = new AccountExperienceProgressTotals(
+                        HonorLevelProgressRepository.LoadAccountHonorExp(connection, transaction, accountId),
+                        GrowthCapsuleProgressRepository.LoadTotalExp(connection, transaction, accountId),
+                        0);
+                    transaction.Commit();
+                }
+            }
+
+            return BuildSummary(accountId, totals);
+        }
+
         public AccountExperienceProgressSummary AddHonorAndGrowthCapsuleExp(int accountId, uint honorExpGain)
         {
             if (accountId <= 0)

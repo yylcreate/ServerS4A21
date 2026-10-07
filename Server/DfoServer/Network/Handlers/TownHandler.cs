@@ -83,6 +83,7 @@ namespace DfoServer.Network.Handlers
             _dungeonGiveupPartyDeparture;
         private Func<Task> _publishTownPartyLists;
         private Func<EnhancedClientSession, byte, byte, Task> _raidTownAreaChanged;
+        private Func<IEnumerable<int>, Task> _publishGuildState;
         private Func<EnhancedClientSession, Func<bool>, Task<bool>> _restoreGuardianControls;
         private Func<EnhancedClientSession, Task> _accountDungeonCountProjection;
         private EpicRoadEntryService _epicRoadEntry;
@@ -164,6 +165,9 @@ namespace DfoServer.Network.Handlers
         {
             _publishTownPartyLists = publisher;
         }
+
+        internal void ConfigureGuildStatePublisher(Func<IEnumerable<int>, Task> publisher)
+            => _publishGuildState = publisher;
 
         internal void ConfigureRaidTownAreaChanged(
             Func<EnhancedClientSession, byte, byte, Task> handler)
@@ -366,7 +370,8 @@ namespace DfoServer.Network.Handlers
             byte[] body,
             TownProjectionGuard projectionGuard,
             EnhancedClientSession.GuardianAltarControlProjectionSource expectedControlsSource = null,
-            Action controlsRestored = null)
+            Action controlsRestored = null,
+            TownUserSnapshot committedTeleportSource = null)
         {
             if (body == null || body.Length < 6) return;
             var controlsSource = expectedControlsSource ?? session?.GuardianAltarControls;
@@ -462,8 +467,8 @@ namespace DfoServer.Network.Handlers
                 return;
             }
 
-            var previousTownId = session.Player.CurTownId;
-            var previousAreaId = session.Player.CurAreaId;
+            var previousTownId = committedTeleportSource?.TownId ?? session.Player.CurTownId;
+            var previousAreaId = committedTeleportSource?.AreaId ?? session.Player.CurAreaId;
 
             session.Player.CurTownId = gotoTownId;
             session.Player.CurAreaId = gotoAreaId;
@@ -529,7 +534,8 @@ namespace DfoServer.Network.Handlers
             if (!CanContinueTownProjection(session, projectionGuard))
                 return;
 
-            PersistPosition(session, forceImmediate: true, source: "set_user_area");
+            if (committedTeleportSource == null)
+                PersistPosition(session, forceImmediate: true, source: "set_user_area");
             if (await TryRestoreGuardianControlsAsync(session, projectionGuard, controlsSource))
                 controlsRestored?.Invoke();
             if (gotoTownId == EpicRoadEntryService.TargetTownId && CanContinueTownProjection(session, projectionGuard))
@@ -1187,23 +1193,159 @@ namespace DfoServer.Network.Handlers
                 return;
             }
 
-            var moved = 0;
+            // Serialize with character changes, town/guild transitions and
+            // relogin. Acquire the existing gates in character order; no
+            // second lock registry or online guild-content balance is needed.
+            if (_guildTransitions == null || _guilds == null
+                || !Town.TryGetArea(request.TownId, request.AreaId, out _))
+                return;
+            // Capture the request's original participants BEFORE waiting on
+            // any gate. A queued request must not acquire a newly selected
+            // Player/account/lease and reinterpret the old packet for it.
+            var sources = new List<(EnhancedClientSession Session, PlayerContext Player,
+                InventoryLease Lease, TownUserSnapshot Area, Func<bool> Current, bool Persist)>();
             foreach (var memberSession in eligible)
             {
-                await SetUserAreaCoreAsync(
-                    memberSession,
-                    areaBody,
-                    default(TownProjectionGuard));
-                moved++;
+                var player = memberSession.Player;
+                var account = memberSession.Account;
+                var gameSession = memberSession.GameSession;
+                if (player == null || account == null || gameSession == null
+                    || !snapshot.Members.Any(member => member.CharacterId == player.CharacterId
+                        && member.UserId == player.UserId && member.SessionId == memberSession.SessionId)
+                    || !SessionDirectory.IsTownPresence(player)
+                    || player.DungeonSelectionPending || player.CurrentDungeonSelection != null
+                    || !InventoryContext.TryGetOwnedLease(memberSession.SessionId,
+                        player.CharacterId, out var inventoryLease)
+                    || inventoryLease.AccountId != account.AccountId
+                    || !string.Equals(inventoryLease.Inventory.Database?.ConnectionString,
+                        _guilds.Database.ConnectionString, StringComparison.Ordinal)
+                    || !IsPartyTeleportSameRoom(session.Player, player)
+                    || !MeetsTownAreaPermission(memberSession, request.TownId, request.AreaId, out _)
+                    || !CanChangeRaidArea(memberSession, request.TownId, request.AreaId))
+                    return;
+                if (player.CurTownId != request.TownId
+                    && request.TownId == EpicRoadEntryService.TargetTownId
+                    && !TryValidateEpicRoadTownEntry(memberSession, request.AreaId, out _))
+                    return;
+                var characterId = player.CharacterId;
+                var userId = player.UserId;
+                var runGeneration = player.CurrentDungeonRunGeneration;
+                var selectionGeneration = player.CurrentDungeonSelectionGeneration;
+                bool Current() => ReferenceEquals(memberSession.Player, player)
+                    && ReferenceEquals(memberSession.Account, account)
+                    && ReferenceEquals(memberSession.GameSession, gameSession)
+                    && player.CharacterId == characterId && player.UserId == userId
+                    && inventoryLease.AccountId == account.AccountId
+                    && player.CurrentDungeonRunGeneration == runGeneration
+                    && player.CurrentDungeonSelectionGeneration == selectionGeneration
+                    && SessionDirectory.IsTownPresence(player)
+                    && !player.DungeonSelectionPending && player.CurrentDungeonSelection == null
+                    && _guildTransitions.IsCurrent(memberSession)
+                    && InventoryContext.IsCurrentLease(inventoryLease, memberSession.SessionId, characterId);
+                sources.Add((memberSession, player, inventoryLease,
+                    TownAreaNotificationBuilder.CreateCurrentSnapshot(player), Current,
+                    GameChannelSpawnPolicy.ShouldPersistPosition(memberSession.ListenerPort,
+                        request.TownId, request.AreaId)));
             }
+            var transitionLeases = new List<IDisposable>();
+            IReadOnlyList<int> guildRefreshMembers = null;
+            try
+            {
+                foreach (var source in sources.OrderBy(source => source.Lease.CharacterId))
+                {
+                    if (!source.Current()) return;
+                    var transition = await _guildTransitions.AcquireIfCurrentAsync(source.Session);
+                    if (transition == null) return;
+                    transitionLeases.Add(transition);
+                    if (!source.Current()) return;
+                }
+                bool PartyCurrent()
+                {
+                    var current = _partyManager.GetPartySnapshot(snapshot.PartyId);
+                    return current != null && current.LeaderUserId == snapshot.LeaderUserId
+                        && current.Count == snapshot.Count
+                        && snapshot.Members.All(member => current.Members.Any(candidate =>
+                            candidate.CharacterId == member.CharacterId
+                            && candidate.UserId == member.UserId
+                            && candidate.SessionId == member.SessionId));
+                }
+                if (!PartyCurrent()) return;
 
-            FileLogger.Log(
-                $"[{ProtocolName}] PARTY_TELEPORT: " +
-                $"leaderCid={session.Player.CharacterId} " +
-                $"party={snapshot.PartyId} " +
-                $"target={request.TownId}:{request.AreaId} " +
-                $"pos=({request.X},{request.Y}) direction={request.Direction} " +
-                $"moved={moved}/{snapshot.Count}");
+                bool SourcesCurrent() => PartyCurrent() && sources.All(source => source.Current()
+                    && source.Player.CurTownId == source.Area.TownId
+                    && source.Player.CurAreaId == source.Area.AreaId
+                    && source.Player.CurPosX == source.Area.PosX
+                    && source.Player.CurPosY == source.Area.PosY);
+                if (!SourcesCurrent()) return;
+
+                // A repeat after a committed move is a projection retry. It
+                // must not consume another use, including the last use.
+                var alreadyAtTarget = sources.All(source =>
+                    source.Player.CurTownId == request.TownId
+                    && source.Player.CurAreaId == request.AreaId
+                    && source.Player.CurPosX == request.X && source.Player.CurPosY == request.Y);
+                var remainingUses = -1;
+                var guild = _guilds.GetForMember(session.Player.CharacterId);
+                if (!alreadyAtTarget)
+                {
+                    var leaderSource = sources.FirstOrDefault(source => ReferenceEquals(source.Session, session));
+                    if (guild == null || leaderSource.Lease == null
+                        || !GuildPartyTeleportCommitService.TryCommit(leaderSource.Lease, guild.Id,
+                            sources.Select(source => new GuildPartyTeleportTarget(source.Lease, source.Persist)).ToArray(),
+                            request.TownId, request.AreaId, request.X, request.Y, SourcesCurrent, out remainingUses))
+                    {
+                        FileLogger.Log($"[{ProtocolName}] PARTY_TELEPORT rejected guild quota or stale source: "
+                            + $"cid={session.Player.CharacterId} party={snapshot.PartyId}");
+                        await ChannelTownRestrictionSender.SendCurrentAreaAsync(session);
+                        return;
+                    }
+                    // The transaction has committed every durable position.
+                    // Apply all online locations before the first await so a
+                    // projection failure cannot split the logical movement.
+                    foreach (var source in sources)
+                    {
+                        source.Player.CurTownId = request.TownId;
+                        source.Player.CurAreaId = request.AreaId;
+                        source.Player.CurPosX = request.X;
+                        source.Player.CurPosY = request.Y;
+                        source.Player.CurDirection = 5;
+                        source.Player.CurAreaState = 0;
+                        if (source.Persist) source.Player.LastPositionPersistAt = DateTime.UtcNow;
+                    }
+                }
+                foreach (var source in sources)
+                {
+                    bool ProjectionCurrent() => source.Current()
+                        && source.Player.CurTownId == request.TownId && source.Player.CurAreaId == request.AreaId
+                        && source.Player.CurPosX == request.X && source.Player.CurPosY == request.Y;
+                    try
+                    {
+                        await SetUserAreaCoreAsync(source.Session, areaBody,
+                            TownProjectionGuard.ForAuthorizedReturn(ProjectionCurrent),
+                            committedTeleportSource: source.Area);
+                    }
+                    catch (Exception exception)
+                    {
+                        FileLogger.Log($"[{ProtocolName}] PARTY_TELEPORT committed projection failed: "
+                            + $"cid={source.Player.CharacterId}: {exception.Message}");
+                    }
+                }
+                if (remainingUses >= 0 && _publishGuildState != null && guild != null)
+                    guildRefreshMembers = _guilds.GetMemberIds(guild.Id);
+                FileLogger.Log($"[{ProtocolName}] PARTY_TELEPORT: leaderCid={session.Player.CharacterId} "
+                    + $"party={snapshot.PartyId} target={request.TownId}:{request.AreaId} "
+                    + $"pos=({request.X},{request.Y}) direction={request.Direction} flag={request.Flag} "
+                    + $"moved={sources.Count}/{snapshot.Count} guildUses={remainingUses} retry={alreadyAtTarget}");
+            }
+            finally
+            {
+                for (var index = transitionLeases.Count - 1; index >= 0; index--)
+                    transitionLeases[index].Dispose();
+            }
+            // The existing publisher acquires the same character gates.
+            // Release the movement leases before its guild-wide refresh.
+            if (guildRefreshMembers != null)
+                await _publishGuildState(guildRefreshMembers);
         }
 
         private bool MeetsTownAreaPermission(

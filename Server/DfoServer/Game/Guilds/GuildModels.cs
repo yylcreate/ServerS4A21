@@ -4,10 +4,11 @@ namespace DfoServer.Game.Guilds
     {
         Success, InvalidName, InvalidPromotion, DuplicateName, AlreadyMember,
         MissingCharacter, InsufficientGold, NotFound, NotLeader, NotApplicant,
-        LeaderCannotLeave, StaleSession, PersistenceFailed, InvalidRank, InvalidChannel
+        LeaderCannotLeave, StaleSession, PersistenceFailed, InvalidRank, InvalidChannel,
+        InvalidAmount
     }
     internal sealed record GuildRecord(int Id, string Name, string Promotion, int LeaderId, string Announcement = "",
-        int RecommendedServerId = 0, int RecommendedChannelId = 0);
+        int RecommendedServerId = 0, int RecommendedChannelId = 0, uint Points = 0);
     internal sealed record GuildCreateResult(GuildResult Status, GuildRecord Guild = null, int GoldAfter = 0);
     internal sealed record GuildMemberRecord(int CharacterId, int AccountId, string Name,
         ushort Level, byte Job, byte GrowType, bool IsLeader, uint OfflineSeconds, byte MemberRank = 4, string Memo = "")
@@ -17,7 +18,9 @@ namespace DfoServer.Game.Guilds
     internal sealed record GuildRoster(GuildRecord Guild, string LeaderName,
         System.Collections.Generic.IReadOnlyList<GuildMemberRecord> Members,
         int RequestCharacterId = 0, GuildContributionSnapshot GuildContribution = null,
-        GuildMemberContributionSnapshot RequesterContribution = null);
+        GuildMemberContributionSnapshot RequesterContribution = null,
+        System.Collections.Generic.IReadOnlyList<GuildPurchasedContent> PurchasedContents = null);
+    internal sealed record GuildPurchasedContent(byte Category, uint ExpiresAt, uint RemainingUses = 0);
     internal sealed record GuildContributionSnapshot(int Total, int MonthId, int MonthValue);
     internal sealed record GuildMemberContributionSnapshot(int CharacterId, int AccountId,
         GuildContributionSnapshot Contribution);

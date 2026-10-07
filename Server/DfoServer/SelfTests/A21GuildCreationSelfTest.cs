@@ -162,7 +162,7 @@ PRAGMA user_version=30; UPDATE schema_metadata SET schema_version=30;";
                 database.Write((c,t) =>
                 {
                     using var cmd=c.CreateCommand();cmd.Transaction=t;
-                    cmd.CommandText=@"DROP TRIGGER guild_member_prevent_soft_delete;
+                    cmd.CommandText=MigrationSelfTestFixture.RemoveAuctionTables + @"DROP TRIGGER guild_member_prevent_soft_delete;
 DROP TABLE guild_dungeon_progress;
 DROP TABLE guild_applications; DROP TABLE guild_members; DROP TABLE guilds;
 PRAGMA user_version=28; UPDATE schema_metadata SET schema_version=28;";
@@ -312,7 +312,7 @@ WHEN NEW.character_id=103 BEGIN SELECT RAISE(ABORT,'test guild rollback'); END;"
                         {
                             // Includes bit 10, required by the current client's
                             // member-removal menu at 025A2580..025A25F2.
-                            valid &= reader.ReadUInt32()==(rank==1 ? 0xC36u : 0u);
+                            valid &= reader.ReadUInt32()==(rank==1 ? 0xD36u : 0u);
                             byte[] label=reader.ReadBytes(24);
                             valid &= label.Length==24 && label[23]==0;
                         }

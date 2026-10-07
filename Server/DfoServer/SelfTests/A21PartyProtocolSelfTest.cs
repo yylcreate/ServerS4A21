@@ -2366,6 +2366,15 @@ var teleportBody = new byte[]
                 && teleportRequest.Direction == 0x05,
                 ref failures);
             Check(
+                "party teleport exposes the captured flag without using it as authorization",
+                PartyTeleportRequest.TryParse(teleportBody, out var flaggedTeleport)
+                    && flaggedTeleport.Flag == 1
+                    && PartyTeleportRequest.TryParse(
+                        teleportBody.Take(PartyTeleportRequest.MinimumBodyLength).ToArray(),
+                        out var bareTeleport)
+                    && bareTeleport.Flag == 0,
+                ref failures);
+            Check(
                 "party teleport still accepts the bare 7-byte body",
                 PartyTeleportRequest.TryParse(
                     teleportBody.Take(7).ToArray(), out _),

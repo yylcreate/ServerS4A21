@@ -748,6 +748,7 @@ namespace DfoServer.Network.Handlers.Dungeon
                     $"potionBonus={settlement.ExperiencePotionBonusExp} " +
                     $"fatigueBurnBonus={settlement.FatigueBurnBonusExp} " +
                     $"monsterFatigueBurnBonus={settlement.MonsterFatigueBurnBonusExp} " +
+                    $"guildKillBonus={settlement.MonsterGuildBonusExp} " +
                     $"equipBonus={settlement.MonsterEquipmentBonusExp} " +
                     $"total={settlement.ClearTotalExp} " +
                     $"charExp={session.Player.Exp}");
@@ -1609,6 +1610,8 @@ namespace DfoServer.Network.Handlers.Dungeon
                     monsterExperience.MonsterEquipmentBonusExperience,
                 MonsterFatigueBurnBonusExp =
                     monsterExperience.MonsterFatigueBurnBonusExperience,
+                MonsterGuildBonusExp =
+                    monsterExperience.MonsterGuildBonusExperience,
                 ObjectExperienceEntries =
                     monsterExperience.ObjectExperienceEntries,
                 ClearTimeMilliseconds = clearTimeMilliseconds,
