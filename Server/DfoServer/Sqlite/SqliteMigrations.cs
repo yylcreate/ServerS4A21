@@ -57,6 +57,10 @@ namespace DfoServer.Sqlite
                 new MigrationStep(32, "add_character_blacklist", ApplyCharacterBlacklist),
                 new MigrationStep(33, "add_character_npc_favor", ApplyCharacterNpcFavor),
                 new MigrationStep(34, "add_character_guardian_altar_progress", ApplyCharacterGuardianAltarProgress),
+                new MigrationStep(35, "add_guild_dungeon_progress", ApplyGuildDungeonProgress),
+                new MigrationStep(36, "add_guild_dungeon_progress_month", ApplyGuildDungeonProgressMonth),
+                new MigrationStep(37, "add_guild_contribution", ApplyGuildContribution),
+                new MigrationStep(38, "add_guild_recommended_channel", ApplyGuildRecommendedChannel),
             };
 
         internal static int CurrentVersion =>
@@ -139,6 +143,64 @@ ON CONFLICT(singleton_id) DO UPDATE SET
         {
             var metadata = ReadMetadata(connection);
             return string.Equals(metadata.BaselineId, BaselineId, StringComparison.Ordinal);
+        }
+
+        private static void ApplyGuildDungeonProgress(SqliteConnection connection, SqliteTransaction transaction)
+        {
+            using var command = connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = @"CREATE TABLE IF NOT EXISTS guild_dungeon_progress (
+    guild_id INTEGER NOT NULL REFERENCES guilds(guild_id) ON DELETE CASCADE,
+    dungeon_id INTEGER NOT NULL CHECK(dungeon_id > 0),
+    clear_count INTEGER NOT NULL DEFAULT 0 CHECK(clear_count >= 0),
+    PRIMARY KEY(guild_id, dungeon_id)
+);";
+            command.ExecuteNonQuery();
+        }
+
+        private static void ApplyGuildDungeonProgressMonth(
+            SqliteConnection connection, SqliteTransaction transaction)
+        {
+            // On first adoption, retain accumulated progress in the current
+            // Beijing operating month (day 1 at 06:00) rather than discarding
+            // pre-month counts.
+            ExecuteSql(connection, transaction, @"
+ALTER TABLE guild_dungeon_progress ADD COLUMN month_id INTEGER NOT NULL DEFAULT 197001
+    CHECK(typeof(month_id) = 'integer' AND month_id BETWEEN 197001 AND 999912
+          AND month_id % 100 BETWEEN 1 AND 12);
+UPDATE guild_dungeon_progress
+SET month_id = CAST(strftime('%Y%m', 'now', '+8 hours', '-6 hours') AS INTEGER);");
+        }
+
+        private static void ApplyGuildContribution(SqliteConnection connection, SqliteTransaction transaction)
+        {
+            ExecuteSql(connection, transaction, @"
+ALTER TABLE guilds ADD COLUMN contribution_total INTEGER NOT NULL DEFAULT 0
+    CHECK(typeof(contribution_total) = 'integer' AND contribution_total BETWEEN 0 AND 2147483647);
+ALTER TABLE guilds ADD COLUMN contribution_month_id INTEGER NOT NULL DEFAULT 197001
+    CHECK(typeof(contribution_month_id) = 'integer' AND contribution_month_id BETWEEN 197001 AND 999912
+          AND contribution_month_id % 100 BETWEEN 1 AND 12);
+ALTER TABLE guilds ADD COLUMN contribution_month_value INTEGER NOT NULL DEFAULT 0
+    CHECK(typeof(contribution_month_value) = 'integer' AND contribution_month_value BETWEEN 0 AND 2147483647);
+ALTER TABLE guild_members ADD COLUMN contribution_total INTEGER NOT NULL DEFAULT 0
+    CHECK(typeof(contribution_total) = 'integer' AND contribution_total BETWEEN 0 AND 2147483647);
+ALTER TABLE guild_members ADD COLUMN contribution_month_id INTEGER NOT NULL DEFAULT 197001
+    CHECK(typeof(contribution_month_id) = 'integer' AND contribution_month_id BETWEEN 197001 AND 999912
+          AND contribution_month_id % 100 BETWEEN 1 AND 12);
+ALTER TABLE guild_members ADD COLUMN contribution_month_value INTEGER NOT NULL DEFAULT 0
+    CHECK(typeof(contribution_month_value) = 'integer' AND contribution_month_value BETWEEN 0 AND 2147483647);");
+        }
+
+        private static void ApplyGuildRecommendedChannel(SqliteConnection connection, SqliteTransaction transaction)
+        {
+            ExecuteSql(connection, transaction, @"
+ALTER TABLE guilds ADD COLUMN recommended_server_id INTEGER NOT NULL DEFAULT 0
+    CHECK(typeof(recommended_server_id) = 'integer' AND recommended_server_id BETWEEN 0 AND 255);
+ALTER TABLE guilds ADD COLUMN recommended_channel_id INTEGER NOT NULL DEFAULT 0
+    CHECK(typeof(recommended_channel_id) = 'integer' AND recommended_channel_id BETWEEN 0 AND 255
+          AND (recommended_server_id > 0 OR recommended_channel_id = 0));
+CREATE INDEX IF NOT EXISTS idx_dungeon_effect_outbox_guild_history
+    ON dungeon_persistent_effect_outbox(effect_kind,effect_scope,scope_target,state,committed_at DESC,source_event_id DESC);");
         }
 
         private static void ApplyCharacterGuardianAltarProgress(

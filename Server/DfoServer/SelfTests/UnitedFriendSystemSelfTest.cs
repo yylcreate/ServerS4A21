@@ -221,9 +221,10 @@ namespace DfoServer.SelfTests
                 using (var cmd = conn.CreateCommand())
                 {
                     cmd.Transaction = tx;
-                    cmd.CommandText = @"
+                    cmd.CommandText = MigrationSelfTestFixture.RemoveGuildContributionColumns + @"
 DROP TABLE IF EXISTS united_friend_relations;
 DROP INDEX IF EXISTS idx_united_friend_relations_friend;
+DROP TABLE guild_dungeon_progress;
 UPDATE schema_metadata SET schema_version = 7, updated_at = CURRENT_TIMESTAMP
 WHERE singleton_id = 1;
 PRAGMA user_version = 7;";

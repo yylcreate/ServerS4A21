@@ -6,6 +6,24 @@ namespace DfoServer.Game.Guilds
 {
     internal sealed partial class GuildRepository
     {
+        internal GuildResult SetRecommendedChannel(int actorId, int accountId, int serverId, int channelId)
+            => Database.Write((connection, transaction) =>
+        {
+            if (serverId < 1 || serverId > byte.MaxValue || channelId < 0 || channelId > byte.MaxValue)
+                return GuildResult.InvalidChannel;
+            var guild = GetForMember(connection, transaction, actorId);
+            if (guild == null || guild.LeaderId != actorId) return GuildResult.NotLeader;
+            using var command = PairCommand(connection, transaction, @"UPDATE guilds
+SET recommended_server_id=@server,recommended_channel_id=@channel
+WHERE guild_id=@guild AND leader_character_id=@character
+AND EXISTS(SELECT 1 FROM characters WHERE character_id=@character AND account_id=@account AND delete_flag=0);",
+                guild.Id, actorId);
+            command.Parameters.AddWithValue("@account", accountId);
+            command.Parameters.AddWithValue("@server", serverId);
+            command.Parameters.AddWithValue("@channel", channelId);
+            return command.ExecuteNonQuery() == 1 ? GuildResult.Success : GuildResult.MissingCharacter;
+        });
+
         internal GuildPendingApplication GetPendingApplication(int characterId) => Database.Read(c =>
         {
             using var cmd = c.CreateCommand();

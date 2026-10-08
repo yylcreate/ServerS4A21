@@ -75,15 +75,18 @@ namespace DfoServer.SelfTests
             Require(Scalar(database, "PRAGMA user_version;") == SqliteMigrations.CurrentVersion
                 && Scalar(database, "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('character_pvp_records','account_pvp_total_match_teams');") == 2,
                 "fresh schema includes PvP progress and account team ownership");
-            Execute(database, @"
+            Execute(database, MigrationSelfTestFixture.RemoveGuildContributionColumns + @"
 DROP TABLE account_pvp_total_match_teams;
 DROP TABLE character_pvp_records;
 DROP TABLE pvp_match_results;
 DROP TABLE pvp_matches;
+DROP TABLE guild_dungeon_progress;
 UPDATE schema_metadata SET schema_version=26;
 PRAGMA user_version=26;
 CREATE TRIGGER reject_pvp_migration BEFORE UPDATE OF schema_version ON schema_metadata
 BEGIN SELECT RAISE(ABORT, 'selftest migration rollback'); END;");
+            Require(Scalar(database, "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='guild_dungeon_progress';") == 0,
+                "the v26 fixture excludes later guild dungeon progress storage");
             var rejected = false;
             using (var connection = database.OpenConnection())
             {
@@ -91,7 +94,8 @@ BEGIN SELECT RAISE(ABORT, 'selftest migration rollback'); END;");
                 catch (SqliteException) { rejected = true; }
             }
             Require(rejected && Scalar(database, "PRAGMA user_version;") == 26
-                && Scalar(database, "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='character_pvp_records';") == 0,
+                && Scalar(database, "SELECT schema_version FROM schema_metadata;") == 26
+                && Scalar(database, "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('character_pvp_records','guild_dungeon_progress');") == 0,
                 "failed v27 migration rolls back tables and version together");
             Execute(database, "DROP TRIGGER reject_pvp_migration;");
             using (var connection = database.OpenConnection())
@@ -100,15 +104,19 @@ BEGIN SELECT RAISE(ABORT, 'selftest migration rollback'); END;");
                 SqliteMigrations.Apply(connection);
             }
             Require(Scalar(database, "PRAGMA user_version;") == SqliteMigrations.CurrentVersion
-                && Scalar(database, "SELECT schema_version FROM schema_metadata;") == DfoServer.Sqlite.SqliteMigrations.CurrentVersion,
+                && Scalar(database, "SELECT schema_version FROM schema_metadata;") == DfoServer.Sqlite.SqliteMigrations.CurrentVersion
+                && Scalar(database, "SELECT COUNT(*) FROM pragma_table_info('guild_dungeon_progress') WHERE name='month_id' AND \"notnull\"=1;") == 1,
                 "v26 upgrades to current schema and repeated migration is idempotent");
-            Execute(database, @"
+            Execute(database, MigrationSelfTestFixture.RemoveGuildContributionColumns + @"
 DROP TABLE pvp_match_results;
 DROP TABLE pvp_matches;
+DROP TABLE guild_dungeon_progress;
 UPDATE schema_metadata SET schema_version=27;
 PRAGMA user_version=27;
 CREATE TRIGGER reject_pvp_migration BEFORE UPDATE OF schema_version ON schema_metadata
 BEGIN SELECT RAISE(ABORT, 'selftest v28 rollback'); END;");
+            Require(Scalar(database, "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='guild_dungeon_progress';") == 0,
+                "the v27 fixture excludes later guild dungeon progress storage");
             rejected = false;
             using (var connection = database.OpenConnection())
             {
@@ -116,11 +124,14 @@ BEGIN SELECT RAISE(ABORT, 'selftest v28 rollback'); END;");
                 catch (SqliteException) { rejected = true; }
             }
             Require(rejected && Scalar(database, "PRAGMA user_version;") == 27
-                && Scalar(database, "SELECT COUNT(*) FROM sqlite_master WHERE name='pvp_matches';") == 0,
+                && Scalar(database, "SELECT schema_version FROM schema_metadata;") == 27
+                && Scalar(database, "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('pvp_matches','guild_dungeon_progress');") == 0,
                 "v28 failure rolls back match tables and version together");
             Execute(database, "DROP TRIGGER reject_pvp_migration;");
             using (var connection = database.OpenConnection()) SqliteMigrations.Apply(connection);
-            Require(Scalar(database, "PRAGMA user_version;") == SqliteMigrations.CurrentVersion,
+            Require(Scalar(database, "PRAGMA user_version;") == SqliteMigrations.CurrentVersion
+                && Scalar(database, "SELECT schema_version FROM schema_metadata;") == SqliteMigrations.CurrentVersion
+                && Scalar(database, "SELECT COUNT(*) FROM pragma_table_info('guild_dungeon_progress') WHERE name='month_id' AND \"notnull\"=1;") == 1,
                 "v27 can retry to current schema after migration rollback");
         }
 

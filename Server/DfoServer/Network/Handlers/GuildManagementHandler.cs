@@ -24,13 +24,41 @@ namespace DfoServer.Network.Handlers
             var command = (CmdPacketTypeA21)header.type;
             int actor = session.Player.CharacterId;
             if (actor <= 0) return;
+            bool recommendedChannel = command == CmdPacketTypeA21.SET_GUILD_RECOMMAND_CHANNEL;
+            var originalPlayer = session.Player;
+            var originalAccount = session.Account;
+            var originalGameSession = session.GameSession;
+            int accountId = originalAccount?.AccountId ?? 0;
+            ushort userId = originalPlayer.UserId;
+            long runGeneration = originalPlayer.CurrentDungeonRunGeneration;
+            long selectionGeneration = originalPlayer.CurrentDungeonSelectionGeneration;
+            InventoryLease originalLease = null;
+            int originalGuildId = 0;
+            if (recommendedChannel)
+            {
+                if (accountId <= 0 || userId == 0
+                    || !InventoryContext.TryGetOwnedLease(session.SessionId, actor, out originalLease)
+                    || originalLease.AccountId != accountId) return;
+                originalGuildId = _repository.GetForMember(actor)?.Id ?? 0;
+            }
+            bool ChannelSourceCurrent() => ReferenceEquals(session.Player, originalPlayer)
+                && ReferenceEquals(session.Account, originalAccount)
+                && ReferenceEquals(session.GameSession, originalGameSession)
+                && originalPlayer.CharacterId == actor && originalPlayer.UserId == userId
+                && originalAccount.AccountId == accountId
+                && originalPlayer.CurrentDungeonRunGeneration == runGeneration
+                && originalPlayer.CurrentDungeonSelectionGeneration == selectionGeneration
+                && InventoryContext.IsCurrentLease(originalLease, session.SessionId, actor)
+                && _transitions.IsCurrent(session)
+                && (_repository.GetForMember(actor)?.Id ?? 0) == originalGuildId;
             var refresh = new HashSet<int>();
             var gates = await AcquireAffectedAsync(actor);
             if (gates == null) return;
             try
             {
                 if (!_transitions.IsCurrent(session)) return;
-                if (!InventoryContext.TryGetOwnedLease(session.SessionId, actor, out _)) return;
+                if (!InventoryContext.TryGetOwnedLease(session.SessionId, actor, out var lease)) return;
+                if (recommendedChannel && !ChannelSourceCurrent()) return;
                 if (command == CmdPacketTypeA21.JOIN_GUILD_INFO)
                 {
                     if (body == null || body.Length == 0)
@@ -46,6 +74,19 @@ namespace DfoServer.Network.Handlers
                 {
                     switch (command)
                     {
+                        case CmdPacketTypeA21.SET_GUILD_RECOMMAND_CHANNEL:
+                            // The captured request is empty. 019EC520's confirmation
+                            // says to select the sender's current channel, not a client ID.
+                            if (body == null || body.Length == 0)
+                            {
+                                if (!ChannelSourceCurrent()) return;
+                                result = GameNetworkConfig.TryResolveGameChannel(session.ListenerPort, out var channel)
+                                    && channel.ChannelType == GameNetworkConfig.GeneralChannelEnvironment
+                                    ? _repository.SetRecommendedChannel(actor, lease.AccountId,
+                                        GameNetworkConfig.ChannelServerIndex, channel.ChannelId)
+                                    : GuildResult.InvalidChannel;
+                            }
+                            break;
                         case CmdPacketTypeA21.CANCEL_JOIN_GUILD:
                             if (TryId(body, out int guildId) && guildId > 0)
                                 result = _repository.CancelApplication(actor, guildId);
@@ -106,8 +147,16 @@ namespace DfoServer.Network.Handlers
                 }
                 // A disconnected initiator must not prevent committed state
                 // from being published to the other online members/applicants.
-                await SessionDirectory.TrySendBestEffortAsync(ct => session.SendPacketAsync(
-                    result == GuildResult.Success ? success : GuildCreationPacketBuilder.Ack(command, 0x22), ct),
+                var ack = result == GuildResult.Success ? success : GuildCreationPacketBuilder.Ack(command,
+                        command == CmdPacketTypeA21.SET_GUILD_RECOMMAND_CHANNEL
+                            ? (result == GuildResult.InvalidChannel ? (byte)7 : (byte)19) : (byte)0x22);
+                await SessionDirectory.TrySendBestEffortAsync(async ct =>
+                    {
+                        if (recommendedChannel)
+                            await session.TrySendPacketAsync(ack, ct, ChannelSourceCurrent);
+                        else
+                            await session.SendPacketAsync(ack, ct);
+                    },
                     $"guild management ack cid={actor}");
                 if (result == GuildResult.Success)
                 {

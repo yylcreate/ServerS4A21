@@ -51,7 +51,7 @@ namespace DfoServer.SelfTests
 
                     using (var command = connection.CreateCommand())
                     {
-                        command.CommandText = @"
+                        command.CommandText = MigrationSelfTestFixture.RemoveGuildContributionColumns + @"
 DROP TABLE character_item_states;
 INSERT INTO accounts(account_id, m_id, password_hash)
 VALUES (70001, 'item-state-migration-account', '');
@@ -71,6 +71,7 @@ VALUES
     (70002, 'cooltime', 1, 1001, 1700000020),
     (70002, 'effect', 0, 1002, 1700000030),
     (70002, 'unknown', 0, 1003, 1700000040);
+DROP TABLE guild_dungeon_progress;
 UPDATE schema_metadata SET schema_version = 6 WHERE singleton_id = 1;
 PRAGMA user_version = 6;";
                         command.ExecuteNonQuery();

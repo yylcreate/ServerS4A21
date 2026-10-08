@@ -42,6 +42,7 @@ namespace DfoServer.Game.Dungeon
             "guardian-altar-clear-commit";
         internal const string GuardianAltarSurvivalCommit =
             "guardian-altar-survival-commit";
+        internal const string GuildDungeonClearCommit = "guild-dungeon-clear-commit";
     }
 
     internal sealed class SuitableDungeonLuckyStarResult
@@ -916,6 +917,15 @@ namespace DfoServer.Game.Dungeon
                         {
                             result.FailedCount++;
                             LogRecoveryFailure(record, licensedRewardError);
+                        }
+                        break;
+                    case DungeonPersistentEffectKinds.GuildDungeonClearCommit:
+                        if (TryExecuteGuildDungeonClear(record, out _, out var guildClearError))
+                            result.CommittedCount++;
+                        else
+                        {
+                            result.FailedCount++;
+                            LogRecoveryFailure(record, guildClearError);
                         }
                         break;
                     case DungeonPersistentEffectKinds.GuardianAltarClearCommit:

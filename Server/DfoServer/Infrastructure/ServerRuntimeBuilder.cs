@@ -685,6 +685,7 @@ namespace DfoServer.Infrastructure
             var guildRepository = new DfoServer.Game.Guilds.GuildRepository(core.Database);
             var guildPublisher = new GuildStatePublisher(guildRepository, world.CharacterTransitions, world.Sessions, inventoryRefresh);
             chat.ConfigureGuilds(guildRepository, world.CharacterTransitions);
+            townDungeon.Town.ConfigureGuildEntrance(guildRepository, world.CharacterTransitions);
 
             return new GameProtocolSocialHandlers(
                 party,

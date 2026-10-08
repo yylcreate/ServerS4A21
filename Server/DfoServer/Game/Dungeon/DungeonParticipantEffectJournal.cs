@@ -90,7 +90,8 @@ namespace DfoServer.Game.Dungeon
             DungeonRunIdentity runIdentity,
             DungeonRoomIdentity roomIdentity,
             long attachmentGeneration,
-            byte partySlot)
+            byte partySlot,
+            int accountId = 0)
         {
             if (characterId <= 0)
                 throw new ArgumentOutOfRangeException(nameof(characterId));
@@ -110,9 +111,11 @@ namespace DfoServer.Game.Dungeon
             RoomIdentity = roomIdentity;
             AttachmentGeneration = attachmentGeneration;
             PartySlot = partySlot;
+            AccountId = accountId;
         }
 
         internal int CharacterId { get; }
+        internal int AccountId { get; }
         internal ushort ParticipantUserId { get; }
         internal DungeonRun Run { get; }
         internal DungeonRunIdentity RunIdentity { get; }

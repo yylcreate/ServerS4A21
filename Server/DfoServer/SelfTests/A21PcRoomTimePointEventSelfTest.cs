@@ -312,10 +312,11 @@ namespace DfoServer.SelfTests
             {
                 using (var command = connection.CreateCommand())
                 {
-                    command.CommandText = @"
+                    command.CommandText = MigrationSelfTestFixture.RemoveGuildContributionColumns + @"
 DROP TABLE IF EXISTS event_pcroom_timepoint_daily;
 DROP TABLE IF EXISTS event_pcroom_timepoint_period;
 DELETE FROM game_event_state WHERE event_id=228;
+DROP TABLE guild_dungeon_progress;
 UPDATE schema_metadata SET schema_version=14 WHERE singleton_id=1;
 PRAGMA user_version=14;";
                     command.ExecuteNonQuery();

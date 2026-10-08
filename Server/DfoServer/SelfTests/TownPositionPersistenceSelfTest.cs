@@ -44,6 +44,7 @@ namespace DfoServer.SelfTests
                 catch (Exception exception) { Check(label + " exception: " + exception, false); }
             }
             Section("typed village-save configuration", () => VerifyConfig(Check));
+            Section("registered guild destination definition", () => VerifyGuildDefinition(Check));
             Section("persistent town policy", () => VerifyPolicy(Check));
             Section("real town projection and repository", () => VerifyTownAsync(Check).GetAwaiter().GetResult());
             Section("safe ordinary login gates", () => VerifyRecovery(Check));
@@ -112,6 +113,95 @@ namespace DfoServer.SelfTests
             }
         }
 
+        private static void VerifyGuildDefinition(Action<string, bool> check)
+        {
+            const string positive = "[guild agit entrance info]\n10 20 30 40 41 0\n[/guild agit entrance info]";
+            const string sentinel = "[guild agit entrance info]\n10 20 30 40 -2 -2\n[/guild agit entrance info]";
+            var entry = MapFile.Parse(positive).GuildAgitEntrance;
+            check("the typed MAP entrance keeps the positive destination independently of source-town identity",
+                entry.IsValid && entry.HasPhysicalDestination && entry.TargetTownId == 41 && entry.TargetAreaId == 0);
+            var sentinelEntry = MapFile.Parse(sentinel).GuildAgitEntrance;
+            check("the native negative entrance sentinel does not authorize a physical guild destination",
+                sentinelEntry.IsValid && sentinelEntry.HasDefinition && !sentinelEntry.HasPhysicalDestination);
+            var absent = MapFile.Parse("[map name]\n`ordinary`").GuildAgitEntrance;
+            check("ordinary MAPs without an entrance definition remain valid and grant no guild role",
+                absent.IsValid && !absent.HasDefinition && !absent.HasPhysicalDestination);
+            foreach (var (label, content) in new[]
+            {
+                ("duplicated entrance", positive + "\n" + positive),
+                ("unclosed entrance", "[guild agit entrance info]\n10 20 30 40 41 0"),
+                ("incomplete target", positive.Replace("41 0", "41")),
+                ("quoted target", positive.Replace("41 0", "`41` 0")),
+                ("mixed sentinel", positive.Replace("41 0", "-2 0")),
+                ("out-of-range target", positive.Replace("41 0", "256 0")),
+                ("invalid rectangle", positive.Replace("30 40", "0 40")),
+                ("nested entrance", "[outer]\n" + positive + "\n[/outer]"),
+                ("stray nested end", positive.Replace("41 0", "41 0\n[/other]")),
+                ("malformed entrance boundary", positive.Replace("[guild agit entrance info]", "[guild agit entrance info"))
+            })
+            {
+                var malformed = GuildAgitEntranceInfo.Parse(content);
+                check(label + " fails closed without publishing a partial guild target",
+                    !malformed.IsValid && !malformed.HasPhysicalDestination && !string.IsNullOrWhiteSpace(malformed.InvalidReason));
+            }
+
+            const string townList = "31 `ordinary.twn` 41 `guild.twn` 42 `sentinel.twn`";
+            var resources = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["town/ordinary.twn"] = "[area]\n0 `ordinary.map` `[gate]` 100 200\n[/area]",
+                ["town/guild.twn"] = "[area]\n0 `guild.map` `[normal]`\n[/area]\n[area]\n9 `guild-gate.map` `[gate]` 200 300\n[/area]",
+                ["town/sentinel.twn"] = "[area]\n0 `sentinel.map` `[gate]` 100 200\n[/area]",
+                ["map/ordinary.map"] = positive,
+                ["map/guild.map"] = "[map name]\n`guild room`",
+                ["map/guild-gate.map"] = sentinel,
+                ["map/sentinel.map"] = sentinel,
+            };
+            string Read(string path) => resources.TryGetValue(path.Replace('\\', '/'), out var text) ? text : null;
+            var definition = TownPositionSaveDefinition.Load(CurrentConfig, townList, Read, requiredGuildTownId: 41);
+            check("a registered positive target makes all destination-town areas transient without an ignore row or fixed Town8 rule",
+                definition.IsExcluded(41, 0) && definition.IsExcluded(41, 9) && definition.IsExcluded(41, byte.MaxValue)
+                && !VillageSaveConfigFile.Parse(CurrentConfig).IsExcluded(41, 0));
+            check("an ordinary source containing a physical entrance and another town's negative entrance both remain persistable",
+                !definition.IsExcluded(31, 0) && !definition.IsExcluded(42, 0));
+            check("the same frozen definition preserves independently configured activity-area exclusions",
+                definition.IsExcluded(2, 65) && !definition.IsExcluded(2, 0));
+            var virtualGateResources = new Dictionary<string, string>(resources)
+                { ["map/sentinel.map"] = null };
+            var virtualGateDefinition = TownPositionSaveDefinition.Load(CurrentConfig, townList,
+                path => virtualGateResources.TryGetValue(path.Replace('\\', '/'), out var text) ? text : null, 41);
+            check("an existing ordinary virtual gate with no MAP cannot acquire a guild role or hide the registered destination",
+                !virtualGateDefinition.IsExcluded(42, 0) && virtualGateDefinition.IsExcluded(41, 9));
+            foreach (var (label, changedList, changedResources) in new[]
+            {
+                ("missing guild owner registration", "31 `ordinary.twn` 42 `sentinel.twn`", new Dictionary<string, string>(resources)),
+                ("duplicate town registration", townList + " 41 `guild.twn`", new Dictionary<string, string>(resources)),
+                ("negative raw town ID", townList.Replace("41 `guild.twn`", "-41 `guild.twn`"), new Dictionary<string, string>(resources)),
+                ("prefixed raw town ID", townList.Replace("41 `guild.twn`", "x41 `guild.twn`"), new Dictionary<string, string>(resources)),
+                ("quoted raw town ID", townList.Replace("41 `guild.twn`", "`41` `guild.twn`"), new Dictionary<string, string>(resources)),
+                ("unquoted town path", townList.Replace("`guild.twn`", "guild.twn"), new Dictionary<string, string>(resources)),
+                ("town path traversal", townList.Replace("`guild.twn`", "`../guild.twn`"), new Dictionary<string, string>(resources)),
+                ("missing guild target area", townList, new Dictionary<string, string>(resources) { ["map/ordinary.map"] = positive.Replace("41 0", "41 7") }),
+                ("missing guild target MAP", townList, new Dictionary<string, string>(resources) { ["map/guild-gate.map"] = null }),
+                ("duplicate guild target area", townList, new Dictionary<string, string>(resources) { ["town/guild.twn"] = resources["town/guild.twn"] + "\n[area]\n0 `guild.map` `[normal]`\n[/area]" }),
+                ("unclosed guild target area", townList, new Dictionary<string, string>(resources) { ["town/guild.twn"] = resources["town/guild.twn"].Replace("[/area]", "") }),
+                ("stray guild area end", townList, new Dictionary<string, string>(resources) { ["town/guild.twn"] = resources["town/guild.twn"] + "\n[/area]" }),
+                ("malformed guild area boundary", townList, new Dictionary<string, string>(resources) { ["town/guild.twn"] = resources["town/guild.twn"] + "\n[area\n0 `guild.map` `[normal]`" }),
+                ("nested guild area", townList, new Dictionary<string, string>(resources) { ["town/guild.twn"] = resources["town/guild.twn"] + "\n[outer]\n[area]\n0 `guild.map` `[normal]`\n[/area]\n[/outer]" }),
+                ("malformed registered entrance", townList, new Dictionary<string, string>(resources) { ["map/ordinary.map"] = positive + "\n" + positive }),
+                ("no positive role for the guild owner", townList, new Dictionary<string, string>(resources) { ["map/ordinary.map"] = sentinel })
+            })
+            {
+                var rejected = false;
+                try
+                {
+                    TownPositionSaveDefinition.Load(CurrentConfig, changedList,
+                        path => changedResources.TryGetValue(path.Replace('\\', '/'), out var text) ? text : null, 41);
+                }
+                catch (InvalidDataException) { rejected = true; }
+                check(label + " rejects the entire saving definition instead of allowing guild coordinates", rejected);
+            }
+        }
+
         private static void VerifyPolicy(Action<string, bool> check)
         {
             var raw = LoadCurrentConfig();
@@ -132,6 +222,17 @@ namespace DfoServer.SelfTests
                 && Town.IsPositionSaveExcluded(28, 1) == raw.IsExcluded(28, 1)
                 && GameChannelSpawnPolicy.ShouldPersistPosition(GameNetworkConfig.NormalGamePort, 28, 0) == !raw.IsExcluded(28, 0)
                 && GameChannelSpawnPolicy.ShouldPersistPosition(GameNetworkConfig.NormalGamePort, 28, 1) == !raw.IsExcluded(28, 1));
+            check("every registered guild area is transient by destination role, including areas with no ignore row or own entrance",
+                Enumerable.Range(0, 5).All(area => Town.TryGetArea(8, area, out _)
+                    && Town.IsPositionSaveExcluded(8, area)
+                    && !GameChannelSpawnPolicy.ShouldPersistPosition(GameNetworkConfig.NormalGamePort, 8, area)));
+            var pvpGateAreaExists = Town.TryGetArea(10, 0, out var pvpGateArea);
+            var pvpEntrance = pvpGateAreaExists
+                ? GuildAgitEntranceInfo.Parse(PvfArchiveAccessor.ReadText(Path.Combine("map", pvpGateArea.MapPath)))
+                : null;
+            check("a real registered MAP with a negative guild-entrance sentinel does not classify its source town as a guild residence",
+                pvpEntrance?.IsValid == true && pvpEntrance.HasDefinition && !pvpEntrance.HasPhysicalDestination
+                && Town.IsPositionSaveExcluded(10, 0) == raw.IsExcluded(10, 0));
             check("unrelated town29 retains its existing persistence rule",
                 GameChannelSpawnPolicy.ShouldPersistPosition(GameNetworkConfig.NormalGamePort, 29, 0));
             foreach (var port in new[] { GameNetworkConfig.FreeDuelGamePort, GameNetworkConfig.Channel100GamePort, GameNetworkConfig.RaidGamePort })
@@ -194,6 +295,30 @@ namespace DfoServer.SelfTests
                 player.CurTownId == 2 && player.CurAreaId == 65 && player.CurAreaState == 0
                 && SamePosition(before, fixture.Reload()) && player.LastPositionPersistAt == oldPersistTime);
 
+            foreach (byte area in Enumerable.Range(0, 5).Select(value => (byte)value))
+            {
+                player.CurTownId = 8;
+                player.CurAreaId = area;
+                await fixture.PositionAsync(650, 270, 4);
+                packets = await fixture.DrainAsync();
+                check("registered guild area8:" + area + " projects live movement while retaining the normal-town record and throttle",
+                    player.CurTownId == 8 && player.CurAreaId == area && player.CurPosX == 650
+                    && packets.Any(packet => Type(packet) == (ushort)NotiPacketTypeA21.USER_POSITION)
+                    && SamePosition(before, fixture.Reload()) && player.LastPositionPersistAt == oldPersistTime);
+                foreach (var source in new[] { "disconnect", "return_select", "select_character", "select-displaced", "select-rollback" })
+                {
+                    fixture.Town.PersistPosition(fixture.Session, forceImmediate: true, source);
+                    check(source + " cannot turn registered guild area8:" + area + " into the permanent position",
+                        SamePosition(before, fixture.Reload()) && player.LastPositionPersistAt == oldPersistTime);
+                }
+            }
+            DungeonRunLifecycle.ApplyTownReturnAnchor(player,
+                new DungeonTownReturnAnchor(8, 1, 441, 177, 5, 0), fixture.Session.ListenerPort);
+            fixture.Town.PersistPosition(fixture.Session, forceImmediate: true, source: "guild-dungeon-return");
+            check("a guild dungeon keeps its frozen live return anchor without replacing the permanent normal-town position",
+                player.CurTownId == 8 && player.CurAreaId == 1 && player.CurPosX == 441 && player.CurPosY == 177
+                && SamePosition(before, fixture.Reload()) && player.LastPositionPersistAt == oldPersistTime);
+
             await fixture.AreaAsync(11, 0, 700, 260);
             await fixture.DrainAsync();
             check("leaving for an ordinary town resumes immediate saving of the new complete position",
@@ -239,6 +364,25 @@ namespace DfoServer.SelfTests
             check("excluding only28:0 does not exclude the different native gate28:1",
                 areaZeroOnly.IsValid && unchangedGate.TownId == epicGate.Town && unchangedGate.AreaId == epicGate.Area
                 && unchangedGate.X == epicGate.X && unchangedGate.Y == epicGate.Y);
+            var guildGate = Town.GetCeraRoomInfo(8);
+            check("the current guild login gate is its registered area4 with the resource's own anchor",
+                guildGate.Town == 8 && guildGate.Area == 4 && guildGate.X == 474 && guildGate.Y == 234
+                && Town.TryGetArea(guildGate.Town, guildGate.Area, out var guildGateArea)
+                && guildGateArea.AreaType == "gate");
+            var guildRecovered = GameChannelSpawnPolicy.Resolve(GameNetworkConfig.NormalGamePort, 8);
+            check("a historic saved guild town uses the existing safe normal login fallback without adding PVF ignore rows",
+                SameSpawn(expected, guildRecovered));
+            foreach (byte guildArea in Enumerable.Range(0, 5).Select(value => (byte)value))
+            {
+                fixture.Records.UpdatePosition(fixture.Session.Player.CharacterId, 8, guildArea, 650, 270, 4, 0);
+                var guildRecord = fixture.Reload();
+                var recoveredSpawn = GameChannelSpawnPolicy.Resolve(fixture.Session.ListenerPort, guildRecord.TownId);
+                fixture.Session.Player.HydrateFrom(guildRecord, recoveredSpawn);
+                fixture.Town.PersistPosition(fixture.Session, forceImmediate: true, source: "guild-login-recovery");
+                check("a saved guild area8:" + guildArea + " hydrates and persists the safe normal fallback through the existing repository",
+                    SameSpawn(expected, recoveredSpawn) && MatchesPlayer(fixture.Reload(), fixture.Session.Player)
+                    && fixture.Reload().TownId == expected.TownId && fixture.Reload().AreaId == expected.AreaId);
+            }
             var fallbackGate = Town.GetCeraRoomInfo(GameChannelSpawnPolicy.NormalTownFallbackId);
             var noSafeGate = VillageSaveConfigFile.Parse(CurrentConfig.Replace("[/ignore village save]",
                 $"28 0\n28 1\n{fallbackGate.Town} {fallbackGate.Area}\n[/ignore village save]"));

@@ -20,6 +20,9 @@ namespace DfoServer.GameWorld
             return content;
         }
 
+        internal static string ReadTextIfPresent(string relativePath)
+            => Archive.Value.GetFileContent(NormalizeRelativePath(relativePath));
+
         public static string ReadChannelInfoEtc()
         {
             foreach (var relativePath in new[]

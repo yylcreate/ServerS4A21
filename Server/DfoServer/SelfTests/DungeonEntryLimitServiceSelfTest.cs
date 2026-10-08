@@ -252,20 +252,27 @@ WHERE dgn_id = 11007;";
                 var database = new GameDatabase(
                     databasePath,
                     ServerPaths.SchemaFilePath);
+                SeedCharacters(database);
                 using (var connection = database.OpenConnection())
                 {
                     using (var command = connection.CreateCommand())
                     {
-                        command.CommandText = @"
+                        command.CommandText = MigrationSelfTestFixture.RemoveGuildContributionColumns + @"
 DROP TABLE IF EXISTS character_dimensiongate_records;
 DROP TABLE IF EXISTS dungeon_limit_records;
 DROP TABLE IF EXISTS dungeon_limit_config;
+DROP TABLE guild_dungeon_progress;
 UPDATE schema_metadata SET schema_version = 12
 WHERE singleton_id = 1;
 PRAGMA user_version = 12;";
                         command.ExecuteNonQuery();
                     }
 
+                    Check(
+                        "schema v12 fixture excludes the later guild progress table",
+                        SqliteMigrations.ReadVersion(connection) == 12
+                        && !TableExists(connection, "guild_dungeon_progress"),
+                        ref failures);
                     SqliteMigrations.Apply(connection);
                     Check(
                         "schema v12 migrates to current dungeon entry limit tables",
@@ -274,9 +281,22 @@ PRAGMA user_version = 12;";
                         && TableExists(connection, "dungeon_limit_config")
                         && TableExists(connection, "dungeon_limit_records")
                         && TableExists(connection, "character_dimensiongate_records")
-                        && LoadConfigRows(connection).Count
-                            == SpecialDungeonEntryLimitDefaults.Entries.Length,
+                        && RowsMatchDefaults(LoadConfigRows(connection)),
                         ref failures);
+                    using (var command = connection.CreateCommand())
+                    {
+                        command.CommandText = @"SELECT
+    (SELECT schema_version FROM schema_metadata WHERE singleton_id=1) = @version
+    AND (SELECT COUNT(*) FROM pragma_table_info('guild_dungeon_progress')
+         WHERE name='month_id' AND type='INTEGER' AND ""notnull""=1 AND dflt_value='197001') = 1
+    AND (SELECT COUNT(*) FROM guild_dungeon_progress) = 0
+    AND (SELECT COUNT(*) FROM characters WHERE account_id=9001 AND character_id IN (9101,9102)) = 2;";
+                        command.Parameters.AddWithValue("@version", SqliteMigrations.CurrentVersion);
+                        Check(
+                            "schema v12 upgrade creates monthly guild progress without replacing characters",
+                            Convert.ToInt32(command.ExecuteScalar()) == 1,
+                            ref failures);
+                    }
                 }
             }
             finally

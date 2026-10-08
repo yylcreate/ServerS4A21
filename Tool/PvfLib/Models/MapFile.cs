@@ -212,6 +212,7 @@ namespace PvfLib
         public int[] PvpPracticeStartArea { get; set; }
         public int[] VirtualMovableArea { get; set; }
         public int[] TownMovableArea { get; set; }
+        public GuildAgitEntranceInfo GuildAgitEntrance { get; private set; }
         public int[] PathgateObject { get; set; }
 
         // --- String properties ---
@@ -268,10 +269,12 @@ namespace PvfLib
         public static MapFile Parse(string content)
         {
             if (string.IsNullOrEmpty(content))
-                return new MapFile { Content = content ?? string.Empty, Root = new ScriptNode { Tag = "ROOT" } };
+                return new MapFile { Content = content ?? string.Empty, Root = new ScriptNode { Tag = "ROOT" },
+                    GuildAgitEntrance = GuildAgitEntranceInfo.Parse(content) };
 
             var root = new ScriptParser().Parse(content);
-            var map = new MapFile { Root = root, Content = content };
+            var map = new MapFile { Root = root, Content = content,
+                GuildAgitEntrance = GuildAgitEntranceInfo.Parse(content) };
 
             foreach (var node in root.Children)
             {
@@ -465,7 +468,11 @@ namespace PvfLib
                         map.VirtualMovableArea = ParseIntArray(GetAllDataContent(node, content));
                         break;
                     case "town movable area":
-                        map.TownMovableArea = ParseIntArray(data);
+                        // Exits may span several lines. Preserve signed client
+                        // sentinels and reject malformed rows rather than shifting
+                        // destinations by silently dropping a nonnumeric token.
+                        map.TownMovableArea = root.GetChildren("town movable area").Count == 1
+                            ? ParseTownMovableArea(node, content) : null;
                         break;
                     case "pathgate object":
                         map.PathgateObject = ParseIntArray(data);
@@ -657,6 +664,22 @@ namespace PvfLib
             return string.Join(" ", node.DataItems
                 .Select(item => item.GetContent(content).Trim())
                 .Where(item => !string.IsNullOrWhiteSpace(item)));
+        }
+
+        private static int[] ParseTownMovableArea(ScriptNode node, string content)
+            => ReadSixIntegerRows(node, content);
+
+        internal static int[] ReadSixIntegerRows(ScriptNode node, string content)
+        {
+            try
+            {
+                var values = ActivityConfigScriptReader.Integers(node, content);
+                return values.Count > 0 && values.Count % 6 == 0 ? values.ToArray() : null;
+            }
+            catch (InvalidOperationException)
+            {
+                return null;
+            }
         }
 
         private static List<AICharacterInfo> ParseAICharacters(string data)

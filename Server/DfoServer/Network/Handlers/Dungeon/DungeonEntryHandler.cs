@@ -660,6 +660,23 @@ namespace DfoServer.Network.Handlers.Dungeon
                         DungeonAdmissionReject.InvalidSelectionState);
                     return default;
                 }
+                var selectionPlayer = session.Player;
+                var selectionAccount = session.Account;
+                var selectionGameSession = session.GameSession;
+                int selectionCharacterId = selectionPlayer.CharacterId;
+                int selectionAccountId = selectionAccount?.AccountId ?? 0;
+                ushort selectionUserId = selectionPlayer.UserId;
+                var selectionRun = selectionPlayer.CurrentRun;
+                long selectionRunGeneration = selectionPlayer.CurrentDungeonRunGeneration;
+                InventoryContext.TryGetOwnedLease(session.SessionId, selectionCharacterId, out var selectionLease);
+                bool SelectionSourceCurrent() => ReferenceEquals(session.Player, selectionPlayer)
+                    && ReferenceEquals(session.Account, selectionAccount)
+                    && ReferenceEquals(session.GameSession, selectionGameSession)
+                    && selectionPlayer.CharacterId == selectionCharacterId && selectionPlayer.UserId == selectionUserId
+                    && (selectionAccount?.AccountId ?? 0) == selectionAccountId
+                    && IsEntrySourceCurrent(session, selectionRun, selectionRunGeneration, selection)
+                    && (selectionLease == null || InventoryContext.IsCurrentLease(selectionLease, session.SessionId, selectionCharacterId))
+                    && (_svc.Sessions == null || (_svc.Sessions.TryGet(selectionCharacterId, out var current) && ReferenceEquals(current, session)));
                 if (partyCohort != null
                     && !ReferenceEquals(selection.PartyCohort, partyCohort))
                 {
@@ -789,14 +806,21 @@ namespace DfoServer.Network.Handlers.Dungeon
                     await session.SendPacketAsync(packet);
                 }
                 await _svc.PersistentMechanisms.RestoreBeforeSelectionAsync(session);
+                if (_svc.GuildDungeons.Catalog.IsValid
+                    && Town.TryGetDungeonGateReturnInfo(session.Player.CurTownId, session.Player.CurAreaId, out var guildGate)
+                    && guildGate.WorldMapAreaId == _svc.GuildDungeons.Catalog.WorldMapAreaId)
+                    await _svc.GuildDungeonProgress.SendAsync(session, "enter-select-dungeon");
                 if (!isA21TutorialEntry)
                 {
-                    await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(
+                    if (!await session.TrySendPacketAsync(GamePacketEnvelopeBuilder.Build(
                         0x00,
-                        0x001B,
+                        (ushort)NotiPacketTypeA21.ENTER_SELECT_DUNGEON,
                         EnterSelectDungeonStateBuilder.BuildA21EnterSelectDungeon(
                             hellPartySelection.UserIds,
-                            hellPartySelection.BlockedSlots)));
+                            hellPartySelection.BlockedSlots)),
+                        System.Threading.CancellationToken.None,
+                        SelectionSourceCurrent))
+                        return default;
                 }
                 else
                 {
@@ -2269,6 +2293,25 @@ namespace DfoServer.Network.Handlers.Dungeon
                 return;
             }
 
+            Game.Guilds.GuildDungeonAdmissionSnapshot guildAdmission;
+            try
+            {
+                if (!_svc.GuildDungeons.TryPrepare(session.Player.CharacterId, session.Account?.AccountId ?? 0,
+                    req.DungeonId, req.Difficulty, session.Player.CurTownId, session.Player.CurAreaId,
+                    out guildAdmission, out var guildFailure))
+                {
+                    FileLogger.Log($"[GuildDungeon] selection rejected cid={session.Player.CharacterId} dungeon={req.DungeonId}: {guildFailure}");
+                    await RejectSelectionAsync(session, expectedSelection, header.type, DungeonAdmissionReject.DungeonUnavailable);
+                    return;
+                }
+            }
+            catch (Exception exception)
+            {
+                FileLogger.Log("[GuildDungeon] admission unavailable: " + exception.Message);
+                await RejectSelectionAsync(session, expectedSelection, header.type, DungeonAdmissionReject.DungeonUnavailable);
+                return;
+            }
+
             if (!anotherAradSelection.HasValue
                 && !WorldMap.IsStoryDungeon(req.DungeonId)
                 && !DungeonData.MeetsMinimumRequiredLevel(
@@ -2650,6 +2693,8 @@ namespace DfoServer.Network.Handlers.Dungeon
             }
             var run = session.Player.CurrentRun;
             var runIdentity = run.CaptureIdentity();
+            if (guildAdmission != null && !run.Instance.TryFreezeGuildDungeonAdmission(guildAdmission))
+                throw new InvalidOperationException("Guild admission could not bind the selected physical instance.");
             run.AnotherAradActive = anotherAradSelection.HasValue;
             run.AnotherAradWrapperDungeonId = anotherAradSelection.HasValue
                 ? anotherAradSelection.Value.WrapperDungeonId
@@ -2842,6 +2887,30 @@ namespace DfoServer.Network.Handlers.Dungeon
                     partyEntryFailure);
                 return;
             }
+            if (guildAdmission != null)
+            {
+                foreach (var plan in partyEntryPlans)
+                {
+                    var participantSession = plan.Session;
+                    var participantPlayer = participantSession.Player;
+                    var participantAccount = participantSession.Account;
+                    var participantGameSession = participantSession.GameSession;
+                    int participantId = participantPlayer.CharacterId;
+                    int participantAccountId = participantAccount?.AccountId ?? 0;
+                    ushort participantUid = participantPlayer.UserId;
+                    plan.Preparation.CostPlan.GuildDungeonSourceCurrent = () =>
+                        ReferenceEquals(participantSession.Player, participantPlayer)
+                        && ReferenceEquals(participantSession.Account, participantAccount)
+                        && ReferenceEquals(participantSession.GameSession, participantGameSession)
+                        && participantGameSession != null && participantAccountId > 0
+                        && participantAccount.AccountId == participantAccountId
+                        && participantPlayer.CharacterId == participantId && participantPlayer.UserId == participantUid
+                        && plan.Run != null && ReferenceEquals(plan.Run.Instance, run.Instance)
+                        && participantPlayer.IsCurrentDungeonRun(plan.Run.CaptureIdentity())
+                        && _svc.Sessions != null && _svc.Sessions.TryGet(participantId, out var currentParticipant)
+                        && ReferenceEquals(currentParticipant, participantSession);
+                }
+            }
             if (!await TryPreparePartyDungeonEntryRunsAsync(
                     session,
                     req,
@@ -2883,7 +2952,7 @@ namespace DfoServer.Network.Handlers.Dungeon
             // Recheck the absolute opening and party state after asynchronous
             // run preparation, before either existing debit owner commits.
             var eventCommitFailure = string.Empty;
-            var eventSourceCurrent = !IsManagedEventDungeon(run.DungeonId)
+            var eventSourceCurrent = (!IsManagedEventDungeon(run.DungeonId) && guildAdmission == null)
                 || (ReferenceEquals(session.Player, eventEntryPlayer)
                     && ReferenceEquals(session.Account, eventEntryAccount)
                     && ReferenceEquals(session.GameSession, eventEntryGameSession)
@@ -3916,6 +3985,16 @@ namespace DfoServer.Network.Handlers.Dungeon
             {
                 validation = new EntryCostResult().Fail(
                     "event dungeon " + eventEntryFailure, EntryCostFailureKind.MissingPermission);
+                return false;
+            }
+            var guildDefinition = DungeonData.GetDungeonFile(run.DungeonId);
+            if (guildDefinition?.GuildDungeonDefinitionValid != true
+                || ((guildDefinition.GuildDungeon == true || _svc.GuildDungeons.Catalog.IsManagedDungeon(run.DungeonId))
+                    && (run.Instance.GuildDungeonAdmission == null
+                        || !_svc.GuildDungeons.ValidateParticipant(session.Player.CharacterId,
+                            session.Account?.AccountId ?? 0, run.Instance.GuildDungeonAdmission))))
+            {
+                validation = new EntryCostResult().Fail("guild membership or conquest unavailable", EntryCostFailureKind.MissingPermission);
                 return false;
             }
             if (!WorldMap.IsStoryDungeon(run.DungeonId)

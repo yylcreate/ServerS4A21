@@ -75,6 +75,8 @@ namespace DfoServer.Game.Dungeon
         internal IReadOnlyList<DungeonEntryCostAlternativeGroup>
             AlternativeGroups => _alternativeGroups;
         internal int GoldCost { get; private set; }
+        internal Game.Guilds.GuildDungeonAdmissionSnapshot GuildDungeonAdmission { get; set; }
+        internal Func<bool> GuildDungeonSourceCurrent { get; set; }
 
         internal void AddRequiredItems(
             IEnumerable<DungeonEntryItemRequirement> requirements)
@@ -281,7 +283,7 @@ namespace DfoServer.Game.Dungeon
                         consumedCounts.Keys);
                 }
 
-                if (states.All(state => state.ConsumedCounts.Count == 0))
+                if (states.All(state => state.ConsumedCounts.Count == 0 && state.Request.Plan.GuildDungeonAdmission == null))
                 {
                     foreach (var state in states)
                         state.Result.Success = true;
@@ -303,8 +305,19 @@ namespace DfoServer.Game.Dungeon
 
                 using (var connection = states[0].Request.Lease.Inventory
                            .Database.OpenConnection())
-                using (var transaction = connection.BeginTransaction())
+                using (var transaction = connection.BeginTransaction(deferred: false))
                 {
+                    foreach (var state in states)
+                    {
+                        var guildAdmission = state.Request.Plan.GuildDungeonAdmission;
+                        if (guildAdmission != null && (state.Request.Plan.GuildDungeonSourceCurrent?.Invoke() == false
+                            || !Game.Guilds.GuildDungeonProgressRepository.ValidateAdmission(
+                                connection, transaction, state.Request.Lease.CharacterId, guildAdmission)))
+                        {
+                            state.Result.Fail("guild membership or conquest changed before entry commit", EntryCostFailureKind.MissingPermission);
+                            return false;
+                        }
+                    }
                     foreach (var state in states)
                     {
                         ApplyGroupCostLocked(state);
@@ -323,6 +336,10 @@ namespace DfoServer.Game.Dungeon
                                 $"cid={state.Request.Lease.CharacterId}");
                         }
                     }
+                    if (states.Any(state => state.Request.Plan.GuildDungeonAdmission != null
+                        && (state.Request.Plan.GuildDungeonSourceCurrent?.Invoke() == false
+                            || state.Request.Plan.GuildDungeonAdmission.MonthId != Game.Guilds.GuildDungeonMonth.MonthId(DateTimeOffset.UtcNow))))
+                        throw new InvalidOperationException("Guild entry source changed before final commit.");
                     transaction.Commit();
                     committed = true;
                     foreach (var state in states)
@@ -541,6 +558,15 @@ namespace DfoServer.Game.Dungeon
                 return result.Fail(
                     "entry cost plan is missing",
                     EntryCostFailureKind.Unavailable);
+            }
+
+            // Guild admission must use the same final transactional gate even
+            // when this resource has no ticket or gold consumption.
+            if (commit && plan.GuildDungeonAdmission != null)
+            {
+                if (TryCommitPlans(new[] { new DungeonEntryCostCommitRequest(lease, plan) }, out var committed))
+                    return committed[0];
+                return result.Fail("guild entry transaction rejected", EntryCostFailureKind.MissingPermission);
             }
 
             EntryItemSnapshot snapshot = null;

@@ -622,9 +622,10 @@ namespace DfoServer.SelfTests
             {
                 using (var command = connection.CreateCommand())
                 {
-                    command.CommandText = @"
+                    command.CommandText = MigrationSelfTestFixture.RemoveGuildContributionColumns + @"
 DROP TABLE character_daily_challenge_progress_events;
 DROP TABLE character_daily_challenge_entry_claims;
+DROP TABLE guild_dungeon_progress;
 UPDATE schema_metadata SET schema_version=5 WHERE singleton_id=1;
 PRAGMA user_version=5;";
                     command.ExecuteNonQuery();

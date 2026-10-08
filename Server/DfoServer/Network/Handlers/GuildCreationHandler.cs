@@ -5,6 +5,7 @@ using DfoServer.Infrastructure;
 using DfoServer.Network.Builders.Guilds;
 using DfoServer.Network.Parsers.Guilds;
 using System;
+using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Threading.Tasks;
 
@@ -28,8 +29,22 @@ namespace DfoServer.Network.Handlers
         }
 
         internal Task Handle(EnhancedClientSession session, GamePacketHeader header, byte[] body)
-            => _transitions.RunIfCurrentAsync(session, async () =>
+        {
+            var player = session?.Player;
+            var account = session?.Account;
+            var gameSession = session?.GameSession;
+            int characterId = player?.CharacterId ?? 0;
+            ushort userId = player?.UserId ?? 0;
+            int accountId = account?.AccountId ?? 0;
+            return _transitions.RunIfCurrentAsync(session, async () =>
             {
+                // Player is reused on this socket. A request queued on the old
+                // character gate must never consume the new character's draft.
+                if (!ReferenceEquals(session.Player, player) || player.CharacterId != characterId
+                    || player.UserId != userId || !ReferenceEquals(session.Account, account)
+                    || (session.Account?.AccountId ?? 0) != accountId
+                    || !ReferenceEquals(session.GameSession, gameSession))
+                    return;
                 if (!InventoryContext.TryGetOwnedLease(session.SessionId, session.Player.CharacterId, out var lease))
                     return;
                 var command = (CmdPacketTypeA21)header.type;
@@ -115,9 +130,14 @@ namespace DfoServer.Network.Handlers
                         await _refresh.SendNoti2AppearanceUpdate(session);
                         await session.SendPacketAsync(GuildCreationPacketBuilder.Created(result.Guild));
                         await Reply(session, command);
+                        var roster = _repository.GetRosterForMember(lease.CharacterId);
+                        await session.SendPacketAsync(GuildJoinPacketBuilder.Rank(
+                            roster.Members.Single(member => member.CharacterId == lease.CharacterId).Rank));
+                        await session.SendPacketAsync(GuildInfoPacketBuilder.Build(roster));
                         break;
                 }
             });
+        }
 
         private static Task Reply(EnhancedClientSession session, CmdPacketTypeA21 command, byte error = 0)
             => session.SendPacketAsync(GuildCreationPacketBuilder.Ack(command, error));

@@ -57,6 +57,18 @@ namespace DfoServer.SelfTests
                     && createdPacket.AsSpan(23).SequenceEqual(ClientTextEncoding.GetBytes("测试公会")));
                 var database = new GameDatabase(path, ServerPaths.SchemaFilePath);
                 var repository = new GuildRepository(database);
+                bool HasMigratedGuildProgress() => database.Read(c =>
+                {
+                    using var cmd = c.CreateCommand();
+                    cmd.CommandText = @"SELECT
+    (SELECT user_version FROM pragma_user_version) = @version
+    AND (SELECT schema_version FROM schema_metadata WHERE singleton_id=1) = @version
+    AND (SELECT COUNT(*) FROM pragma_table_info('guild_dungeon_progress')
+         WHERE name='month_id' AND type='INTEGER' AND ""notnull""=1 AND dflt_value='197001') = 1
+    AND (SELECT COUNT(*) FROM guild_dungeon_progress) = 0;";
+                    cmd.Parameters.AddWithValue("@version", DfoServer.Sqlite.SqliteMigrations.CurrentVersion);
+                    return Convert.ToInt32(cmd.ExecuteScalar()) == 1;
+                });
                 Check("creation cost comes from current PVF", GuildCreationService.ReadCreationCost() == 300_000);
                 var guildTail = new Game.SelectCharacter.UserInfoMinimumTailSnapshot
                 {
@@ -91,20 +103,50 @@ INSERT INTO guild_members(character_id,guild_id) VALUES(100,1);";
                 database.Write((c,t) =>
                 {
                     using var cmd=c.CreateCommand();cmd.Transaction=t;
-                    cmd.CommandText=@"INSERT INTO guild_applications(guild_id,character_id) VALUES(1,100);
+                    cmd.CommandText=MigrationSelfTestFixture.RemoveGuildRecommendedChannelColumns+@"
+PRAGMA user_version=37; UPDATE schema_metadata SET schema_version=37;
+CREATE TRIGGER reject_guild_channel_migration BEFORE UPDATE OF schema_version ON schema_metadata
+WHEN NEW.schema_version=38 BEGIN SELECT RAISE(ABORT,'guild-channel-migration-fault'); END;";
+                    cmd.ExecuteNonQuery();
+                });
+                bool channelMigrationRejected=false;
+                try { using var connection=database.OpenConnection(); DfoServer.Sqlite.SqliteMigrations.Apply(connection); }
+                catch(SqliteException exception) when(exception.Message.Contains("guild-channel-migration-fault")) { channelMigrationRejected=true; }
+                Check("schema38 failure rolls channel fields and its history index back without losing schema37 guild data", channelMigrationRejected && database.Read(c=>
+                {
+                    using var cmd=c.CreateCommand();
+                    cmd.CommandText=@"SELECT (SELECT user_version FROM pragma_user_version)=37
+AND (SELECT schema_version FROM schema_metadata WHERE singleton_id=1)=37
+AND (SELECT COUNT(*) FROM pragma_table_info('guilds') WHERE name IN ('recommended_server_id','recommended_channel_id'))=0
+AND (SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_dungeon_effect_outbox_guild_history')=0
+AND (SELECT COUNT(*) FROM guild_members WHERE character_id=100)=1;";
+                    return Convert.ToInt32(cmd.ExecuteScalar())==1;
+                }));
+                database.Write((c,t)=>{using var cmd=c.CreateCommand();cmd.Transaction=t;cmd.CommandText="DROP TRIGGER reject_guild_channel_migration;";cmd.ExecuteNonQuery();});
+                using(var connection=database.OpenConnection()) DfoServer.Sqlite.SqliteMigrations.Apply(connection);
+                Check("schema37 upgrades recommended channel keys to typed empty defaults while preserving membership",
+                    repository.GetForMember(100).RecommendedServerId==0 && repository.GetForMember(100).RecommendedChannelId==0
+                    && database.Read(c=>{using var cmd=c.CreateCommand();cmd.CommandText="SELECT user_version FROM pragma_user_version;";
+                        return Convert.ToInt32(cmd.ExecuteScalar())==DfoServer.Sqlite.SqliteMigrations.CurrentVersion;}));
+                database.Write((c,t) =>
+                {
+                    using var cmd=c.CreateCommand();cmd.Transaction=t;
+                    cmd.CommandText=MigrationSelfTestFixture.RemoveGuildContributionColumns + @"INSERT INTO guild_applications(guild_id,character_id) VALUES(1,100);
 ALTER TABLE guild_applications DROP COLUMN message;
+DROP TABLE guild_dungeon_progress;
 PRAGMA user_version=29; UPDATE schema_metadata SET schema_version=29;";
                     cmd.ExecuteNonQuery();
                 });
                 using (var connection = database.OpenConnection()) DfoServer.Sqlite.SqliteMigrations.Apply(connection);
                 Check("v29 migration preserves existing guild, member and application", repository.IsMember(100)
                     && repository.GetApplicationsForLeader(100).Single().Message == ""
-                    && repository.GetForMember(100).Name == "TestGuild");
+                    && repository.GetForMember(100).Name == "TestGuild" && HasMigratedGuildProgress());
                 database.Write((c,t) =>
                 {
                     using var cmd=c.CreateCommand();cmd.Transaction=t;
-                    cmd.CommandText=@"ALTER TABLE guilds DROP COLUMN announcement;
+                    cmd.CommandText=MigrationSelfTestFixture.RemoveGuildContributionColumns + @"ALTER TABLE guilds DROP COLUMN announcement;
 ALTER TABLE guild_members DROP COLUMN rank; ALTER TABLE guild_members DROP COLUMN memo;
+DROP TABLE guild_dungeon_progress;
 PRAGMA user_version=30; UPDATE schema_metadata SET schema_version=30;";
                     cmd.ExecuteNonQuery();
                 });
@@ -112,7 +154,7 @@ PRAGMA user_version=30; UPDATE schema_metadata SET schema_version=30;";
                 Check("v30 upgrade preserves roster and application with management defaults", repository.GetForMember(100).Announcement==""
                     && repository.GetRosterForMember(100).Members.Single().Rank==1
                     && repository.GetRosterForMember(100).Members.Single().Memo==""
-                    && repository.GetApplicationsForLeader(100).Count==1);
+                    && repository.GetApplicationsForLeader(100).Count==1 && HasMigratedGuildProgress());
                 bool guarded = false;
                 try { database.Write((c,t) => { using var cmd=c.CreateCommand();cmd.Transaction=t;cmd.CommandText="UPDATE characters SET delete_flag=1 WHERE character_id=100;";cmd.ExecuteNonQuery(); }); }
                 catch (SqliteException) { guarded = true; }
@@ -121,6 +163,7 @@ PRAGMA user_version=30; UPDATE schema_metadata SET schema_version=30;";
                 {
                     using var cmd=c.CreateCommand();cmd.Transaction=t;
                     cmd.CommandText=@"DROP TRIGGER guild_member_prevent_soft_delete;
+DROP TABLE guild_dungeon_progress;
 DROP TABLE guild_applications; DROP TABLE guild_members; DROP TABLE guilds;
 PRAGMA user_version=28; UPDATE schema_metadata SET schema_version=28;";
                     cmd.ExecuteNonQuery();
@@ -132,7 +175,7 @@ PRAGMA user_version=28; UPDATE schema_metadata SET schema_version=28;";
                     using var cmd=c.CreateCommand();
                     cmd.CommandText="SELECT (SELECT COUNT(*) FROM characters WHERE character_id=100) + (SELECT schema_version FROM schema_metadata);";
                     return Convert.ToInt32(cmd.ExecuteScalar()) == 1 + DfoServer.Sqlite.SqliteMigrations.CurrentVersion;
-                }) && !new GuildRepository(migrated).IsMember(100));
+                }) && !new GuildRepository(migrated).IsMember(100) && HasMigratedGuildProgress());
                 database.Write((c,t) =>
                 {
                     using var cmd=c.CreateCommand();cmd.Transaction=t;
@@ -263,7 +306,7 @@ WHEN NEW.character_id=103 BEGIN SELECT RAISE(ABORT,'test guild rollback'); END;"
                         bool valid=Text()==created.Guild.Name && reader.ReadByte()==1 && reader.ReadByte()==0
                             && reader.ReadUInt16()==2 && reader.ReadByte()==1 && reader.ReadUInt32()==0 && reader.ReadByte()==0
                             && Text()=="";
-                        valid &= reader.ReadBytes(4).SequenceEqual(new byte[]{0,0,0,1}) && reader.ReadUInt32()==0
+                        valid &= reader.ReadBytes(4).SequenceEqual(new byte[]{0,1,0,1}) && reader.ReadUInt32()==0
                             && Text()=="" && Text()=="" && reader.ReadUInt16()==0 && Text()==created.Guild.Promotion;
                         for(int rank=0;rank<6;rank++)
                         {

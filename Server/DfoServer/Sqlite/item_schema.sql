@@ -1172,6 +1172,8 @@ CREATE INDEX IF NOT EXISTS idx_dungeon_effect_outbox_character_state
     ON dungeon_persistent_effect_outbox(character_id, state, updated_at);
 CREATE INDEX IF NOT EXISTS idx_dungeon_effect_outbox_account_state
     ON dungeon_persistent_effect_outbox(account_id, state, updated_at);
+CREATE INDEX IF NOT EXISTS idx_dungeon_effect_outbox_guild_history
+    ON dungeon_persistent_effect_outbox(effect_kind,effect_scope,scope_target,state,committed_at DESC,source_event_id DESC);
 
 CREATE TABLE IF NOT EXISTS account_settings (
     account_id INTEGER PRIMARY KEY,
@@ -1507,7 +1509,19 @@ CREATE TABLE IF NOT EXISTS guilds (
     name TEXT NOT NULL COLLATE NOCASE UNIQUE,
     promotion TEXT NOT NULL DEFAULT '',
     announcement TEXT NOT NULL DEFAULT '',
+    recommended_server_id INTEGER NOT NULL DEFAULT 0
+        CHECK(typeof(recommended_server_id) = 'integer' AND recommended_server_id BETWEEN 0 AND 255),
+    recommended_channel_id INTEGER NOT NULL DEFAULT 0
+        CHECK(typeof(recommended_channel_id) = 'integer' AND recommended_channel_id BETWEEN 0 AND 255
+              AND (recommended_server_id > 0 OR recommended_channel_id = 0)),
     leader_character_id INTEGER NOT NULL UNIQUE REFERENCES characters(character_id),
+    contribution_total INTEGER NOT NULL DEFAULT 0
+        CHECK(typeof(contribution_total) = 'integer' AND contribution_total BETWEEN 0 AND 2147483647),
+    contribution_month_id INTEGER NOT NULL DEFAULT 197001
+        CHECK(typeof(contribution_month_id) = 'integer' AND contribution_month_id BETWEEN 197001 AND 999912
+              AND contribution_month_id % 100 BETWEEN 1 AND 12),
+    contribution_month_value INTEGER NOT NULL DEFAULT 0
+        CHECK(typeof(contribution_month_value) = 'integer' AND contribution_month_value BETWEEN 0 AND 2147483647),
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE TABLE IF NOT EXISTS guild_members (
@@ -1515,9 +1529,25 @@ CREATE TABLE IF NOT EXISTS guild_members (
     guild_id INTEGER NOT NULL REFERENCES guilds(guild_id) ON DELETE CASCADE,
     rank INTEGER NOT NULL DEFAULT 4 CHECK(rank BETWEEN 2 AND 5),
     memo TEXT NOT NULL DEFAULT '',
+    contribution_total INTEGER NOT NULL DEFAULT 0
+        CHECK(typeof(contribution_total) = 'integer' AND contribution_total BETWEEN 0 AND 2147483647),
+    contribution_month_id INTEGER NOT NULL DEFAULT 197001
+        CHECK(typeof(contribution_month_id) = 'integer' AND contribution_month_id BETWEEN 197001 AND 999912
+              AND contribution_month_id % 100 BETWEEN 1 AND 12),
+    contribution_month_value INTEGER NOT NULL DEFAULT 0
+        CHECK(typeof(contribution_month_value) = 'integer' AND contribution_month_value BETWEEN 0 AND 2147483647),
     joined_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_guild_members_guild ON guild_members(guild_id);
+-- 公会地下城净化进度。共享clear的持久去重仍使用dungeon_persistent_effect_outbox。
+CREATE TABLE IF NOT EXISTS guild_dungeon_progress (
+    guild_id INTEGER NOT NULL REFERENCES guilds(guild_id) ON DELETE CASCADE,
+    dungeon_id INTEGER NOT NULL CHECK(dungeon_id > 0),
+    clear_count INTEGER NOT NULL DEFAULT 0 CHECK(clear_count >= 0),
+    month_id INTEGER NOT NULL CHECK(typeof(month_id) = 'integer'
+        AND month_id BETWEEN 197001 AND 999912 AND month_id % 100 BETWEEN 1 AND 12),
+    PRIMARY KEY(guild_id, dungeon_id)
+);
 CREATE TABLE IF NOT EXISTS guild_applications (
     guild_id INTEGER NOT NULL REFERENCES guilds(guild_id) ON DELETE CASCADE,
     character_id INTEGER NOT NULL REFERENCES characters(character_id) ON DELETE CASCADE,
