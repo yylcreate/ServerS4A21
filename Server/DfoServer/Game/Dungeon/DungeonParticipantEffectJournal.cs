@@ -1,5 +1,7 @@
 using System;
 using System.Collections.Generic;
+using DfoServer.Game.Accounts;
+using DfoServer.Game.Progression;
 
 namespace DfoServer.Game.Dungeon
 {
@@ -35,6 +37,24 @@ namespace DfoServer.Game.Dungeon
         Resolved = 1,
         IdentityMismatch = 2,
     }
+
+    internal enum DungeonMonsterExperienceOutcomeResolution
+    {
+        Absent = 0,
+        Resolved = 1,
+        IdentityMismatch = 2,
+    }
+
+    internal readonly record struct DungeonMonsterExperienceOutcome(
+        uint MonsterBaseExperience,
+        uint GrowthContractBonusExperience,
+        uint EquipmentBonusExperience,
+        uint FatigueBurnBonusExperience,
+        uint GuildBonusExperience,
+        int GuildBonusPercent,
+        uint EliteDisplayBonusExperience,
+        uint RawExperience,
+        ExperienceGrantResult Grant);
 
     internal enum DungeonParticipantEffectState
     {
@@ -225,6 +245,8 @@ namespace DfoServer.Game.Dungeon
             internal DungeonParticipantEffectState State;
             internal Guid LeaseId;
             internal DungeonMonsterDropOutcome MonsterDropOutcome;
+            internal DungeonMonsterExperienceOutcome? MonsterExperienceOutcome;
+            internal DungeonMonsterDropIdentity MonsterExperienceIdentity;
         }
 
         private sealed class DungeonMonsterDropOutcome
@@ -465,6 +487,55 @@ namespace DfoServer.Game.Dungeon
             }
         }
 
+        internal DungeonMonsterExperienceOutcomeResolution ResolveMonsterExperienceOutcome(
+            DungeonParticipantEffectReservation reservation,
+            DungeonMonsterDropIdentity monsterIdentity,
+            out DungeonMonsterExperienceOutcome outcome)
+        {
+            outcome = default;
+            lock (_syncRoot)
+            {
+                if (!monsterIdentity.IsValid || !TryGetEntry(reservation, out var entry))
+                    return DungeonMonsterExperienceOutcomeResolution.IdentityMismatch;
+                if (!entry.MonsterExperienceOutcome.HasValue)
+                    return DungeonMonsterExperienceOutcomeResolution.Absent;
+                if (!entry.MonsterExperienceIdentity.Equals(monsterIdentity))
+                    return DungeonMonsterExperienceOutcomeResolution.IdentityMismatch;
+                outcome = CopyMonsterExperienceOutcome(entry.MonsterExperienceOutcome.Value);
+                return DungeonMonsterExperienceOutcomeResolution.Resolved;
+            }
+        }
+
+        // This is a checkpoint on the existing kill effect, not a second EXP
+        // ledger. A Failed -> TryBegin projection retry reuses the accepted
+        // grant and skips player/ledger/carry mutations. A throwing apply has
+        // no checkpoint and can retry from the still-uncommitted carry.
+        internal bool TryApplyMonsterExperienceOutcome(
+            DungeonParticipantEffectReservation reservation,
+            DungeonMonsterDropIdentity monsterIdentity,
+            Func<DungeonMonsterExperienceOutcome> apply,
+            out DungeonMonsterExperienceOutcome outcome)
+        {
+            ArgumentNullException.ThrowIfNull(apply);
+            outcome = default;
+            lock (_syncRoot)
+            {
+                if (!monsterIdentity.IsValid || !TryGetEntry(reservation, out var entry))
+                    return false;
+                if (entry.MonsterExperienceOutcome.HasValue)
+                {
+                    if (!entry.MonsterExperienceIdentity.Equals(monsterIdentity)) return false;
+                    outcome = CopyMonsterExperienceOutcome(entry.MonsterExperienceOutcome.Value);
+                    return true;
+                }
+                var accepted = apply();
+                entry.MonsterExperienceIdentity = monsterIdentity;
+                entry.MonsterExperienceOutcome = CopyMonsterExperienceOutcome(accepted);
+                outcome = CopyMonsterExperienceOutcome(accepted);
+                return true;
+            }
+        }
+
         internal bool TryCommit(DungeonParticipantEffectReservation reservation)
         {
             lock (_syncRoot)
@@ -636,6 +707,40 @@ namespace DfoServer.Game.Dungeon
                 GoldAmount = source.GoldAmount,
                 Drops = drops,
             };
+        }
+
+        private static DungeonMonsterExperienceOutcome CopyMonsterExperienceOutcome(
+            DungeonMonsterExperienceOutcome source)
+        {
+            var grant = source.Grant;
+            return source with { Grant = grant == null ? null : new ExperienceGrantResult
+            {
+                RawGain = grant.RawGain,
+                HonorExpGain = grant.HonorExpGain,
+                NormalExpGain = grant.NormalExpGain,
+                PreviousLevel = grant.PreviousLevel,
+                PreviousExp = grant.PreviousExp,
+                NewLevel = grant.NewLevel,
+                NewExp = grant.NewExp,
+                NormalizedMaxLevelExp = grant.NormalizedMaxLevelExp,
+                Persisted = grant.Persisted,
+                Honor = grant.Honor == null ? null : new HonorLevelSummary
+                {
+                    TotalHonorExp = grant.Honor.TotalHonorExp,
+                    HonorExp = grant.Honor.HonorExp,
+                    HonorLevel = grant.Honor.HonorLevel,
+                    HonorGrade = grant.Honor.HonorGrade,
+                    FullLevelCharacterCount = grant.Honor.FullLevelCharacterCount,
+                },
+                GrowthCapsule = grant.GrowthCapsule == null ? null : new GrowthCapsuleSummary
+                {
+                    TotalExp = grant.GrowthCapsule.TotalExp,
+                    RequiredExp = grant.GrowthCapsule.RequiredExp,
+                },
+                GrowthCapsuleExpGain = grant.GrowthCapsuleExpGain,
+                TotalHonorExp = grant.TotalHonorExp,
+                TotalGrowthCapsuleExp = grant.TotalGrowthCapsuleExp,
+            } };
         }
 
         private static IReadOnlyList<DungeonParticipantRosterEntry> NormalizeRoster(

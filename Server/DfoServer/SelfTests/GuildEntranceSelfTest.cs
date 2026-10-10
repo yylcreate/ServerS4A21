@@ -198,13 +198,15 @@ WHEN NEW.character_id=416 BEGIN SELECT RAISE(ABORT,'guild entrance rollback test
             await Wait(publisher.RefreshAsync(new[] { 412, 412 }));
             var published = member.Drain();
             check("publisher deduplicates recipients and sends rank then current basic entrance",
-                published.Count == 3 && IsRankThenInfo(published.Take(2).ToArray(), 4, "入口公会", "入口公告")
-                && IsCommand(published[2], CmdPacketTypeA21.GUILD_MEMER_LIST));
+                published.Count == 4 && IsRankThenInfo(published.Take(2).ToArray(), 4, "入口公会", "入口公告")
+                && IsCommand(published[2], CmdPacketTypeA21.GUILD_MEMER_LIST)
+                && IsGuildStatBuffClear(published[3]));
             await Wait(publisher.RefreshAsync(new[] { 413 }));
             var nonmember = outsider.Drain();
             check("nonmember publisher restores pending state without guild entrance or agit deletion",
-                nonmember.Count == 1 && IsNoti(nonmember[0], NotiPacketTypeA21.JOIN_GUILD_INFO)
-                && nonmember[0].AsSpan(15).SequenceEqual(new byte[] { 0 }));
+                nonmember.Count == 2 && IsNoti(nonmember[0], NotiPacketTypeA21.JOIN_GUILD_INFO)
+                && nonmember[0].AsSpan(15).SequenceEqual(new byte[] { 0 })
+                && IsGuildStatBuffClear(nonmember[1]));
 
             using (var gate = await transitions.AcquireAsync(412))
             {
@@ -216,7 +218,9 @@ WHEN NEW.character_id=416 BEGIN SELECT RAISE(ABORT,'guild entrance rollback test
             }
             published = member.Drain();
             check("queued publisher reads the committed current announcement instead of an old snapshot",
-                published.Count == 3 && IsRankThenInfo(published.Take(2).ToArray(), 4, "入口公会", "最新入口公告"));
+                published.Count == 4 && IsRankThenInfo(published.Take(2).ToArray(), 4, "入口公会", "最新入口公告")
+                && IsCommand(published[2], CmdPacketTypeA21.GUILD_MEMER_LIST)
+                && IsGuildStatBuffClear(published[3]));
 
             using (var gate = await transitions.AcquireAsync(412))
             {
@@ -230,6 +234,8 @@ WHEN NEW.character_id=416 BEGIN SELECT RAISE(ABORT,'guild entrance rollback test
             check("queued publisher sees lost membership, clears identity and cannot reopen the entrance",
                 !repository.IsMember(412) && member.Session.Player.Subtype0Tail.GuildId == 0
                 && removed.Any(p => IsNoti(p, NotiPacketTypeA21.GUILD_SECEDE_TO_USER) && p.Length == 15)
+                && removed.Count(IsGuildStatBuffClear) == 1
+                && !removed.Any(p => IsNoti(p, NotiPacketTypeA21.CHARACTER_ADD_BUFF))
                 && !removed.Any(p => IsNoti(p, NotiPacketTypeA21.GUILD_INFO)
                     || IsNoti(p, NotiPacketTypeA21.DELETE_GUILD_AGIT)));
             await Wait(publisher.RefreshAsync(new[] { 412 }));
@@ -404,6 +410,15 @@ WHEN NEW.character_id=416 BEGIN SELECT RAISE(ABORT,'guild entrance rollback test
         private static bool IsFailureOnly(IReadOnlyList<byte[]> packets, CmdPacketTypeA21 command)
             => packets.Count == 1 && IsCommand(packets[0], command)
                 && packets[0].AsSpan(15).SequenceEqual(new byte[] { 0, 0 });
+
+        // Current PVF guild attribute categories reference buff indices 167/169.
+        // A publisher without an active purchase clears both in one exact frame:
+        // u8 count=2, followed by the two i32 indices, with no trailing fields.
+        private static bool IsGuildStatBuffClear(byte[] packet)
+            => IsNoti(packet, NotiPacketTypeA21.CHARACTER_DEL_BUFF)
+                && packet.Length == 24 && packet[15] == 2
+                && BitConverter.ToInt32(packet, 16) == 167
+                && BitConverter.ToInt32(packet, 20) == 169;
 
         private static bool IsNoti(byte[] packet, NotiPacketTypeA21 type)
             => packet.Length >= 15 && packet[0] == 0 && BitConverter.ToUInt16(packet, 1) == (ushort)type;

@@ -8,7 +8,7 @@ namespace DfoServer.Network.Builders.Guilds
     internal static class GuildInfoPacketBuilder
     {
         // DNF.exe 1F8244D3...B20B00DD, 011959B0..0119681B. Optional systems
-        // (alliance, purchased content, attendance/rewards) remain empty/disabled.
+        // (alliance, attendance/rewards) remain empty/disabled.
         internal static byte[] Build(GuildRoster roster)
         {
             ArgumentNullException.ThrowIfNull(roster);
@@ -50,10 +50,23 @@ namespace DfoServer.Network.Builders.Guilds
                 var name = ClientTextEncoding.GetBytes(GuildManagementRules.RankName(rank));
                 w.WriteBytes(name); w.WriteZeroBytes(24 - name.Length);
             }
-            w.WriteByte(0); // Purchased-content count, 011962A1.
+            // 011962A1/011962D0: u8 count, then u8 category / u32 expiry /
+            // u8 count-mode / u32 remaining uses. MR95's count-mode mapping
+            // still requires a client UI check; widths and field order are native.
+            var purchased = roster.PurchasedContents ?? Array.Empty<GuildPurchasedContent>();
+            if (purchased.Count > byte.MaxValue)
+                throw new InvalidOperationException("Guild purchased-content projection exceeds the native count field.");
+            w.WriteByte(checked((byte)purchased.Count));
+            foreach (var content in purchased)
+            {
+                w.WriteByte(content.Category);
+                w.WriteUInt32(content.ExpiresAt);
+                w.WriteByte(content.RemainingUses > 0 ? (byte)1 : (byte)0);
+                w.WriteUInt32(content.RemainingUses);
+            }
             w.WriteUInt32(0);
             w.WriteByte(0); // Alliance count, 01196350.
-            w.WriteUInt32(0); w.WriteByte(0); w.WriteUInt32(0); w.WriteByte(0);
+            w.WriteUInt32(roster.Guild.Points); w.WriteByte(0); w.WriteUInt32(0); w.WriteByte(0);
             // 0119671F..01196743 -> 019E9E90..019E9EC0, then the
             // GuildContributeTabWindow guild/member cumulative and month values.
             w.WriteInt32(guildContribution.Total);

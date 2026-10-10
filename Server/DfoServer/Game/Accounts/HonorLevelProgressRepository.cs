@@ -93,7 +93,7 @@ namespace DfoServer.Game.Accounts
             }
         }
 
-        private static ulong LoadAccountHonorExp(SqliteConnection conn, SqliteTransaction tx, int accountId)
+        internal static ulong LoadAccountHonorExp(SqliteConnection conn, SqliteTransaction tx, int accountId)
         {
             if (accountId <= 0)
                 return 0;

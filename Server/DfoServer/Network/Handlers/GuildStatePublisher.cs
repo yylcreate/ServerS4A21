@@ -108,6 +108,7 @@ namespace DfoServer.Network.Handlers
                                         if (ct.IsCancellationRequested || !SourceCurrent()) return Array.Empty<byte[]>();
                                         GuildIdentityProjection.Apply(published?.Guild, player.Subtype0Tail);
                                         var packets = projection.ToList();
+                                        packets.AddRange(GuildStatBuffNotifier.BuildProjection(published?.PurchasedContents));
                                         if (identityChanged)
                                         {
                                             appearancePacket = _appearance.PrepareNoti2AppearanceUpdate(session);
@@ -131,6 +132,8 @@ namespace DfoServer.Network.Handlers
                             if (snapshotChanged) continue;
                             if (prepared && appearancePacket != null && CanWrite())
                                 await _appearance.BroadcastNoti2AppearanceUpdateToArea(session, appearancePacket).WaitAsync(ct);
+                            if (prepared && CanWrite())
+                                GuildStatBuffNotifier.ScheduleForCharacter(session, _repository.Database, id, _transitions);
                             return;
                         }
                         FileLogger.Log($"[Guild] refresh deferred cid={id} attempts={maximumAttempts}");
@@ -161,6 +164,8 @@ namespace DfoServer.Network.Handlers
                 && current.RequestCharacterId == expected.RequestCharacterId
                 && current.GuildContribution == expected.GuildContribution
                 && current.RequesterContribution == expected.RequesterContribution
+                && (current.PurchasedContents ?? Array.Empty<GuildPurchasedContent>())
+                    .SequenceEqual(expected.PurchasedContents ?? Array.Empty<GuildPurchasedContent>())
                 && current.Members.Select(row => row with { OfflineSeconds = 0 })
                     .SequenceEqual(expected.Members.Select(row => row with { OfflineSeconds = 0 }));
 

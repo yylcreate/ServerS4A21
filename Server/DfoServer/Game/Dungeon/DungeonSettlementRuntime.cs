@@ -134,6 +134,9 @@ namespace DfoServer.Game.Dungeon
         internal uint NamedMonsterTotalExp;
         internal uint MonsterGrowthContractBonusExp;
         internal uint MonsterEquipmentBonusExp;
+        // Guild kill experience is included in MonsterTotalExp. It has no
+        // dedicated A21 display slot and must not replace another bonus line.
+        internal uint MonsterGuildBonusExp;
         internal uint MonsterFatigueBurnBonusExp;
         internal IReadOnlyList<DungeonObjectExperienceEntry>
             ObjectExperienceEntries = Array.Empty<DungeonObjectExperienceEntry>();

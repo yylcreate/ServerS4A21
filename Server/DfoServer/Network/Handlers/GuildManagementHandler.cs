@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
 using DfoServer.Game.Guilds;
@@ -16,8 +17,19 @@ namespace DfoServer.Network.Handlers
         private readonly GuildRepository _repository;
         private readonly CharacterTransitionCoordinator _transitions;
         private readonly GuildStatePublisher _publisher;
-        internal GuildManagementHandler(GuildRepository repository, CharacterTransitionCoordinator transitions, GuildStatePublisher publisher)
-        { _repository = repository; _transitions = transitions; _publisher = publisher; }
+        private readonly InventoryRefreshSender _refresh;
+        private readonly GuildDonationService _donation;
+        private readonly GuildContentPurchaseService _purchase;
+        internal GuildManagementHandler(GuildRepository repository, CharacterTransitionCoordinator transitions,
+            GuildStatePublisher publisher, InventoryRefreshSender refresh)
+        {
+            _repository = repository;
+            _transitions = transitions;
+            _publisher = publisher;
+            _refresh = refresh ?? throw new ArgumentNullException(nameof(refresh));
+            _donation = new GuildDonationService(repository);
+            _purchase = new GuildContentPurchaseService(repository);
+        }
 
         internal async Task Handle(EnhancedClientSession session, GamePacketHeader header, byte[] body)
         {
@@ -25,6 +37,9 @@ namespace DfoServer.Network.Handlers
             int actor = session.Player.CharacterId;
             if (actor <= 0) return;
             bool recommendedChannel = command == CmdPacketTypeA21.SET_GUILD_RECOMMAND_CHANNEL;
+            bool contentMutation = command == CmdPacketTypeA21.DONATE_GUILD_FUND
+                || command == CmdPacketTypeA21.BUY_GUILD_CONTENTS;
+            bool boundSource = recommendedChannel || contentMutation;
             var originalPlayer = session.Player;
             var originalAccount = session.Account;
             var originalGameSession = session.GameSession;
@@ -34,14 +49,14 @@ namespace DfoServer.Network.Handlers
             long selectionGeneration = originalPlayer.CurrentDungeonSelectionGeneration;
             InventoryLease originalLease = null;
             int originalGuildId = 0;
-            if (recommendedChannel)
+            if (boundSource)
             {
                 if (accountId <= 0 || userId == 0
                     || !InventoryContext.TryGetOwnedLease(session.SessionId, actor, out originalLease)
                     || originalLease.AccountId != accountId) return;
                 originalGuildId = _repository.GetForMember(actor)?.Id ?? 0;
             }
-            bool ChannelSourceCurrent() => ReferenceEquals(session.Player, originalPlayer)
+            bool SourceCurrent() => ReferenceEquals(session.Player, originalPlayer)
                 && ReferenceEquals(session.Account, originalAccount)
                 && ReferenceEquals(session.GameSession, originalGameSession)
                 && originalPlayer.CharacterId == actor && originalPlayer.UserId == userId
@@ -58,7 +73,7 @@ namespace DfoServer.Network.Handlers
             {
                 if (!_transitions.IsCurrent(session)) return;
                 if (!InventoryContext.TryGetOwnedLease(session.SessionId, actor, out var lease)) return;
-                if (recommendedChannel && !ChannelSourceCurrent()) return;
+                if (boundSource && (!SourceCurrent() || !ReferenceEquals(lease, originalLease))) return;
                 if (command == CmdPacketTypeA21.JOIN_GUILD_INFO)
                 {
                     if (body == null || body.Length == 0)
@@ -79,7 +94,7 @@ namespace DfoServer.Network.Handlers
                             // says to select the sender's current channel, not a client ID.
                             if (body == null || body.Length == 0)
                             {
-                                if (!ChannelSourceCurrent()) return;
+                                if (!SourceCurrent()) return;
                                 result = GameNetworkConfig.TryResolveGameChannel(session.ListenerPort, out var channel)
                                     && channel.ChannelType == GameNetworkConfig.GeneralChannelEnvironment
                                     ? _repository.SetRecommendedChannel(actor, lease.AccountId,
@@ -138,11 +153,27 @@ namespace DfoServer.Network.Handlers
                                 if (result == GuildResult.Success) refresh.UnionWith(affected);
                             }
                             break;
+                        case CmdPacketTypeA21.DONATE_GUILD_FUND:
+                            // MR95 captures: one little-endian u32 gold amount.
+                            if (TryDonationAmount(body, out uint donation) && SourceCurrent())
+                                result = _donation.Donate(originalLease, donation, originalGuildId);
+                            break;
+                        case CmdPacketTypeA21.BUY_GUILD_CONTENTS:
+                            // The request selects a resource row; category, cost,
+                            // duration and uses are resolved from the current PVF.
+                            if (TryContentRowNumber(body, out uint contentRow) && SourceCurrent())
+                                result = _purchase.Purchase(originalLease, contentRow, originalGuildId);
+                            break;
                     }
                 }
                 catch (SqliteException ex)
                 {
                     FileLogger.Log($"[Guild] management persistence failed cid={actor} command={command} code={ex.SqliteErrorCode}");
+                    result = GuildResult.PersistenceFailed;
+                }
+                catch (InvalidDataException ex) when (contentMutation)
+                {
+                    FileLogger.Log($"[Guild] content configuration/storage invalid cid={actor} command={command}: {ex.Message}");
                     result = GuildResult.PersistenceFailed;
                 }
                 // A disconnected initiator must not prevent committed state
@@ -152,8 +183,8 @@ namespace DfoServer.Network.Handlers
                             ? (result == GuildResult.InvalidChannel ? (byte)7 : (byte)19) : (byte)0x22);
                 await SessionDirectory.TrySendBestEffortAsync(async ct =>
                     {
-                        if (recommendedChannel)
-                            await session.TrySendPacketAsync(ack, ct, ChannelSourceCurrent);
+                        if (boundSource)
+                            await session.TrySendPacketAsync(ack, ct, SourceCurrent);
                         else
                             await session.SendPacketAsync(ack, ct);
                     },
@@ -163,6 +194,8 @@ namespace DfoServer.Network.Handlers
                     refresh.Add(actor);
                     if (target > 0) refresh.Add(target);
                     if (roster != null) foreach (var member in roster.Members) refresh.Add(member.CharacterId);
+                    if (contentMutation && SourceCurrent())
+                        await _refresh.SendGoldUpdate(session, SourceCurrent);
                 }
                 FileLogger.Log($"[Guild] management cid={actor} command={command} target={target} result={result}");
             }
@@ -195,5 +228,14 @@ namespace DfoServer.Network.Handlers
 
         internal static bool TryId(byte[] body, out int id)
         { id = body?.Length == 4 ? BitConverter.ToInt32(body, 0) : 0; return body?.Length == 4; }
+
+        internal static bool TryDonationAmount(byte[] body, out uint amount)
+        {
+            amount = body?.Length == 4 ? BitConverter.ToUInt32(body, 0) : 0;
+            return amount > 0;
+        }
+
+        internal static bool TryContentRowNumber(byte[] body, out uint rowNumber)
+            => TryDonationAmount(body, out rowNumber);
     }
 }

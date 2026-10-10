@@ -213,6 +213,7 @@ namespace DfoServer.Network
             _partyHandler = socialHandlers.Party;
             _raidHandler = socialHandlers.Raid;
             _townHandler.ConfigureRaidTownAreaChanged(_raidHandler.HandleRaidTownAreaChangedAsync);
+            _townHandler.ConfigureGuildStatePublisher(ids => socialHandlers.GuildPublisher.RefreshAsync(ids));
             _chatHandler = socialHandlers.Chat;
             _dungeonRejoin = socialHandlers.DungeonRejoin;
             _dungeonLoading = socialHandlers.DungeonLoading;
@@ -292,7 +293,8 @@ namespace DfoServer.Network
                     CmdPacketTypeA21.JOIN_GUILD_INFO, CmdPacketTypeA21.REQ_GUILD_SECEDE, CmdPacketTypeA21.SET_SUB_GUILD_MASTER,
                     CmdPacketTypeA21.NOTIFY_MESSAGE_TO_GUILD, CmdPacketTypeA21.MODIFY_GUILD_PROMOTE_MSG,
                     CmdPacketTypeA21.WRITE_GUILD_MEMBER_MEMO, CmdPacketTypeA21.BREAK_GUILD,
-                    CmdPacketTypeA21.SET_GUILD_RECOMMAND_CHANNEL })
+                    CmdPacketTypeA21.SET_GUILD_RECOMMAND_CHANNEL,
+                    CmdPacketTypeA21.DONATE_GUILD_FUND, CmdPacketTypeA21.BUY_GUILD_CONTENTS })
                     d[(ushort)command] = _socialHandlers.GuildManagement.Handle;
             });
             _cmdDispatch.RegisterGroup("event-joust", RegisterEventJoustHandlers);

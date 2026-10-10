@@ -777,6 +777,17 @@ namespace DfoServer.Network.Handlers.Dungeon
             DungeonDynamicActorPolicy dynamicPolicy = null)
         {
             var isDeathTowerRun = run.Tower != null;
+            var monsterDropIdentity = new DungeonMonsterDropIdentity(sequenceId, monster.Code);
+            var experienceOutcome = default(DungeonMonsterExperienceOutcome);
+            var reusesExperienceOutcome = false;
+            if (participantEffect.IsValid)
+            {
+                var resolution = run.Instance.ParticipantEffects.ResolveMonsterExperienceOutcome(
+                    participantEffect, monsterDropIdentity, out experienceOutcome);
+                if (resolution == DungeonMonsterExperienceOutcomeResolution.IdentityMismatch)
+                    throw new InvalidOperationException("Monster experience retry has a different actor identity.");
+                reusesExperienceOutcome = resolution == DungeonMonsterExperienceOutcomeResolution.Resolved;
+            }
             IReadOnlyList<DropInfo> towerDrops = null;
             if (isDeathTowerRun)
                 _services.DeathTower.TryGenerateDropsForMonster(
@@ -866,32 +877,29 @@ namespace DfoServer.Network.Handlers.Dungeon
             // A21 EXP. The calculator already includes the PVF 3x named rate;
             // adding this display delta here would turn purple 2x champions
             // into an incorrect 3x award and double-pay green elites.
-            var monsterAwardBaseExp = baseExp;
-            var growthContractBonus = allowsExperience
+            var monsterAwardBaseExp = reusesExperienceOutcome
+                ? experienceOutcome.MonsterBaseExperience : baseExp;
+            if (reusesExperienceOutcome)
+                eliteMonsterKillBonusExp = experienceOutcome.EliteDisplayBonusExperience;
+            var growthContractBonus = reusesExperienceOutcome
+                ? experienceOutcome.GrowthContractBonusExperience : allowsExperience
                 ? CalculateGrowthContractMonsterBonus(
                     session,
                     monsterAwardBaseExp)
                 : 0;
-            var equipmentBonusPercent = allowsExperience
+            // Read the durable guild owner before advancing either carry. A
+            // failed repository read must leave this effect retryable.
+            var guildBonusPercent = reusesExperienceOutcome
+                ? experienceOutcome.GuildBonusPercent : allowsExperience
+                ? GetGuildMonsterExpBonusPercent(session)
+                : 0;
+            var equipmentBonusPercent = allowsExperience && !reusesExperienceOutcome
                 ? GetQuickSlotCharmBonusPercent(session)
                 : 0;
-            uint equipmentBonus = 0;
-            if (equipmentBonusPercent > 0)
-            {
-                // 进位零头在台账内按 run 粒度累计, 须在 SyncRoot 下计算。
-                lock (run.SyncRoot)
-                {
-                    equipmentBonus = run.Combat.Experience.ApplyEquipmentBonusRate(
-                        monsterAwardBaseExp,
-                        equipmentBonusPercent);
-                }
-            }
-            var awardedExp = CalculateMonsterAwardExperience(
-                monsterAwardBaseExp,
-                growthContractBonus,
-                equipmentBonus,
-                experienceBonusSnapshot,
-                out var fatigueBurnBonus);
+            uint equipmentBonus = reusesExperienceOutcome ? experienceOutcome.EquipmentBonusExperience : 0;
+            uint guildBonus = reusesExperienceOutcome ? experienceOutcome.GuildBonusExperience : 0;
+            uint fatigueBurnBonus = reusesExperienceOutcome ? experienceOutcome.FatigueBurnBonusExperience : 0;
+            uint awardedExp = reusesExperienceOutcome ? experienceOutcome.RawExperience : 0;
 
             var dungeonBasisLevel = (int)monster.Level;
             var dungeonMinimumLevel = (int)monster.Level;
@@ -923,9 +931,6 @@ namespace DfoServer.Network.Handlers.Dungeon
 
             IReadOnlyList<DropInfo> generatedDrops;
             int goldGained;
-            var monsterDropIdentity = new DungeonMonsterDropIdentity(
-                sequenceId,
-                monster.Code);
             var reusesFrozenSequentialOutcome = false;
             if (!allowsDrops)
             {
@@ -1041,46 +1046,82 @@ namespace DfoServer.Network.Handlers.Dungeon
                 goldGained = dropResult.GoldAmount;
             }
 
-            ExperienceGrantResult grant = null;
-            if (allowsExperience && awardedExp > 0)
-            {
-                grant = _services.CharacterExperience.Grant(
-                    session.Player,
-                    session.Account?.AccountId ?? 0,
-                    awardedExp,
-                    ExperiencePersistMode.OnLevelUpOnly,
-                    "dungeon-kill");
-            }
-
             lock (run.SyncRoot)
             {
-                run.Combat.Experience.RecordMonster(
-                    monsterAwardBaseExp,
-                    growthContractBonus,
-                    isBoss,
-                    isChampion,
-                    isSuperChampion,
-                    isNamed,
-                    actorSequenceId: sequenceId,
-                    equipmentBonusExperience: equipmentBonus,
-                    fatigueBurnBonusExperience: fatigueBurnBonus);
-                if (reusesFrozenSequentialOutcome)
+                DungeonMonsterExperienceOutcome ApplyExperience()
                 {
-                    if (!run.Instance.ParticipantEffects.TryApplyMonsterDropGold(
+                    // Resolve from this participant's own guild. Preview only
+                    // after drops succeed, while the same run lock also guards
+                    // grant, carry commit and ledger recording. Another kill
+                    // cannot advance the carry between preview and acceptance.
+                    var guildPlan = run.Combat.Experience.PreviewGuildBonusRate(
+                        monsterAwardBaseExp, guildBonusPercent);
+                    var equipmentPlan = run.Combat.Experience.PreviewEquipmentBonusRate(
+                        monsterAwardBaseExp, equipmentBonusPercent);
+                    equipmentBonus = equipmentPlan.Experience;
+                    var existingAward = CharacterExperienceService.AddSaturating(
+                        CharacterExperienceService.AddSaturating(monsterAwardBaseExp, growthContractBonus),
+                        equipmentBonus);
+                    guildBonus = Math.Min(guildPlan.Experience, uint.MaxValue - existingAward);
+                    awardedExp = CalculateMonsterAwardExperience(monsterAwardBaseExp,
+                        growthContractBonus, equipmentBonus, experienceBonusSnapshot,
+                        out fatigueBurnBonus, guildBonus);
+                    // Check fallible gold arithmetic before accepting EXP.
+                    // Sequential gold keeps its own existing journal checkpoint.
+                    var nextGold = reusesFrozenSequentialOutcome
+                        ? run.TotalGold : checked(run.TotalGold + goldGained);
+                    if (reusesFrozenSequentialOutcome
+                        && !run.Instance.ParticipantEffects.TryApplyMonsterDropGold(
                             participantEffect,
                             monsterDropIdentity,
-                            amount => run.TotalGold = checked(
-                                run.TotalGold + amount)))
+                            amount => run.TotalGold = checked(run.TotalGold + amount)))
                     {
                         throw new InvalidOperationException(
                             "Sequential monster drop gold checkpoint lost its frozen outcome.");
                     }
+
+                    var acceptedGrant = allowsExperience && awardedExp > 0
+                        ? _services.CharacterExperience.Grant(session.Player,
+                            session.Account?.AccountId ?? 0, awardedExp,
+                            ExperiencePersistMode.OnLevelUpOnly, "dungeon-kill")
+                        : null;
+                    if (!run.Combat.Experience.TryCommitGuildBonusRate(guildPlan))
+                        throw new InvalidOperationException("Accepted guild bonus carry plan changed under its run lock.");
+                    if (!run.Combat.Experience.TryCommitEquipmentBonusRate(equipmentPlan))
+                        throw new InvalidOperationException("Accepted equipment bonus carry plan changed under its run lock.");
+                    run.Combat.Experience.RecordMonster(monsterAwardBaseExp, growthContractBonus,
+                        isBoss, isChampion, isSuperChampion, isNamed, actorSequenceId: sequenceId,
+                        equipmentBonusExperience: equipmentBonus, fatigueBurnBonusExperience: fatigueBurnBonus,
+                        guildBonusExperience: guildBonus);
+                    if (!reusesFrozenSequentialOutcome) run.TotalGold = nextGold;
+                    return new DungeonMonsterExperienceOutcome(monsterAwardBaseExp, growthContractBonus,
+                        equipmentBonus, fatigueBurnBonus, guildBonus, guildBonusPercent,
+                        eliteMonsterKillBonusExp, awardedExp, acceptedGrant);
+                }
+
+                if (participantEffect.IsValid)
+                {
+                    if (!run.Instance.ParticipantEffects.TryApplyMonsterExperienceOutcome(
+                            participantEffect, monsterDropIdentity, ApplyExperience, out experienceOutcome))
+                        throw new InvalidOperationException("Monster experience checkpoint lost its kill reservation.");
                 }
                 else
-                {
-                    run.TotalGold = checked(run.TotalGold + goldGained);
-                }
+                    experienceOutcome = ApplyExperience();
             }
+            // A recovered effect uses precisely the already accepted values,
+            // including a zero guild award and its original progression result.
+            monsterAwardBaseExp = experienceOutcome.MonsterBaseExperience;
+            growthContractBonus = experienceOutcome.GrowthContractBonusExperience;
+            equipmentBonus = experienceOutcome.EquipmentBonusExperience;
+            fatigueBurnBonus = experienceOutcome.FatigueBurnBonusExperience;
+            guildBonus = experienceOutcome.GuildBonusExperience;
+            guildBonusPercent = experienceOutcome.GuildBonusPercent;
+            eliteMonsterKillBonusExp = experienceOutcome.EliteDisplayBonusExperience;
+            awardedExp = experienceOutcome.RawExperience;
+            var grant = experienceOutcome.Grant;
+            if (reusesExperienceOutcome)
+                _services.CharacterExperience.RefreshAccountProgressForProjection(
+                    grant, session.Account?.AccountId ?? 0);
 
             if (allowsExperience)
             {
@@ -1104,6 +1145,8 @@ namespace DfoServer.Network.Handlers.Dungeon
                     $"awardBase={monsterAwardBaseExp} " +
                     $"growthContract={growthContractBonus} " +
                     $"equipBonus={equipmentBonus} " +
+                    $"guildBonus={guildBonus} guildBonusPercent={guildBonusPercent}% " +
+                    $"experienceReused={reusesExperienceOutcome} " +
                     $"fatigueBurnRate={experienceBonusSnapshot.FatigueBurnExperienceBonusPercent}% " +
                     $"fatigueBurnBonus={fatigueBurnBonus} " +
                     $"awarded={awardedExp}");
@@ -1758,19 +1801,22 @@ namespace DfoServer.Network.Handlers.Dungeon
             uint growthContractBonusExperience,
             uint equipmentBonusExperience,
             DungeonParticipantExperienceBonusSnapshot bonusSnapshot,
-            out uint fatigueBurnBonusExperience)
+            out uint fatigueBurnBonusExperience,
+            uint guildBonusExperience = 0)
         {
             var existingAward = CharacterExperienceService.AddSaturating(
                 CharacterExperienceService.AddSaturating(
-                    baseExperience,
-                    growthContractBonusExperience),
-                equipmentBonusExperience);
+                    CharacterExperienceService.AddSaturating(
+                        baseExperience,
+                        growthContractBonusExperience),
+                    equipmentBonusExperience),
+                guildBonusExperience);
             var percent = bonusSnapshot.IsCaptured
                 ? Math.Max(0, bonusSnapshot.FatigueBurnExperienceBonusPercent)
                 : 0;
             // The base already includes story, actor-kind, party and level
             // adjustments. Burn adds its own component; it never multiplies
-            // the independently calculated contract or equipment bonuses.
+            // the independently calculated contract, equipment or guild bonuses.
             fatigueBurnBonusExperience = DungeonParticipantExperienceRuntime
                 .CalculateFatigueBurnBonus(baseExperience, existingAward, percent);
             // Persist/project only the increment admitted to this raw grant.
@@ -1801,6 +1847,16 @@ namespace DfoServer.Network.Handlers.Dungeon
 
             return CharmExpAdvantageService.GetQuickSlotCharmExpAdvantagePercent(
                 session.SessionId,
+                session.Player.CharacterId);
+        }
+
+        private int GetGuildMonsterExpBonusPercent(EnhancedClientSession session)
+        {
+            if (session?.Player == null)
+                return 0;
+
+            return Game.Guilds.GuildExperienceBonusProvider.GetMonsterExpBonusPercent(
+                _services.ConnectionString,
                 session.Player.CharacterId);
         }
 

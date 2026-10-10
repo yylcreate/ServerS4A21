@@ -20,6 +20,10 @@ namespace DfoServer.SelfTests
             var failures = 0;
 
             VerifyParticipantRuntimeEquipmentBonus(ref failures);
+            VerifyParticipantRuntimeGuildBonus(ref failures);
+            VerifyGuildBonusFailedPreviewRetry(ref failures);
+            VerifyEquipmentBonusFailedPreviewRetry(ref failures);
+            DungeonMonsterExperienceReceiptSelfTest.Run(ref failures);
             VerifyCharmExpAdvantageScan(ref failures);
             VerifyClearRewardSlotProjection(ref failures);
             VerifyFatigueBurnAwardArithmetic(ref failures);
@@ -33,6 +37,115 @@ namespace DfoServer.SelfTests
                 ? "DUNGEON_EXPERIENCE selftest passed"
                 : $"DUNGEON_EXPERIENCE selftest failed: {failures}");
             return failures == 0 ? 0 : 1;
+        }
+
+        private static void VerifyParticipantRuntimeGuildBonus(ref int failures)
+        {
+            var runtime = new DungeonParticipantExperienceRuntime();
+            var first = runtime.ApplyGuildBonusRate(3, 10);
+            uint total = first;
+            for (var index = 1; index < 10; index++)
+                total += runtime.ApplyGuildBonusRate(3, 10);
+            Check("guild bonus carries tiny awards within a participant run",
+                first == 0 && total == 3, ref failures);
+            Check("guild bonus ignores zero base and nonpositive rates",
+                runtime.ApplyGuildBonusRate(0, 10) == 0
+                    && runtime.ApplyGuildBonusRate(100, 0) == 0
+                    && runtime.ApplyGuildBonusRate(100, -1) == 0,
+                ref failures);
+
+            var separate = new DungeonParticipantExperienceRuntime();
+            Check("guild and equipment carry independently",
+                separate.ApplyEquipmentBonusRate(3, 30) == 0
+                    && separate.ApplyGuildBonusRate(3, 30) == 0
+                    && separate.ApplyEquipmentBonusRate(3, 30) == 1
+                    && separate.ApplyGuildBonusRate(3, 30) == 1,
+                ref failures);
+            var saturated = new DungeonParticipantExperienceRuntime();
+            Check("guild integer overflow cannot become a later award",
+                saturated.ApplyGuildBonusRate(uint.MaxValue, 200) == uint.MaxValue
+                    && saturated.ApplyGuildBonusRate(1, 10) == 0,
+                ref failures);
+
+            runtime.RecordMonster(100, 20,
+                isBoss: false, isChampion: false,
+                isSuperChampion: false, isNamedMonster: true,
+                actorSequenceId: 7, equipmentBonusExperience: 30,
+                fatigueBurnBonusExperience: 40, guildBonusExperience: 10);
+            var snapshot = runtime.Capture();
+            Check("guild ledger preserves base and other bonus components",
+                snapshot.MonsterBaseExperience == 100
+                    && snapshot.NamedMonsterBaseExperience == 100
+                    && snapshot.MonsterGrowthContractBonusExperience == 20
+                    && snapshot.MonsterEquipmentBonusExperience == 30
+                    && snapshot.MonsterFatigueBurnBonusExperience == 40
+                    && snapshot.MonsterGuildBonusExperience == 10
+                    && snapshot.MonsterTotalExperience == 200
+                    && runtime.MonsterTotalExperience == 200
+                    && snapshot.ObjectExperienceEntries.Count == 1
+                    && snapshot.ObjectExperienceEntries[0].Experience == 100,
+                ref failures);
+            runtime.RecordMonster(1, 0, false, false, false, false,
+                guildBonusExperience: 1);
+            Check("captured guild ledger cannot change with a later kill",
+                snapshot.MonsterGuildBonusExperience == 10
+                    && runtime.MonsterGuildBonusExperience == 11,
+                ref failures);
+            var burnSnapshot = new DungeonParticipantExperienceBonusSnapshot(
+                partyMemberCount: 1, partyHasEquippedAvatar: false,
+                hasEquippedCreature: false, fatigueBurnExperienceBonusPercent: 100);
+            var combined = DungeonKillApplicationService.CalculateMonsterAwardExperience(
+                100, 20, 30, burnSnapshot, out var burn, guildBonusExperience: 10);
+            var capped = DungeonKillApplicationService.CalculateMonsterAwardExperience(
+                uint.MaxValue - 10, 5, 2, burnSnapshot, out var cappedBurn,
+                guildBonusExperience: 3);
+            Check("guild and burn are additive to the same base and share only saturation headroom",
+                combined == 260 && burn == 100 && capped == uint.MaxValue && cappedBurn == 0,
+                ref failures);
+        }
+
+        private static void VerifyGuildBonusFailedPreviewRetry(ref int failures)
+        {
+            var runtime = new DungeonParticipantExperienceRuntime();
+            for (int index = 0; index < 9; index++) runtime.ApplyGuildBonusRate(1, 10);
+            var failedPlan = runtime.PreviewGuildBonusRate(1, 10);
+            // Drop/EXP failure occurs before accepting the plan: preview is
+            // discarded. The retry must still receive the same integer bonus.
+            var retriedPlan = runtime.PreviewGuildBonusRate(1, 10);
+            Check("a failed guild preview preserves its carry for the retry",
+                failedPlan.Experience == 1 && retriedPlan.Experience == 1
+                    && retriedPlan.Revision == failedPlan.Revision,
+                ref failures);
+            var accepted = runtime.TryCommitGuildBonusRate(retriedPlan);
+            Check("an accepted guild carry plan cannot be committed twice",
+                accepted && !runtime.TryCommitGuildBonusRate(failedPlan)
+                    && runtime.PreviewGuildBonusRate(1, 10).Experience == 0,
+                ref failures);
+            var otherKill = runtime.PreviewGuildBonusRate(9, 10);
+            runtime.ApplyGuildBonusRate(1, 10);
+            Check("a plan prepared before another accepted kill cannot overwrite its carry",
+                !runtime.TryCommitGuildBonusRate(otherKill), ref failures);
+        }
+
+        private static void VerifyEquipmentBonusFailedPreviewRetry(ref int failures)
+        {
+            var runtime = new DungeonParticipantExperienceRuntime();
+            var failedPlan = runtime.PreviewEquipmentBonusRate(15, 5);
+            var retryPlan = runtime.PreviewEquipmentBonusRate(15, 5);
+            Check("failed equipment preview leaves the same fractional carry for retry",
+                failedPlan.Experience == 0 && retryPlan.Experience == 0
+                    && failedPlan.Revision == retryPlan.Revision,
+                ref failures);
+            Check("equipment carry is accepted once and remains independent from guild carry",
+                runtime.TryCommitEquipmentBonusRate(retryPlan)
+                    && !runtime.TryCommitEquipmentBonusRate(failedPlan)
+                    && runtime.PreviewEquipmentBonusRate(15, 5).Experience == 1
+                    && runtime.PreviewGuildBonusRate(15, 5).Experience == 0,
+                ref failures);
+            var oldPlan = runtime.PreviewEquipmentBonusRate(15, 5);
+            runtime.ApplyEquipmentBonusRate(15, 5);
+            Check("equipment plans from before another accepted kill cannot replace its carry",
+                !runtime.TryCommitEquipmentBonusRate(oldPlan), ref failures);
         }
 
         private static void VerifyParticipantRuntimeEquipmentBonus(ref int failures)
