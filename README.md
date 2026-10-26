@@ -14,6 +14,8 @@
 
 修改具体领域时，还要阅读对应专项规范：副本 `Docs/副本架构业务接入规范.md`、背包/GM `Docs/新版背包架构业务接入规范.md` 和 `Docs/GM工具_新背包表结构与ItemCore语义.md`、副职业 `Docs/副职业架构业务接入规范.md`、计时器 `Docs/ClockService.md`。
 
+账号教程的独立持久化、登录恢复包与验证入口见 [账号教程持久化](Docs/账号教程持久化.md)。
+
 ## 社区交流
 
 Discord 社区: https://discord.gg/xdd2HGkQnd (永久邀请链接)

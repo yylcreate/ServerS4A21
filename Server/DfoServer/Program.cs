@@ -16,6 +16,7 @@ namespace DfoServer
         // 自测注册表: A21 协议自测; 单跑参数与 --selftest-all 都会覆盖到。
         private static readonly (string Arg, Func<int> Run)[] SelfTestRegistry =
         {
+            ("--selftest-account-tutorial-database", SelfTests.AccountTutorialDatabaseSelfTest.Run),
             ("--selftest-a21-startup-protocol", SelfTests.A21StartupProtocolSelfTest.Run),
             ("--selftest-a21-raid-protocol", SelfTests.A21RaidProtocolSelfTest.Run),
             ("--selftest-raid-persistence", SelfTests.RaidPersistenceSelfTest.Run),
