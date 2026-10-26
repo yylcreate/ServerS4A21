@@ -1,4 +1,4 @@
-﻿using DfoServer.Game.Accounts;
+using DfoServer.Game.Accounts;
 using DfoServer.Game.CharacterData;
 using DfoServer.Game.Characters;
 using DfoServer.Game.DailyReset;
@@ -174,7 +174,9 @@ namespace DfoServer.Infrastructure
                 inventoryLifecycle,
                 rentalTimeProvider,
                 dailyResetService,
-                antonProgress);
+                antonProgress,
+                new Game.Tutorials.AccountTutorialFlagStore(
+                    Game.Tutorials.AccountTutorialDatabase.Open()));
             var getUserInfoTemplate = new SqliteUserInfoBlobRepository(Database)
                 .LoadGetUserInfoTemplate();
             var eventManager = new EventManager(Database);
