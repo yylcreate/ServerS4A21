@@ -1,4 +1,4 @@
-﻿using DfoServer.Game.Accounts;
+using DfoServer.Game.Accounts;
 using DfoServer.Game.CharacterData;
 using DfoServer.Game.Characters;
 using DfoServer.Game.DailyReset;
@@ -16,6 +16,7 @@ using DfoServer.Game.Lottery;
 using DfoServer.Game.Mercenary;
 using DfoServer.Game.Mailbox;
 using DfoServer.Game.Party;
+using DfoServer.Game.Progression;
 using DfoServer.Game.Raid;
 using DfoServer.Game.SelectCharacter;
 using DfoServer.Game.Session;
@@ -30,7 +31,7 @@ namespace DfoServer.Infrastructure
 {
     // 正式运行时组合根。当前首批先统一数据库与协议处理器入口，
     // 后续按业务模块把 GameProtocolHandler 内的对象装配逐步迁到这里。
-    public sealed class ServerRuntimeBuilder : IDisposable
+    public sealed partial class ServerRuntimeBuilder : IDisposable
     {
         private GameProtocolCoreDependencies _gameProtocolCore;
         private GameProtocolInventoryDependencies _gameProtocolInventory;
@@ -46,6 +47,7 @@ namespace DfoServer.Infrastructure
         private PartyUdpRelay _boundUdpRelay;
         private PartyUdpRelay _boundPvpUdpRelay;
         private bool _gameProtocolBuilt;
+        private IDisposable _levelUpRewardRecovery;
         private ISessionDirectory _boundSessionDirectory;
         private bool _disposed;
 
@@ -130,7 +132,16 @@ namespace DfoServer.Infrastructure
                 townDungeonHandlers,
                 socialHandlers,
                 featureHandlers,
-                characterSessionLifecycle);
+                characterSessionLifecycle,
+                _auctionRuntime);
+            if (_auctionRuntime != null)
+            {
+                // Only network notifications are asynchronous. All DB recovery
+                // and expiry work remains synchronous under the market gate.
+                _auctionRuntime.DeliveriesCommitted += recipients => _ = handler.NotifyAuctionDeliveriesAsync(recipients);
+                _auctionRuntime.Start(ClockService.Instance);
+            }
+            _levelUpRewardRecovery = handler.StartLevelUpRewardRecovery(ClockService.Instance);
             _gameProtocolBuilt = true;
             return handler;
         }
@@ -255,6 +266,7 @@ namespace DfoServer.Infrastructure
                     core.CharacterRepository,
                     core.Database),
                 mailboxService,
+                new CharacterLevelUpRewardService(core.Database, mailboxService),
                 recommendDungeonClears,
                 dailyAttendanceAnytimeService,
                 totalAttendanceService,
@@ -701,6 +713,8 @@ namespace DfoServer.Infrastructure
                 new GuildJoinHandler(guildRepository,
                     world.CharacterTransitions, world.Sessions, inventoryRefresh, guildPublisher),
                 new GuildManagementHandler(guildRepository, world.CharacterTransitions, guildPublisher),
+                new GuildFacilityHandler(guildRepository, world.CharacterTransitions, guildPublisher, inventoryRefresh),
+                new GuildInviteHandler(guildRepository, world.CharacterTransitions, world.Sessions, guildPublisher),
                 new ItemTradeHandler(world.Sessions, world.CharacterTransitions, core.Database));
         }
 
@@ -991,6 +1005,8 @@ namespace DfoServer.Infrastructure
                 return;
 
             _disposed = true;
+            _auctionRuntime?.Dispose();
+            _levelUpRewardRecovery?.Dispose();
             _gameProtocolSocialHandlers?.Dispose();
             _gameProtocolWorld?.Dispose();
         }

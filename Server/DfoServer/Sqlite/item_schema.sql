@@ -1,4 +1,4 @@
-﻿PRAGMA foreign_keys = ON;
+PRAGMA foreign_keys = ON;
 
 CREATE TABLE IF NOT EXISTS accounts (
     account_id     INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -236,6 +236,7 @@ CREATE TABLE IF NOT EXISTS item_purchase_limits (
     buy_count INTEGER NOT NULL DEFAULT 0,
     limit_type INTEGER NOT NULL DEFAULT 0,
     reset_type INTEGER NOT NULL DEFAULT 0,
+    day_id INTEGER NOT NULL DEFAULT 0,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (account_id, character_id, npc_id, item_id, limit_type, reset_type),
     CHECK(limit_type IN (0, 1)),
@@ -502,6 +503,23 @@ CREATE TABLE IF NOT EXISTS character_growth_weapon_stages (
     PRIMARY KEY (character_id, sort_order),
     FOREIGN KEY (character_id) REFERENCES characters(character_id) ON DELETE CASCADE
 );
+
+-- 龙跃武器([equipment grow])每件实例的成长值。
+-- 成长值随武器实例走：跨列表移动(背包<->穿戴)时 item_uid 会变，
+-- 迁移逻辑在 InventoryPersistenceService 的同事务内完成。
+CREATE TABLE IF NOT EXISTS character_equipment_growth (
+    character_id INTEGER NOT NULL,
+    item_uid INTEGER NOT NULL,
+    item_id INTEGER NOT NULL,
+    growth_value INTEGER NOT NULL DEFAULT 0 CHECK(growth_value >= 0),
+    stage INTEGER NOT NULL DEFAULT 1 CHECK(stage >= 1),
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (character_id, item_uid),
+    FOREIGN KEY (character_id) REFERENCES characters(character_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_character_equipment_growth_item
+    ON character_equipment_growth(character_id, item_id);
 
 CREATE TABLE IF NOT EXISTS character_pvp_missions (
     character_id INTEGER NOT NULL,
@@ -1027,6 +1045,34 @@ CREATE INDEX IF NOT EXISTS idx_mailbox_messages_sender_created
 CREATE INDEX IF NOT EXISTS idx_mailbox_messages_expiry
     ON mailbox_messages(mail_type, expire_at, message_id);
 
+-- 等级变更与角色进度同事务记录；基础升级邮件的消费状态不影响其他活动读取事件。
+CREATE TABLE IF NOT EXISTS character_level_up_events (
+    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    character_id INTEGER NOT NULL REFERENCES characters(character_id) ON DELETE CASCADE,
+    previous_level INTEGER NOT NULL CHECK(previous_level BETWEEN 1 AND 254),
+    new_level INTEGER NOT NULL CHECK(new_level BETWEEN 2 AND 255 AND new_level > previous_level),
+    source TEXT NOT NULL,
+    occurred_at_utc TEXT NOT NULL,
+    base_rewards_processed_at_utc TEXT,
+    retry_after_unix INTEGER NOT NULL DEFAULT 0,
+    attempts INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_character_level_up_events_pending
+    ON character_level_up_events(retry_after_unix, event_id)
+    WHERE base_rewards_processed_at_utc IS NULL;
+
+-- 发放账本独立于邮件生命周期，清理过期邮件不得恢复同等级的发奖资格。
+CREATE TABLE IF NOT EXISTS character_level_up_rewards (
+    character_id INTEGER NOT NULL REFERENCES characters(character_id) ON DELETE CASCADE,
+    reward_key TEXT NOT NULL,
+    level INTEGER NOT NULL CHECK(level BETWEEN 2 AND 255),
+    item_id INTEGER NOT NULL CHECK(item_id > 0),
+    item_count INTEGER NOT NULL CHECK(item_count > 0),
+    message_id INTEGER REFERENCES mailbox_messages(message_id) ON DELETE SET NULL,
+    delivered_at_utc TEXT NOT NULL,
+    PRIMARY KEY(character_id, reward_key, level)
+);
+
 CREATE TABLE IF NOT EXISTS mailbox_recipients (
     recipient_id INTEGER PRIMARY KEY AUTOINCREMENT,
     message_id INTEGER NOT NULL,
@@ -1230,6 +1276,22 @@ CREATE TABLE IF NOT EXISTS game_event_info_details (
     sort_order INTEGER NOT NULL DEFAULT 0,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (event_id) REFERENCES game_event_state(event_id) ON DELETE CASCADE
+);
+
+-- Event 2037 enables the client's native RandomboxBooster HUD host.
+INSERT OR IGNORE INTO game_event_state(event_id, state)
+VALUES(2037, 1);
+
+INSERT OR IGNORE INTO game_event_info_details (
+    event_id, unknown0, start_notice, end_notice, detail_flag,
+    flag_a, flag_b, title, short_name, reserved_or_icon,
+    start_unix_time, end_unix_time, link_key, description,
+    detail_enabled, sort_order, updated_at
+) VALUES (
+    2037, 0, '[S4A21]', '[S4A21]', 0,
+    0, 0, '', '', '',
+    0, 0, '', '',
+    0, 0, CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS game_event_info_extra (
@@ -1508,6 +1570,9 @@ CREATE TABLE IF NOT EXISTS guilds (
     promotion TEXT NOT NULL DEFAULT '',
     announcement TEXT NOT NULL DEFAULT '',
     leader_character_id INTEGER NOT NULL UNIQUE REFERENCES characters(character_id),
+    contribution INTEGER NOT NULL DEFAULT 0 CHECK(contribution >= 0),
+    agit_level INTEGER NOT NULL DEFAULT 0 CHECK(agit_level >= 0),
+    cargo_slot_count INTEGER NOT NULL DEFAULT 0 CHECK(cargo_slot_count >= 0),
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE TABLE IF NOT EXISTS guild_members (
@@ -1515,7 +1580,14 @@ CREATE TABLE IF NOT EXISTS guild_members (
     guild_id INTEGER NOT NULL REFERENCES guilds(guild_id) ON DELETE CASCADE,
     rank INTEGER NOT NULL DEFAULT 4 CHECK(rank BETWEEN 2 AND 5),
     memo TEXT NOT NULL DEFAULT '',
+    contribution INTEGER NOT NULL DEFAULT 0 CHECK(contribution >= 0),
     joined_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS guild_cargo_items (
+    guild_id INTEGER NOT NULL REFERENCES guilds(guild_id) ON DELETE CASCADE,
+    slot_index INTEGER NOT NULL CHECK(slot_index >= 0),
+    item_core BLOB NOT NULL CHECK(length(item_core) = 99),
+    PRIMARY KEY(guild_id, slot_index)
 );
 CREATE INDEX IF NOT EXISTS idx_guild_members_guild ON guild_members(guild_id);
 CREATE TABLE IF NOT EXISTS guild_applications (
@@ -1556,3 +1628,45 @@ WHEN NEW.delete_flag <> 0 AND EXISTS (
 BEGIN
     SELECT RAISE(ABORT, 'leave guild before deleting character');
 END;
+
+CREATE TABLE IF NOT EXISTS guild_dungeon_progress (
+    guild_id INTEGER NOT NULL REFERENCES guilds(guild_id) ON DELETE CASCADE,
+    period_start INTEGER NOT NULL,
+    style_id INTEGER NOT NULL,
+    dungeon_id INTEGER NOT NULL,
+    clear_count INTEGER NOT NULL CHECK(clear_count >= 0),
+    PRIMARY KEY(guild_id, period_start, style_id, dungeon_id)
+);
+CREATE TABLE IF NOT EXISTS guild_dungeon_clears (
+    event_id TEXT NOT NULL,
+    character_id INTEGER NOT NULL REFERENCES characters(character_id) ON DELETE CASCADE,
+    guild_id INTEGER NOT NULL REFERENCES guilds(guild_id) ON DELETE CASCADE,
+    period_start INTEGER NOT NULL,
+    dungeon_id INTEGER NOT NULL,
+    mail_id INTEGER NOT NULL,
+    clear_count INTEGER NOT NULL,
+    PRIMARY KEY(event_id, character_id)
+);
+
+CREATE TABLE IF NOT EXISTS guild_contents (
+    guild_id INTEGER NOT NULL REFERENCES guilds(guild_id) ON DELETE CASCADE,
+    content_type INTEGER NOT NULL,
+    content_id INTEGER NOT NULL,
+    content_value INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL CHECK(expires_at >= 0),
+    PRIMARY KEY(guild_id, content_type)
+);
+
+-- 角色改名历史。changed_at 为 Unix 秒；old_name 保留 180 天用于防止旧名被抢注，
+-- 同角色两次改名间隔 90 天。写入与改名事务同批提交（CharacterRenameCommitService）。
+CREATE TABLE IF NOT EXISTS character_rename_history (
+    character_id INTEGER NOT NULL,
+    changed_at INTEGER NOT NULL,
+    old_name BLOB NOT NULL,
+    new_name BLOB NOT NULL,
+    source_item INTEGER NOT NULL,
+    PRIMARY KEY(character_id, changed_at),
+    FOREIGN KEY(character_id) REFERENCES characters(character_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_character_rename_old_name
+    ON character_rename_history(old_name, changed_at);

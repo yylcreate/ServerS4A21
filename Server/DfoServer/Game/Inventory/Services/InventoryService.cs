@@ -68,6 +68,10 @@ namespace DfoServer.Game.Inventory
         private readonly HashSet<InventoryListType> _dirtyListParams = new HashSet<InventoryListType>();
         private int _pendingHappyTokenCeraGrant;
 
+        private readonly List<(InventoryListType FromListType, short FromSlotIndex,
+            InventoryListType ToListType, short ToSlotIndex)> _pendingGrowthMigrations
+            = new List<(InventoryListType, short, InventoryListType, short)>();
+
         public InventoryService(int characterId, int accountId)
             : this(characterId, accountId, database: null)
         {
@@ -86,8 +90,8 @@ namespace DfoServer.Game.Inventory
             Database = database;
             Cargo = new CargoModel(characterId, accountId);
             AccountCargo = new AccountCargoModel(accountId);
-            AvatarDetails = new AvatarDetailManager(database);
-            CreatureDetails = new CreatureDetailManager(database);
+            AvatarDetails = new AvatarDetailManager(database, () => InventoryContext.CanPersistModel(this), () => PersistenceSyncRoot);
+            CreatureDetails = new CreatureDetailManager(database, () => InventoryContext.CanPersistModel(this), () => PersistenceSyncRoot);
             CreatureDetails.BindCharacter(characterId);
             InitEmptySlots();
             InitDefaultMainVirtualCounts();
@@ -99,6 +103,22 @@ namespace DfoServer.Game.Inventory
         public int AccountId { get; }
 
         internal IGameDatabase Database { get; }
+
+        // A failed/unknown transaction may leave this object ahead of the DB.
+        // This latch is permanent: recovery installs a different loaded model.
+        private int _persistenceUntrusted;
+        private int _wasContextManaged;
+        internal bool WasContextManaged => System.Threading.Volatile.Read(ref _wasContextManaged) != 0;
+        internal void MarkContextManaged() => System.Threading.Interlocked.Exchange(ref _wasContextManaged, 1);
+        private object _persistenceSyncRoot = new object();
+        internal object PersistenceSyncRoot => System.Threading.Volatile.Read(ref _persistenceSyncRoot);
+        internal void BindPersistenceSyncRoot(object syncRoot)
+            => System.Threading.Volatile.Write(ref _persistenceSyncRoot, syncRoot ?? throw new ArgumentNullException(nameof(syncRoot)));
+        internal bool IsPersistenceTrusted => System.Threading.Volatile.Read(ref _persistenceUntrusted) == 0;
+        internal void MarkPersistenceUntrusted(string reason)
+        {
+            lock (PersistenceSyncRoot) System.Threading.Interlocked.Exchange(ref _persistenceUntrusted, 1);
+        }
 
         public CargoModel Cargo { get; }
 
@@ -567,6 +587,7 @@ namespace DfoServer.Game.Inventory
             _dirtyMainVirtualSlots.Clear();
             _dirtyListParams.Clear();
             _pendingHappyTokenCeraGrant = 0;
+            _pendingGrowthMigrations.Clear();
             AvatarDetails.ClearDirtyState();
             CreatureDetails.ClearDirtyState();
             Cargo.ClearDirtyState();
@@ -577,6 +598,23 @@ namespace DfoServer.Game.Inventory
             EpicPieces.ClearDirtyState();
             ItemStates.ClearDirtyState();
         }
+
+        // 跨列表移动(背包<->穿戴)后 item_uid 会变，龙跃武器成长值必须跟着
+        // 同一件物品迁移。移动服务在内存变更时登记映射，持久化落库后由
+        // InventoryPersistenceService 在同一事务内执行迁移。
+        internal void RecordGrowthMigration(
+            InventoryListType fromListType,
+            short fromSlotIndex,
+            InventoryListType toListType,
+            short toSlotIndex)
+        {
+            _pendingGrowthMigrations.Add(
+                (fromListType, fromSlotIndex, toListType, toSlotIndex));
+        }
+
+        internal IReadOnlyList<(InventoryListType FromListType, short FromSlotIndex,
+            InventoryListType ToListType, short ToSlotIndex)> PendingGrowthMigrations
+            => _pendingGrowthMigrations;
 
         public static bool IsVirtualMainSlot(short slotIndex)
         {

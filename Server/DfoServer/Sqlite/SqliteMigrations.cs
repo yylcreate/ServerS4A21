@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Text;
@@ -56,6 +56,14 @@ namespace DfoServer.Sqlite
                 new MigrationStep(31, "add_guild_management", ApplyGuildManagement),
                 new MigrationStep(32, "add_character_blacklist", ApplyCharacterBlacklist),
                 new MigrationStep(33, "add_character_npc_favor", ApplyCharacterNpcFavor),
+                new MigrationStep(34, "add_character_level_up_events_and_rewards", ApplyCharacterLevelUpRewards),
+                new MigrationStep(35, "add_item_purchase_limit_day_id", ApplyItemPurchaseLimitDayId),
+                new MigrationStep(36, "add_seria_luck_ui_event", ApplySeriaLuckUiEvent),
+                new MigrationStep(37, "add_guild_contribution_agit_and_cargo", ApplyGuildFacilities),
+                new MigrationStep(38, "add_character_equipment_growth", ApplyCharacterEquipmentGrowth),
+                new MigrationStep(39, "add_guild_dungeon_progress", ApplyGuildDungeonProgress),
+                new MigrationStep(40, "add_guild_contents", ApplyGuildContents),
+                new MigrationStep(41, "add_character_rename_history", CharacterRenameSchema.Apply),
             };
 
         internal static int CurrentVersion =>
@@ -140,6 +148,37 @@ ON CONFLICT(singleton_id) DO UPDATE SET
             return string.Equals(metadata.BaselineId, BaselineId, StringComparison.Ordinal);
         }
 
+        private static void ApplyCharacterLevelUpRewards(
+            SqliteConnection connection,
+            SqliteTransaction transaction)
+        {
+            ExecuteSql(connection, transaction, @"
+CREATE TABLE IF NOT EXISTS character_level_up_events (
+    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    character_id INTEGER NOT NULL REFERENCES characters(character_id) ON DELETE CASCADE,
+    previous_level INTEGER NOT NULL CHECK(previous_level BETWEEN 1 AND 254),
+    new_level INTEGER NOT NULL CHECK(new_level BETWEEN 2 AND 255 AND new_level > previous_level),
+    source TEXT NOT NULL,
+    occurred_at_utc TEXT NOT NULL,
+    base_rewards_processed_at_utc TEXT,
+    retry_after_unix INTEGER NOT NULL DEFAULT 0,
+    attempts INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_character_level_up_events_pending
+    ON character_level_up_events(retry_after_unix, event_id)
+    WHERE base_rewards_processed_at_utc IS NULL;
+CREATE TABLE IF NOT EXISTS character_level_up_rewards (
+    character_id INTEGER NOT NULL REFERENCES characters(character_id) ON DELETE CASCADE,
+    reward_key TEXT NOT NULL,
+    level INTEGER NOT NULL CHECK(level BETWEEN 2 AND 255),
+    item_id INTEGER NOT NULL CHECK(item_id > 0),
+    item_count INTEGER NOT NULL CHECK(item_count > 0),
+    message_id INTEGER REFERENCES mailbox_messages(message_id) ON DELETE SET NULL,
+    delivered_at_utc TEXT NOT NULL,
+    PRIMARY KEY(character_id, reward_key, level)
+);");
+        }
+
         private static void ApplyCharacterNpcFavor(
             SqliteConnection connection,
             SqliteTransaction transaction)
@@ -172,6 +211,77 @@ CREATE INDEX IF NOT EXISTS idx_character_npc_favor_daily
     CHECK(owner_character_id <> target_character_id)
 );";
             command.ExecuteNonQuery();
+        }
+
+        // 龙跃武器每件实例的成长值。跨列表移动时 item_uid 会变，
+        // 成长值迁移在 InventoryPersistenceService 的同一事务内完成。
+        private static void ApplyCharacterEquipmentGrowth(
+            SqliteConnection connection,
+            SqliteTransaction transaction)
+        {
+            ExecuteSql(connection, transaction, @"CREATE TABLE IF NOT EXISTS character_equipment_growth (
+    character_id INTEGER NOT NULL,
+    item_uid INTEGER NOT NULL,
+    item_id INTEGER NOT NULL,
+    growth_value INTEGER NOT NULL DEFAULT 0 CHECK(growth_value >= 0),
+    stage INTEGER NOT NULL DEFAULT 1 CHECK(stage >= 1),
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (character_id, item_uid),
+    FOREIGN KEY (character_id) REFERENCES characters(character_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_character_equipment_growth_item
+    ON character_equipment_growth(character_id, item_id);
+");
+        }
+
+        private static void ApplyGuildFacilities(SqliteConnection connection, SqliteTransaction transaction)        {
+            AddColumnIfMissing(connection, transaction, "guilds", "contribution", "INTEGER NOT NULL DEFAULT 0 CHECK(contribution >= 0)");
+            AddColumnIfMissing(connection, transaction, "guilds", "agit_level", "INTEGER NOT NULL DEFAULT 0 CHECK(agit_level >= 0)");
+            AddColumnIfMissing(connection, transaction, "guilds", "cargo_slot_count", "INTEGER NOT NULL DEFAULT 0 CHECK(cargo_slot_count >= 0)");
+            AddColumnIfMissing(connection, transaction, "guild_members", "contribution", "INTEGER NOT NULL DEFAULT 0 CHECK(contribution >= 0)");
+            ExecuteSql(connection, transaction, @"CREATE TABLE IF NOT EXISTS guild_cargo_items (
+    guild_id INTEGER NOT NULL REFERENCES guilds(guild_id) ON DELETE CASCADE,
+    slot_index INTEGER NOT NULL CHECK(slot_index >= 0),
+    item_core BLOB NOT NULL CHECK(length(item_core) = 99),
+    PRIMARY KEY(guild_id, slot_index)
+);");
+        }
+
+        // v39: 公会地下城周期进度与结算台账。表结构与 item_schema.sql 一一对应,
+        // 运行时只由本迁移创建。
+        private static void ApplyGuildDungeonProgress(SqliteConnection connection, SqliteTransaction transaction)
+        {
+            ExecuteSql(connection, transaction, @"CREATE TABLE IF NOT EXISTS guild_dungeon_progress (
+    guild_id INTEGER NOT NULL REFERENCES guilds(guild_id) ON DELETE CASCADE,
+    period_start INTEGER NOT NULL,
+    style_id INTEGER NOT NULL,
+    dungeon_id INTEGER NOT NULL,
+    clear_count INTEGER NOT NULL CHECK(clear_count >= 0),
+    PRIMARY KEY(guild_id, period_start, style_id, dungeon_id)
+);");
+            ExecuteSql(connection, transaction, @"CREATE TABLE IF NOT EXISTS guild_dungeon_clears (
+    event_id TEXT NOT NULL,
+    character_id INTEGER NOT NULL REFERENCES characters(character_id) ON DELETE CASCADE,
+    guild_id INTEGER NOT NULL REFERENCES guilds(guild_id) ON DELETE CASCADE,
+    period_start INTEGER NOT NULL,
+    dungeon_id INTEGER NOT NULL,
+    mail_id INTEGER NOT NULL,
+    clear_count INTEGER NOT NULL,
+    PRIMARY KEY(event_id, character_id)
+);");
+        }
+
+        // v40: 公会购买内容(属性/经验加成)与绝对到期时间。
+        private static void ApplyGuildContents(SqliteConnection connection, SqliteTransaction transaction)
+        {
+            ExecuteSql(connection, transaction, @"CREATE TABLE IF NOT EXISTS guild_contents (
+    guild_id INTEGER NOT NULL REFERENCES guilds(guild_id) ON DELETE CASCADE,
+    content_type INTEGER NOT NULL,
+    content_id INTEGER NOT NULL,
+    content_value INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL CHECK(expires_at >= 0),
+    PRIMARY KEY(guild_id, content_type)
+);");
         }
 
         private static void ApplyGuildManagement(SqliteConnection connection, SqliteTransaction transaction)
@@ -934,6 +1044,20 @@ CREATE INDEX IF NOT EXISTS idx_item_purchase_limits_account_reset
             }
         }
 
+        // v35: 每日限购计数加日期维度, 跨天归零内建于每次购买的 UPSERT(挂机跨过 06:00 也能刷新)。
+        // 存量行 day_id=0, 不等于任何合法 TodayId, 迁移当天会被视为过期并重计一次。
+        private static void ApplyItemPurchaseLimitDayId(
+            SqliteConnection connection,
+            SqliteTransaction transaction)
+        {
+            AddColumnIfMissing(
+                connection,
+                transaction,
+                "item_purchase_limits",
+                "day_id",
+                "INTEGER NOT NULL DEFAULT 0");
+        }
+
         private static void ApplyAuraSkinFlag(
             SqliteConnection connection,
             SqliteTransaction transaction)
@@ -1258,6 +1382,28 @@ CREATE INDEX IF NOT EXISTS idx_event_total_attendance_weekly_week
 
 INSERT OR IGNORE INTO game_event_state(event_id, state)
 VALUES(2208, 0);");
+        }
+
+        private static void ApplySeriaLuckUiEvent(
+            SqliteConnection connection,
+            SqliteTransaction transaction)
+        {
+            ExecuteSql(connection, transaction, @"
+INSERT INTO game_event_state(event_id, state)
+VALUES(2037, 1)
+ON CONFLICT(event_id) DO UPDATE SET state=1;
+
+INSERT OR IGNORE INTO game_event_info_details (
+    event_id, unknown0, start_notice, end_notice, detail_flag,
+    flag_a, flag_b, title, short_name, reserved_or_icon,
+    start_unix_time, end_unix_time, link_key, description,
+    detail_enabled, sort_order, updated_at
+) VALUES (
+    2037, 0, '[S4A21]', '[S4A21]', 0,
+    0, 0, '', '', '',
+    0, 0, '', '',
+    0, 0, CURRENT_TIMESTAMP
+);");
         }
 
         private static void ApplyCharacterAbyssEpicPity(

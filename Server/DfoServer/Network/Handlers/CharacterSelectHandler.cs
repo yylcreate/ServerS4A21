@@ -3,6 +3,7 @@ using DfoServer.Game.Appearance;
 using DfoServer.Game.DailyReset;
 using DfoServer.Game.Characters;
 using DfoServer.Game.Friends;
+using DfoServer.Game.Guilds;
 using DfoServer.Game.Inventory;
 using DfoServer.Game.KnightShield;
 using DfoServer.Game.Mercenary;
@@ -28,6 +29,8 @@ namespace DfoServer.Network.Handlers
 {
     public sealed class CharacterSelectHandler
     {
+        private Func<EnhancedClientSession, Task> _restoreGuildContents;
+        internal void ConfigureGuildContents(Func<EnhancedClientSession, Task> restore) => _restoreGuildContents = restore;
         internal const byte A21MaxCreateJob = 13;
 
         internal static bool IsSupportedA21CreateJob(byte job)
@@ -234,6 +237,33 @@ namespace DfoServer.Network.Handlers
             }
         }
 
+        // 进号时把已持久化的龙跃武器成长值回填到 ItemCore 线上字段。
+        // 只改内存投影，不写库：成长值本身由 character_equipment_growth 持有。
+        private void ApplyLoginEquipmentGrowthProjection(InventoryLease lease)
+        {
+            if (lease?.Inventory == null)
+                return;
+
+            try
+            {
+                using (var connection = _database.OpenConnection())
+                using (var transaction = connection.BeginTransaction())
+                {
+                    EquipmentGrowthService.ProjectPersistedGrowth(
+                        lease.Inventory,
+                        connection,
+                        transaction);
+                    transaction.Commit();
+                }
+            }
+            catch (Exception ex)
+            {
+                FileLogger.Log(
+                    $"[{ProtocolName}] equipment growth projection failed " +
+                    $"cid={lease.CharacterId}: {ex.Message}");
+            }
+        }
+
         private void ApplyLoginItemExpirationMaintenance(InventoryLease lease)
         {
             if (lease?.Inventory == null)
@@ -374,7 +404,9 @@ namespace DfoServer.Network.Handlers
                         record,
                         selectedSpawn);
                     var registeredLease = TryRegisterInventoryLease(session, record, inventory);
+                    if (registeredLease == null) { session.Close(); return; }
                     ApplyLoginItemExpirationMaintenance(registeredLease);
+                    ApplyLoginEquipmentGrowthProjection(registeredLease);
 
                     try
                     {
@@ -421,7 +453,8 @@ namespace DfoServer.Network.Handlers
 
                     session.Player.AppearanceEntries = record.Appearance ?? Array.Empty<CharacterAppearanceEntry>();
                     if (GameChannelSpawnPolicy.ShouldPersistPosition(
-                            session.ListenerPort))
+                            session.ListenerPort,
+                            session.Player.CurTownId))
                     {
                         _characterRepository.UpdatePosition(
                             session.Player.CharacterId,
@@ -529,15 +562,20 @@ namespace DfoServer.Network.Handlers
                 }
             }
 
+            var guildEntranceNotices = GuildStatePublisher.BuildLoginNotices(
+                new GuildRepository(_database),
+                ownerCharId);
             foreach (var packet in SelectCharacterPacketBuilder.BuildPacketStream(
                          _selectCharacterDataSource,
                          ownerCharId,
                          ownerAcctId,
                          pvpSkillOverride,
                          selectedSpawn,
-                         _initPacketBuilders))
+                         _initPacketBuilders,
+                         guildEntranceNotices))
                 await session.SendPacketAsync(packet);
 
+            if (_restoreGuildContents != null) await _restoreGuildContents(session);
             if (InventoryContext.TryGetLease(ownerCharId, out var inventoryLease)
                 && inventoryLease.IsOwnedBy(session.SessionId))
             {
@@ -936,7 +974,8 @@ namespace DfoServer.Network.Handlers
             }
 
             var existing = _characterRepository.GetByName(name);
-            if (existing != null)
+            if (existing != null || new CharacterRenameRepository(_database)
+                .IsNameReserved(nameRaw, DateTimeOffset.UtcNow.ToUnixTimeSeconds()))
             {
                 // 20/24 公告 已存在的角色名
                 // 159 公告 包含无法使用的文字
@@ -996,7 +1035,8 @@ namespace DfoServer.Network.Handlers
                 return;
             }
 
-            if (_characterRepository.GetByName(nameStr) != null)
+            if (_characterRepository.GetByName(nameStr) != null || new CharacterRenameRepository(_database)
+                .IsNameReserved(nameRaw, DateTimeOffset.UtcNow.ToUnixTimeSeconds()))
             {
                 // 与 CHECK_DOUBLE_CHARACTER_NAME 一致：24 = 已存在的角色名
                 await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(
@@ -1199,7 +1239,9 @@ namespace DfoServer.Network.Handlers
             FileLogger.Log($"[{ProtocolName}] CHANGE_CHARAC_SLOT swapped slot {slotA} <-> {slotB} for account_id={accountId}");
 
             await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(0x01, 0x0127, CommonPacketBodyBuilder.BuildSuccessAck()));
-            await SendCharacterListAsync(session);
+            // 与 DELETE_CHARACTER 同口径：客户端 ACK Ok 分支已按本地拖拽结果更新角色向量，
+            // 服务端再补发完整列表会把客户端的选中态按服务端快照重建，表现为自动选中某个槽位。
+            // 顺序已持久化，重登时由正常列表包恢复；这里只回 ACK。
         }
 
         public async Task SendCharacterListAsync(EnhancedClientSession session)

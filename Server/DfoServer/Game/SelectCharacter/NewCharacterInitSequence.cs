@@ -28,6 +28,7 @@ namespace DfoServer.Game.SelectCharacter
             // -> 0005 -> ITEM_LIST -> 0245 -> 0465/021E。
             Raw(0x01, 0x0004);
             Raw(0x00, (ushort)NotiPacketTypeA21.USERINFO, 0);
+            // 有公会时，SelectCharacterPacketBuilder 在这条 USERINFO0 之后、USER_STATE 之前插入公会入口通知。
             Raw(0x00, 0x0166, 0);                   
             Raw(0x00, 0x0166, 1);                   
             Raw(0x00, 0x0166, 2);                   
@@ -62,6 +63,7 @@ namespace DfoServer.Game.SelectCharacter
             Raw(0x00, (ushort)NotiPacketTypeA21.PVP_RECORD);
             Raw(0x00, (ushort)NotiPacketTypeA21.PVP_TOTAL_MATCH_TEAM_INFO);
             Raw(0x00, 0x006C);
+            Raw(0x00, (ushort)NotiPacketTypeA21.BOOSTER_GAGE);
             Raw(0x00, 0x0187);
             Raw(0x00, 0x01B9);
             Raw(0x00, 0x015F);                      
@@ -79,8 +81,8 @@ namespace DfoServer.Game.SelectCharacter
             Raw(0x00, (ushort)NotiPacketTypeA21.TAG_CHARACTER_INFO);
             Raw(0x00, 0x00B1);                      
             Raw(0x00, 0x036A);
-            // 魔王契约必须在进号阶段主动同步；客户端不保证主动查询 0x036F。
-            Raw(0x00, (ushort)NotiPacketTypeA21.PREMIUM_SERVICE);
+            // A21 consumes premium state from the cmd=1 response branch of 0x036F.
+            Raw(0x01, (ushort)CmdPacketTypeA21.PREMIUM_SERVICE);
             Raw(0x00, 0x03D8);                      
             Raw(0x00, 0x025B);                      
             Raw(0x00, 0x0331);                      

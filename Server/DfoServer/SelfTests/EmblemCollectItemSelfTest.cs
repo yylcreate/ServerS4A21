@@ -171,7 +171,18 @@ namespace DfoServer.SelfTests
 
             VerifyBrilliantCollect(ref failures);
             VerifyGorgeousCollect(ref failures);
-            VerifyPlatinumCollect(ref failures);
+            if (StackableItemProvider.Load(PlatinumBoxItemId) == null)
+            {
+                Console.WriteLine(
+                    $"[SKIP] platinum box checks require PVF item {PlatinumBoxItemId} "
+                    + "(the customized platinum emblem collector)");
+            }
+            else
+            {
+                VerifyPlatinumCollect(ref failures);
+                VerifyPlatinumBoxRejectsGrade3(ref failures);
+            }
+
             VerifyEquippedTargetCollect(ref failures);
             VerifyRejections(ref failures);
         }
@@ -281,6 +292,23 @@ namespace DfoServer.SelfTests
                 ref failures);
         }
 
+        private static void VerifyPlatinumBoxRejectsGrade3(ref int failures)
+        {
+            var inventory = CreateCollectInventory(PlatinumBoxItemId, BrilliantEmblemId1, BrilliantEmblemId2);
+            Check(
+                "platinum box rejects grade-3 emblems on a two-socket equipment",
+                !InventoryEquipmentMutationService.TryCollectEquipmentEmblems(
+                    inventory,
+                    BoxSlot,
+                    PlatinumBoxItemId,
+                    EquipmentSlot,
+                    EquipmentItemId,
+                    out _)
+                && inventory.GetItem(InventoryListType.Main, BoxSlot)?.Count == 1
+                && inventory.GetItem(InventoryListType.Main, EquipmentSlot)?.EmblemId1 == BrilliantEmblemId1,
+                ref failures);
+        }
+
         private static void VerifyEquippedTargetCollect(ref int failures)
         {
             var inventory = new InventoryService(characterId: 92011, accountId: 92010);
@@ -363,20 +391,6 @@ namespace DfoServer.SelfTests
                     out _)
                 && brilliantOnPlatinum.GetItem(InventoryListType.Main, BoxSlot)?.Count == 1
                 && brilliantOnPlatinum.GetItem(InventoryListType.Main, EquipmentSlot)?.EmblemId1 == PlatinumEmblemItemId,
-                ref failures);
-
-            var platinumOnBrilliant = CreateCollectInventory(PlatinumBoxItemId, BrilliantEmblemId1, BrilliantEmblemId2);
-            Check(
-                "platinum box rejects grade-3 emblems on a two-socket equipment",
-                !InventoryEquipmentMutationService.TryCollectEquipmentEmblems(
-                    platinumOnBrilliant,
-                    BoxSlot,
-                    PlatinumBoxItemId,
-                    EquipmentSlot,
-                    EquipmentItemId,
-                    out _)
-                && platinumOnBrilliant.GetItem(InventoryListType.Main, BoxSlot)?.Count == 1
-                && platinumOnBrilliant.GetItem(InventoryListType.Main, EquipmentSlot)?.EmblemId1 == BrilliantEmblemId1,
                 ref failures);
 
             // 两孔装备只镶 1 颗（等级与箱子匹配）也必须拒绝：客户端补丁跳过了"每个孔都要有徽章"，

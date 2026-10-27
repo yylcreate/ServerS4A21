@@ -64,7 +64,7 @@ namespace DfoServer.Network.Builders
             Register(new SimpleByteBodyBuilder(
                 (ushort)NotiPacketTypeA21.UPGRADE_CARRY_GOLD,
                 s => s.GoldLimitUpgradeLevel));
-            Register(new PremiumServiceInitBodyBuilder());
+            RegisterCmd(new PremiumServiceInitBodyBuilder());
 
             
             Register(new EnterGameWorldCompleteBodyBuilder());
@@ -93,6 +93,7 @@ namespace DfoServer.Network.Builders
             Register(new RentalInfoBodyBuilder());                                      
             Register(new LotteryBufferBodyBuilder(_database));                          
             Register(new CubeInfoBodyBuilder());                                        
+            Register(new BoosterGageBodyBuilder());
             Register(new FatigueAccelBodyBuilder());                                    
 
             

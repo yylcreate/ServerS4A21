@@ -21,11 +21,15 @@ namespace DfoServer.Infrastructure
             GuildMemberHandler guildMembers,
             GuildJoinHandler guildJoin,
             GuildManagementHandler guildManagement,
+            GuildFacilityHandler guildFacility,
+            GuildInviteHandler guildInvite,
             ItemTradeHandler trade)
         {
             Trade = trade ?? throw new ArgumentNullException(nameof(trade));
             GuildJoin = guildJoin ?? throw new ArgumentNullException(nameof(guildJoin));
             GuildManagement = guildManagement ?? throw new ArgumentNullException(nameof(guildManagement));
+            GuildFacility = guildFacility ?? throw new ArgumentNullException(nameof(guildFacility));
+            GuildInvite = guildInvite ?? throw new ArgumentNullException(nameof(guildInvite));
             GuildMembers = guildMembers ?? throw new ArgumentNullException(nameof(guildMembers));
             GuildCreation = guildCreation ?? throw new ArgumentNullException(nameof(guildCreation));
             Party = party ?? throw new ArgumentNullException(nameof(party));
@@ -46,6 +50,8 @@ namespace DfoServer.Infrastructure
         internal GuildMemberHandler GuildMembers { get; }
         internal GuildJoinHandler GuildJoin { get; }
         internal GuildManagementHandler GuildManagement { get; }
+        internal GuildFacilityHandler GuildFacility { get; }
+        internal GuildInviteHandler GuildInvite { get; }
 
         internal PartyHandler Party { get; }
 
@@ -67,6 +73,7 @@ namespace DfoServer.Infrastructure
                 return;
 
             _disposed = true;
+            GuildManagement.DisposeContentTimers();
             Trade.Dispose();
             Chat.Dispose();
             PvpRoom.Dispose();
