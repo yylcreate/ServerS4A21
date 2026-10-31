@@ -10,6 +10,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Text;
+using System.Threading.Tasks;
 
 namespace DfoServer.SelfTests
 {
@@ -205,6 +206,7 @@ INSERT INTO accounts (account_id, m_id, password_hash) VALUES (959000, 'mailbox-
 INSERT INTO characters (character_id, account_id, name, level) VALUES (959001, 959000, 'mailbox-medal', 86);");
                 var lease = InventoryContext.Register(sessionId, new InventoryService(characterId, accountId, database));
                 var mailbox = new MailboxService(new MailboxRepository(database));
+                VerifyCommittedSystemMailNotices(mailbox, characterId, ref failures);
                 var sent = SendGuildMail(mailbox, characterId, new[] { 100380051, 100380058, 90023, 90053 });
                 Check("GM medal/gem system mail is created", sent.Success, ref failures);
                 if (!sent.Success)
@@ -353,6 +355,46 @@ WHEN NEW.list_type = 38 BEGIN SELECT RAISE(ABORT, 'mailbox-medal-selftest'); END
                 try { Directory.Delete(tempDir, recursive: true); }
                 catch (Exception ex) { Console.WriteLine("[WARN] medal/gem mail temp cleanup: " + ex.Message); }
             }
+        }
+
+        private static void VerifyCommittedSystemMailNotices(MailboxService mailbox, int characterId, ref int failures)
+        {
+            var notifications = 0;
+            var sawCommittedMail = false;
+            const string key = "mailbox-system-notice-selftest";
+            var request = new MailboxSendRequest
+            {
+                SenderCharacterId = characterId,
+                SenderName = "system",
+                ReceiverCharacterId = characterId,
+                Title = "system-notice",
+                Text = "committed-notice",
+                Gold = 1,
+                MailType = 1,
+                IdempotencyKey = key
+            };
+            mailbox.SystemMailArrivedNotifier = cid =>
+            {
+                notifications++;
+                sawCommittedMail = cid == characterId
+                    && mailbox.LoadInbox(cid, 20).Any(x => x.Title == request.Title);
+                return Task.CompletedTask;
+            };
+            var first = mailbox.SendSystemMail(request);
+            var replay = mailbox.SendSystemMail(request);
+            Check("system notice occurs once after durable mail commit, not on idempotent replay",
+                first.Success && !first.AlreadyExists && replay.Success && replay.AlreadyExists
+                && replay.MessageId == first.MessageId && notifications == 1 && sawCommittedMail, ref failures);
+            request.Gold = 2;
+            var conflict = mailbox.SendSystemMail(request);
+            Check("idempotency content conflict does not produce a new system notice",
+                !conflict.Success && notifications == 1, ref failures);
+            request.IdempotencyKey = key + ":transport-failure";
+            mailbox.SystemMailArrivedNotifier = _ => throw new InvalidOperationException("notice failed");
+            var committed = mailbox.SendSystemMail(request);
+            Check("system notice failure does not roll back or resend durable mail",
+                committed.Success && mailbox.LoadInbox(characterId, 20).Any(x => x.MessageId == committed.MessageId), ref failures);
+            mailbox.SystemMailArrivedNotifier = null;
         }
 
         private static MailboxSendResult SendGuildMail(MailboxService mailbox, int characterId, int[] itemIds)

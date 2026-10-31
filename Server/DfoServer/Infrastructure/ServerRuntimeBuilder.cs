@@ -16,6 +16,7 @@ using DfoServer.Game.KnightShield;
 using DfoServer.Game.Lottery;
 using DfoServer.Game.Mercenary;
 using DfoServer.Game.Mailbox;
+using DfoServer.Game.Auction;
 using DfoServer.Game.Party;
 using DfoServer.Game.Raid;
 using DfoServer.Game.SelectCharacter;
@@ -842,6 +843,10 @@ namespace DfoServer.Infrastructure
             townDungeon.Town.ConfigureEpicRoadEntry(epicRoad);
             townDungeon.Town.ConfigureAccountDungeonCountProjection(accountDungeonCounts.PublishWhileTransitionHeldAsync);
 
+            var auctionService = new AuctionService(
+                new AuctionRepository(core.Database), inventory.MailboxService);
+            auctionService.RegisterClock(ClockService.Instance);
+
             var handlers = new GameProtocolFeatureHandlers(
                 lotteryItem,
                 new PetCreatureHandler(
@@ -906,6 +911,7 @@ namespace DfoServer.Infrastructure
                 new EventFatigueAccelerationHandler(
                     core.EventManager.FatigueAccelerationEntry,
                     world.CharacterTransitions),
+                new AuctionHandler(auctionService, world.CharacterTransitions),
                 guardianAltarOpening,
                 eventDungeons);
             guardianAltarOpening.Start();

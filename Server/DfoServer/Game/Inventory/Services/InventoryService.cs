@@ -304,6 +304,7 @@ namespace DfoServer.Game.Inventory
                 SlotIndex = slotIndex,
                 ItemId = fixedItemId,
                 Count = NormalizeVirtualCount(count),
+                CommittedCount = NormalizeVirtualCount(count),
             };
         }
 
@@ -326,15 +327,82 @@ namespace DfoServer.Game.Inventory
                 && current.Count == normalizedCount)
                 return true;
 
-            _mainVirtualCounts[slotIndex] = new VirtualCountItem
+            if (current == null)
+                _mainVirtualCounts[slotIndex] = new VirtualCountItem
+                {
+                    SlotIndex = slotIndex,
+                    ItemId = fixedItemId,
+                    Count = normalizedCount,
+                };
+            else
             {
-                SlotIndex = slotIndex,
-                ItemId = fixedItemId,
-                Count = normalizedCount,
-            };
+                current.ItemId = fixedItemId;
+                current.Count = normalizedCount;
+            }
             _dirtyMainVirtualSlots.Add(slotIndex);
             return true;
         }
+
+        internal CrystalCountPersistenceCheckpoint GetCrystalPersistence(short slotIndex)
+            => _mainVirtualCounts.TryGetValue(slotIndex, out var item) ? item.CrystalPersistence : null;
+
+        internal long GetCrystalPersistenceDelta(short slotIndex, SqliteTransaction transaction)
+        {
+            if (!CurrencyService.IsCubeFragmentSlot(slotIndex)
+                || !_mainVirtualCounts.TryGetValue(slotIndex, out var item))
+                throw new InvalidOperationException("Crystal persistence requires a fixed crystal slot.");
+            var alreadyApplied = item.CrystalPersistence?.IsFor(transaction) == true
+                ? item.CrystalPersistence.AppliedDelta : 0;
+            return (long)item.Count - item.CommittedCount - alreadyApplied;
+        }
+
+        internal void RecordCrystalPersistence(short slotIndex, SqliteTransaction transaction,
+            string connectionString, string receipt, long auditId, long delta, int countAfter)
+        {
+            var item = _mainVirtualCounts[slotIndex];
+            var checkpoint = item.CrystalPersistence;
+            if (checkpoint?.IsFor(transaction) != true)
+                item.CrystalPersistence = checkpoint = new CrystalCountPersistenceCheckpoint
+                {
+                    Transaction = new WeakReference<SqliteTransaction>(transaction),
+                    ConnectionString = connectionString,
+                    Receipt = receipt,
+                    AuditId = auditId,
+                };
+            checkpoint.AppliedDelta += delta;
+            checkpoint.CountAfter = countAfter;
+        }
+
+        internal bool AcceptCrystalPersistence(short slotIndex)
+        {
+            var item = _mainVirtualCounts[slotIndex];
+            var checkpoint = item.CrystalPersistence;
+            if (checkpoint == null) return false;
+            var outstanding = (long)item.Count - item.CommittedCount - checkpoint.AppliedDelta;
+            var projected = (long)checkpoint.CountAfter + outstanding;
+            if (projected < 0 || projected > int.MaxValue)
+            {
+                // The receipt already proves the preceding delta committed. A
+                // later accepted change in a stale character coordinate can be
+                // unpayable against the actual shared balance. Keep that change
+                // as a delta from the last persisted local coordinate; the next
+                // real write must validate it against the account, without
+                // clipping units or turning committed cleanup into a failure.
+                item.CommittedCount = checked((int)((long)item.CommittedCount + checkpoint.AppliedDelta));
+            }
+            else
+            {
+                item.Count = (int)projected;
+                item.CommittedCount = checkpoint.CountAfter;
+            }
+            item.CrystalPersistence = null;
+            if (outstanding == 0) _dirtyMainVirtualSlots.Remove(slotIndex);
+            else _dirtyMainVirtualSlots.Add(slotIndex);
+            return outstanding != 0;
+        }
+
+        internal void DiscardCrystalPersistence(short slotIndex)
+            => _mainVirtualCounts[slotIndex].CrystalPersistence = null;
 
         public void SetAuraSkinFlag(byte auraSkinFlag)
         {
@@ -563,8 +631,15 @@ namespace DfoServer.Game.Inventory
 
         public void ClearDirtyState()
         {
+            var outstandingCrystals = InventoryPersistenceService.CompleteCrystalPersistence(this);
             _dirtySlots.Clear();
             _dirtyMainVirtualSlots.Clear();
+            foreach (var slot in outstandingCrystals)
+                _dirtyMainVirtualSlots.Add(slot);
+            foreach (var item in _mainVirtualCounts.Values)
+                if (CurrencyService.IsCubeFragmentSlot(item.SlotIndex)
+                    && !outstandingCrystals.Contains(item.SlotIndex))
+                    item.CommittedCount = item.Count;
             _dirtyListParams.Clear();
             _pendingHappyTokenCeraGrant = 0;
             AvatarDetails.ClearDirtyState();

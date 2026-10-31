@@ -1,4 +1,5 @@
 using DfoServer.Game.Characters;
+using DfoServer.Game.Currency;
 using DfoServer.Network.Builders;
 using DfoServer.Game.Inventory;
 using DfoServer.Game.ItemUpgrade;
@@ -38,6 +39,7 @@ namespace DfoServer.Network.Handlers
         private readonly MailboxService _mailboxService;
         private readonly ISessionDirectory _sessionDirectory;
         private readonly InventoryRefreshSender _inventoryRefreshSender;
+        private readonly Func<EnhancedClientSession, Func<IReadOnlyList<byte[]>>, Func<bool>, Task> _sendSystemNotice;
         private readonly ConcurrentDictionary<Guid, MailboxPageRemovalRefreshState> _pageRemovalRefreshes = new ConcurrentDictionary<Guid, MailboxPageRemovalRefreshState>();
         private readonly ConditionalWeakTable<EnhancedClientSession, MailboxAlarmState> _mailboxAlarmStates = new ConditionalWeakTable<EnhancedClientSession, MailboxAlarmState>();
         private int _mailboxMaintenanceRunning;
@@ -46,13 +48,80 @@ namespace DfoServer.Network.Handlers
             ICharacterRepository characterRepository,
             MailboxService mailboxService,
             ISessionDirectory sessionDirectory,
-            InventoryRefreshSender inventoryRefreshSender)
+            InventoryRefreshSender inventoryRefreshSender,
+            Func<EnhancedClientSession, Func<IReadOnlyList<byte[]>>, Func<bool>, Task> sendSystemNotice = null,
+            bool registerMaintenance = true)
         {
             _characterRepository = characterRepository ?? throw new ArgumentNullException(nameof(characterRepository));
             _mailboxService = mailboxService ?? throw new ArgumentNullException(nameof(mailboxService));
             _sessionDirectory = sessionDirectory ?? throw new ArgumentNullException(nameof(sessionDirectory));
             _inventoryRefreshSender = inventoryRefreshSender ?? throw new ArgumentNullException(nameof(inventoryRefreshSender));
-            ClockService.Instance.RegisterMinuteTick("mailbox-expiration", RunMailboxMaintenance);
+            _sendSystemNotice = sendSystemNotice ?? ((session, prepare, guard) =>
+                session.SendPreparedPacketBatchAsync(prepare, guard));
+            _mailboxService.SystemMailArrivedNotifier = NotifySystemMailArrived;
+            if (registerMaintenance)
+                ClockService.Instance.RegisterMinuteTick("mailbox-expiration", RunMailboxMaintenance);
+        }
+
+        internal async Task NotifySystemMailArrived(int receiverCharacterId)
+        {
+            if (!_sessionDirectory.TryGet(receiverCharacterId, out var session))
+                return;
+            var player = session.Player;
+            var account = session.Account;
+            var gameSession = session.GameSession;
+            var uid = player?.UserId ?? 0;
+            var accountId = account?.AccountId ?? 0;
+            if (receiverCharacterId <= 0 || player?.CharacterId != receiverCharacterId
+                || uid == 0 || accountId <= 0 || gameSession == null
+                || !InventoryContext.TryGetOwnedLease(session.SessionId, receiverCharacterId, out var lease))
+                return;
+            if (lease.AccountId != accountId)
+                return;
+            var version = lease.Version;
+            bool IsCurrent() => _sessionDirectory.TryGet(receiverCharacterId, out var current)
+                && ReferenceEquals(current, session) && ReferenceEquals(session.Player, player)
+                && player.CharacterId == receiverCharacterId && player.UserId == uid
+                && ReferenceEquals(session.Account, account) && account.AccountId == accountId
+                && ReferenceEquals(session.GameSession, gameSession) && lease.Version == version
+                && InventoryContext.IsCurrentLease(lease, session.SessionId, receiverCharacterId);
+
+            MailboxAlarmState preparedState = null;
+            bool alarmPrepared = false;
+            try
+            {
+                await _sendSystemNotice(session, () =>
+                {
+                    if (!IsCurrent())
+                        return Array.Empty<byte[]>();
+                    var page = _mailboxService.LoadInboxPage(receiverCharacterId, MailboxPageSize);
+                    var packets = new List<byte[]>();
+                    preparedState = _mailboxAlarmStates.GetValue(session, _ => new MailboxAlarmState());
+                    lock (preparedState.SyncRoot)
+                    {
+                        preparedState.PendingCount = Math.Min(ushort.MaxValue, preparedState.PendingCount + 1);
+                        if (!preparedState.NotificationSent)
+                        {
+                            preparedState.NotificationSent = true;
+                            alarmPrepared = true;
+                            packets.Add(GamePacketEnvelopeBuilder.Build(0, MailboxAlarmNotificationType,
+                                BuildMailboxAlarmNotification((ushort)Math.Max(1, preparedState.PendingCount))));
+                        }
+                    }
+                    foreach (var body in BuildMailboxListNotificationBatches(
+                        page.Entries, ClampUInt16(page.NotLoadedCount)))
+                        packets.Add(GamePacketEnvelopeBuilder.Build(0, MailboxListNotificationType, body));
+                    return packets;
+                }, IsCurrent).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                if (alarmPrepared && preparedState != null)
+                    lock (preparedState.SyncRoot)
+                        preparedState.NotificationSent = false;
+                // The durable mailbox is authoritative; a failed notice never resends assets.
+                FileLogger.Log($"[Mailbox] system notice skipped/failed cid={receiverCharacterId}: {ex.Message}");
+            }
         }
 
         private void RunMailboxMaintenance(DateTime utcNow)
@@ -330,6 +399,13 @@ namespace DfoServer.Network.Handlers
 
             var claimObjectId = BitConverter.ToInt32(body, 0);
             var characterId = session.Player?.CharacterId ?? 0;
+            var claimPlayer = session.Player;
+            var claimAccount = session.Account;
+            var claimGame = session.GameSession;
+            var claimUid = claimPlayer?.UserId ?? 0;
+            var claimAccountId = claimAccount?.AccountId ?? 0;
+            var claimRun = claimPlayer?.CurrentDungeonRunGeneration ?? 0;
+            var claimSelection = claimPlayer?.CurrentDungeonSelectionGeneration ?? 0;
 
             if (!InventoryContext.TryGetLease(characterId, out var receiverInventory)
                 || !receiverInventory.IsOwnedBy(session.SessionId))
@@ -358,7 +434,45 @@ namespace DfoServer.Network.Handlers
             if (result.ClaimedGold > 0)
                 AddClaimRefreshSlot(updatedSlots, InventoryListType.Main, 0);
 
-            await SendClaimMailboxResult(session, header.type, claimObjectId);
+            // Project the committed wallet through this request's original
+            // identity. Re-read after taking the send lock so a queued claim
+            // cannot publish an old balance or target a replacement character.
+            if (result.ClaimedTokenCera > 0)
+            {
+                bool Current() => claimPlayer != null && claimAccount != null && claimGame != null
+                    && ReferenceEquals(session.Player, claimPlayer) && ReferenceEquals(session.Account, claimAccount)
+                    && ReferenceEquals(session.GameSession, claimGame)
+                    && claimPlayer.CharacterId == characterId && claimPlayer.UserId == claimUid
+                    && claimAccount.AccountId == claimAccountId && receiverInventory.AccountId == claimAccountId
+                    && claimPlayer.CurrentDungeonRunGeneration == claimRun
+                    && claimPlayer.CurrentDungeonSelectionGeneration == claimSelection
+                    && InventoryContext.IsCurrentLease(receiverInventory, session.SessionId, characterId)
+                    && _sessionDirectory.TryGet(characterId, out var current) && ReferenceEquals(current, session);
+                await session.SendPreparedPacketBatchAsync(() =>
+                {
+                    if (!Current()) return Array.Empty<byte[]>();
+                    using var connection = receiverInventory.Inventory.Database.OpenConnection();
+                    var wallet = CurrencyService.LoadWallet(connection, null, characterId);
+                    return wallet == null ? Array.Empty<byte[]>() : new[]
+                    {
+                        GamePacketEnvelopeBuilder.Build(
+                            0,
+                            (ushort)NotiPacketTypeA21.CERA,
+                            CeraUpdateBuilder.Build(wallet.Cera, wallet.TokenCera, wallet.HappyTokenCera))
+                    };
+                }, Current);
+            }
+
+            // The A21 client treats the successful MAILBOX_EXTRACT_ITEM ACK as
+            // the legacy item-claim result dialog.  For token-cera mails that
+            // dialog formats the voucher delta from an item-count field and
+            // shows 0 even though the durable wallet transaction already
+            // credited the token balance.  The authoritative CERA projection
+            // above is sufficient for this virtual-currency claim; suppress
+            // only this success ACK and keep ordinary mailbox claims on their
+            // existing native path.
+            if (result.ClaimedTokenCera <= 0)
+                await SendClaimMailboxResult(session, header.type, claimObjectId);
             await SendClaimInventoryRefresh(session, updatedSlots);
 
             if (result.RemovedFromInbox)
@@ -376,7 +490,7 @@ namespace DfoServer.Network.Handlers
                     result.InventoryMutations);
             }
 
-            FileLogger.Log($"[Mailbox] CLAIM ok claimObjectId={claimObjectId} messageId={result.MessageId} gold={result.ClaimedGold} attachments={result.ClaimedAttachmentCount} removed={result.RemovedFromInbox} refreshSlots={FormatClaimRefreshSlots(updatedSlots)}");
+            FileLogger.Log($"[Mailbox] CLAIM ok claimObjectId={claimObjectId} messageId={result.MessageId} gold={result.ClaimedGold} tokenCera={result.ClaimedTokenCera} attachments={result.ClaimedAttachmentCount} removed={result.RemovedFromInbox} refreshSlots={FormatClaimRefreshSlots(updatedSlots)}");
         }
 
         private async Task SendClaimInventoryRefresh(EnhancedClientSession session, IDictionary<InventoryListType, List<short>> updatedSlots)

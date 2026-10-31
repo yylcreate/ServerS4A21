@@ -154,7 +154,7 @@ namespace DfoServer.Game.Inventory
             SaveDirtyCollectBox(connection, transaction, inventory);
             SaveDirtyEpicPieceBook(connection, transaction, inventory);
             SaveDirtyItemStates(connection, transaction, inventory);
-            SaveDirtyMainVirtualCounts(connection, transaction, inventory);
+            SaveDirtyMainVirtualCounts(connection, transaction, lease, inventory);
             SaveDirtyContainerStates(connection, transaction, inventory);
             SavePendingAccountCurrencyGrants(connection, transaction, inventory);
             return true;
@@ -373,6 +373,9 @@ namespace DfoServer.Game.Inventory
         {
             foreach (var slotIndex in inventory.DirtyMainVirtualCountSlots)
             {
+                // Crystal audit values come from the atomic account delta below,
+                // not from the stale character projection's absolute count.
+                if (CurrencyService.IsCubeFragmentSlot(slotIndex)) continue;
                 var item = inventory.GetMainVirtualCount(slotIndex);
                 if (item == null)
                     continue;
@@ -553,9 +556,10 @@ namespace DfoServer.Game.Inventory
         private static void SaveDirtyMainVirtualCounts(
             SqliteConnection connection,
             SqliteTransaction transaction,
+            InventoryLease lease,
             InventoryService inventory)
         {
-            foreach (var slotIndex in inventory.DirtyMainVirtualCountSlots)
+            foreach (var slotIndex in inventory.DirtyMainVirtualCountSlots.ToArray())
             {
                 var item = inventory.GetMainVirtualCount(slotIndex);
                 if (item == null)
@@ -576,12 +580,7 @@ namespace DfoServer.Game.Inventory
                 if (slotIndex >= InventoryService.MainVirtualCubeSlotStart
                     && slotIndex <= InventoryService.MainVirtualCubeSlotEnd)
                 {
-                    CurrencyService.SetCubeFragmentCount(
-                        connection,
-                        transaction,
-                        inventory.AccountId,
-                        item.ItemId,
-                        item.Count);
+                    SaveCrystalCount(connection, transaction, lease, inventory, slotIndex, item.ItemId);
                     continue;
                 }
 
@@ -596,6 +595,106 @@ namespace DfoServer.Game.Inventory
                         item.Count);
                 }
             }
+        }
+
+        private static void SaveCrystalCount(SqliteConnection connection, SqliteTransaction transaction,
+            InventoryLease lease, InventoryService inventory, short slotIndex, int itemId)
+        {
+            var checkpoint = inventory.GetCrystalPersistence(slotIndex);
+            if (checkpoint != null && !checkpoint.IsFor(transaction))
+            {
+                if (HasCrystalReceipt(connection, transaction, checkpoint))
+                    inventory.AcceptCrystalPersistence(slotIndex);
+                else
+                    inventory.DiscardCrystalPersistence(slotIndex);
+                checkpoint = null;
+            }
+            var delta = inventory.GetCrystalPersistenceDelta(slotIndex, transaction);
+            if (delta == 0 && checkpoint != null) return;
+            if (!CurrencyService.TryApplyCubeFragmentDelta(connection, transaction,
+                    inventory.AccountId, itemId, delta, out var beforeCount, out var afterCount))
+                throw new InvalidOperationException("Account crystal balance cannot accept the pending change.");
+            var receipt = checkpoint?.Receipt ?? Guid.NewGuid().ToString("N");
+            var auditEvent = InventoryAuditEvent.FromVirtualCountChange(
+                lease.SessionId, inventory, slotIndex, itemId, beforeCount, afterCount)
+                ?? new InventoryAuditEvent
+                {
+                    SessionId = lease.SessionId, OwnerScope = "account", OwnerId = inventory.AccountId,
+                    CharacterId = inventory.CharacterId, AccountId = inventory.AccountId,
+                    ActionName = "inventory_crystal_count_observe", ListType = InventoryListType.Main,
+                    SlotIndex = slotIndex, ItemId = itemId, ItemKind = ItemCore.KindSpecialMaterial,
+                    ValueBefore = beforeCount, ValueAfter = afterCount,
+                    CountBefore = beforeCount, CountAfter = afterCount,
+                };
+            if (checkpoint == null)
+                auditEvent.PayloadJson = CrystalReceiptPayload(receipt);
+            InventoryAuditRepository.Insert(connection, transaction, auditEvent);
+            var auditId = checkpoint?.AuditId ?? LastAuditId(connection, transaction);
+            inventory.RecordCrystalPersistence(slotIndex, transaction, connection.ConnectionString,
+                receipt, auditId, delta, afterCount);
+        }
+
+        private static long LastAuditId(SqliteConnection connection, SqliteTransaction transaction)
+        {
+            using var command = connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = "SELECT last_insert_rowid();";
+            return Convert.ToInt64(command.ExecuteScalar());
+        }
+
+        private static string CrystalReceiptPayload(string receipt)
+            => "{\"crystalCommit\":\"" + receipt + "\"}";
+
+        private static bool HasCrystalReceipt(SqliteConnection connection, SqliteTransaction transaction,
+            CrystalCountPersistenceCheckpoint checkpoint)
+        {
+            using var command = connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = "SELECT payload_json FROM inventory_audit_log WHERE audit_id=@id;";
+            command.Parameters.AddWithValue("@id", checkpoint.AuditId);
+            return command.ExecuteScalar() is string payload
+                && string.Equals(payload, CrystalReceiptPayload(checkpoint.Receipt), StringComparison.Ordinal);
+        }
+
+        internal static IReadOnlySet<short> CompleteCrystalPersistence(InventoryService inventory)
+        {
+            var outstanding = new HashSet<short>();
+            for (short slot = InventoryService.MainVirtualCubeSlotStart;
+                 slot <= InventoryService.MainVirtualCubeSlotEnd; slot++)
+            {
+                var checkpoint = inventory.GetCrystalPersistence(slot);
+                if (checkpoint == null) continue;
+                // A separate reader observes durable rows even if a legacy rollback
+                // caller invokes ClearDirtyState with its original transaction alive.
+                // The indexed row + nonce distinguishes rollback and row-id reuse.
+                try
+                {
+                    using var connection = new SqliteConnection(checkpoint.ConnectionString);
+                    connection.Open();
+                    if (HasCrystalReceipt(connection, null, checkpoint))
+                    {
+                        if (inventory.AcceptCrystalPersistence(slot)) outstanding.Add(slot);
+                    }
+                    else
+                    {
+                        // The receipt can also be invisible because the caller's
+                        // transaction is still active. Preserve its checkpoint and
+                        // baseline so a second save in that transaction cannot debit
+                        // twice. A subsequent transaction reconciles rollback first.
+                        outstanding.Add(slot);
+                    }
+                }
+                catch (SqliteException exception)
+                {
+                    // This postcommit observation is not part of the business
+                    // commit. Keep the exact checkpoint for a later read rather
+                    // than reporting an already committed mutation as failed.
+                    FileLogger.Log($"[InventoryPersistence] crystal receipt observation deferred "
+                        + $"cid={inventory.CharacterId} slot={slot} sqlite={exception.SqliteErrorCode}: {exception.Message}");
+                    outstanding.Add(slot);
+                }
+            }
+            return outstanding;
         }
 
         private static void SaveDirtyContainerStates(

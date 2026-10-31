@@ -166,6 +166,8 @@ namespace PvfLib
 
         
         public string StackableType { get; set; }
+        // 拍卖副职业分类的只读资源字段；不改变背包 ItemKind 或职业状态。
+        public string ExpertType { get; set; }
         public List<string> AvatarEmblemTargetTypes { get; set; } = new List<string>();
         // [usable equip type] 限定可作用的装备部位, 例如品级调整箱按武器/防具/首饰分箱。空表示不限部位。
         public List<string> UsableEquipTypes { get; set; } = new List<string>();
@@ -333,6 +335,7 @@ namespace PvfLib
 
                     
                     case "stackable type": stk.StackableType = StripBacktick(data); break;
+                    case "expert type": stk.ExpertType = StripBacktick(data); break;
                     case "avatar emblem target type":
                         stk.AvatarEmblemTargetTypes = ParseStringList(node, content);
                         stk.AvatarEmblemSocketType = ResolveAvatarEmblemSocketType(stk.AvatarEmblemTargetTypes);

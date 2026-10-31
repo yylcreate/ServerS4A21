@@ -42,6 +42,7 @@ namespace DfoServer.Network
         private readonly LuckyStarHandler _luckyStarHandler;
         private readonly RentalHandler _rentalHandler;
         private readonly MailboxHandler _mailboxHandler;
+        private readonly AuctionHandler _auctionHandler;
         private readonly CollectionBoxHandler _collectionBoxHandler;
         private readonly ShopCoinEventHandler _shopCoinEventHandler;
         private readonly InventoryRefreshSender _inventoryRefreshSender;
@@ -207,6 +208,7 @@ namespace DfoServer.Network
             _rentalHandler = featureHandlers.Rental;
             _mercenaryExpeditionHandler = featureHandlers.MercenaryExpedition;
             _mailboxHandler = featureHandlers.Mailbox;
+            _auctionHandler = featureHandlers.Auction;
             _collectionBoxHandler = featureHandlers.CollectionBox;
             _shopCoinEventHandler = featureHandlers.ShopCoinEvent;
             _mercenaryHandler = featureHandlers.Mercenary;
@@ -252,6 +254,7 @@ namespace DfoServer.Network
             _cmdDispatch.RegisterGroup("settings", RegisterSettingsHandlers);
             _cmdDispatch.RegisterGroup("quest", RegisterQuestHandlers);
             _cmdDispatch.RegisterGroup("mailbox", RegisterMailboxHandlers);
+            _cmdDispatch.RegisterGroup("auction", RegisterAuctionHandlers);
             _cmdDispatch.RegisterGroup("collection-box", RegisterCollectionBoxHandlers);
             _cmdDispatch.RegisterGroup("mercenary", RegisterMercenaryHandlers);
             _cmdDispatch.RegisterGroup("party-chat", RegisterPartyHandlers);
@@ -988,6 +991,20 @@ namespace DfoServer.Network
             d[0x0086] = _mailboxHandler.HandleChangeLetterStatMailbox;
             d[0x013B] = _mailboxHandler.HandleSendMultiMailbox;
             d[0x0144] = _mailboxHandler.HandleQueryCharacterInfoMailbox;
+        }
+
+        private void RegisterAuctionHandlers(GameCommandRegistry.GameCommandRegistrationGroup d)
+        {
+            d[(ushort)CmdPacketTypeA21.AUCTION_ASK_AVERAGE_PRICE] = _auctionHandler.HandleAskAveragePrice;
+            d[(ushort)CmdPacketTypeA21.AUCTION_REGIST_ITEM] = _auctionHandler.HandleRegistItem;
+            d[(ushort)CmdPacketTypeA21.AUCTION_REGIST_CANCEL] = _auctionHandler.HandleRegistCancel;
+            d[(ushort)CmdPacketTypeA21.AUCTION_BIDDING] = _auctionHandler.HandleBidding;
+            d[(ushort)CmdPacketTypeA21.AUCTION_SEARCH_BY_ITEMKEY] = _auctionHandler.HandleSearchByItemKey;
+            d[(ushort)CmdPacketTypeA21.AUCTION_SEARCH_BY_NOITEMKEY] = _auctionHandler.HandleSearchByNoItemKey;
+            d[(ushort)CmdPacketTypeA21.AUCTION_MY_REGISTED_ITEM_INFO] = _auctionHandler.HandleMyRegistedItemInfo;
+            d[(ushort)CmdPacketTypeA21.AUCTION_MY_BIDDING_INFO] = _auctionHandler.HandleMyBiddingInfo;
+            d[(ushort)CmdPacketTypeA21.AUCTION_MY_AUCTION_HISTORY] = _auctionHandler.HandleMyAuctionHistory;
+            d[(ushort)CmdPacketTypeA21.AUCTION_BUY_ITEM_APIECE] = _auctionHandler.HandleBuyItemApiece;
         }
 
         private void RegisterCollectionBoxHandlers(GameCommandRegistry.GameCommandRegistrationGroup d)

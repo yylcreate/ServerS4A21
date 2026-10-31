@@ -906,6 +906,7 @@ LIMIT 1;";
 
             var requests = new List<InventoryRewardGrantRequest>(attachments.Count);
             long addedMainWeight = 0;
+            long tokenCera = 0;
             var nowUnixSeconds = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
             foreach (var attachment in attachments)
             {
@@ -916,6 +917,15 @@ LIMIT 1;";
                     return MailboxClaimResult.Fail(MailboxSendError.ExpiredItem);
 
                 var count = Math.Max(1, attachment.ItemCount);
+                if (core.ItemId == CurrencyService.TokenCeraVoucherItemId)
+                {
+                    if (attachment.ItemTemplateId != core.ItemId || core.ItemKind != ItemCore.KindMaterial)
+                        return MailboxClaimResult.Fail(MailboxSendError.InvalidAttachment);
+                    tokenCera += count;
+                    if (tokenCera > int.MaxValue)
+                        return MailboxClaimResult.Fail(MailboxSendError.ItemCarryLimitExceeded);
+                    continue;
+                }
                 if (InventoryStackRuleService.IsStackable(core))
                 {
                     var metadata = ItemMetadataResolver.Resolve(core.ItemId);
@@ -988,6 +998,8 @@ LIMIT 1;";
                     return MailboxClaimResult.Fail(MailboxSendError.GoldCarryLimitExceeded);
                 inventoryMutated = true;
             }
+            if (tokenCera > 0 && !CurrencyService.TryGrantTokenCera(connection, transaction, characterId, (int)tokenCera))
+                return MailboxClaimResult.Fail(MailboxSendError.ItemCarryLimitExceeded);
 
             if (!InventoryPersistenceService.SaveDirtyInTransaction(connection, transaction, lease))
                 return MailboxClaimResult.Fail(MailboxSendError.ServerBusy);
@@ -1007,6 +1019,7 @@ LIMIT 1;";
                 Error = MailboxSendError.None,
                 MessageId = messageId,
                 ClaimedGold = claimsGold ? mailState.Gold : 0,
+                ClaimedTokenCera = (int)tokenCera,
                 ClaimedAttachmentCount = attachments.Count,
                 RemovedFromInbox = false,
                 UpdatedMainSlots = updatedMainSlots,
@@ -2248,6 +2261,7 @@ LIMIT 1;";
             result = new MailboxSendResult
             {
                 Success = true,
+                AlreadyExists = true,
                 Error = MailboxSendError.None,
                 MessageId = messageId,
                 FeeGold = feeGold,
