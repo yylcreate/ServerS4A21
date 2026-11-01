@@ -10,6 +10,7 @@ namespace DfoServer.Game.Dungeon
         private readonly object _syncRoot = new object();
         private TournamentDungeonRuntime _tournament;
         private BloodAltarDungeonRuntime _bloodAltar;
+        private Bio.BioDungeonRuntime _bio;
         private Events.GuardianAltar.GuardianAltarDungeonStartPlan _guardianAltar;
         private Events.GuardianAltar.GuardianAltarEnergyRuntime _guardianAltarEnergy;
         private Events.GuardianAltar.GuardianAltarCombatRuntime _guardianAltarCombat;
@@ -153,6 +154,31 @@ namespace DfoServer.Game.Dungeon
             }
         }
 
+        internal Bio.BioDungeonRuntime Bio
+        {
+            get
+            {
+                lock (_syncRoot)
+                    return _bio;
+            }
+        }
+
+        internal bool TryAttachBio(Bio.BioDungeonRuntime runtime)
+        {
+            if (runtime == null)
+                throw new ArgumentNullException(nameof(runtime));
+
+            lock (_syncRoot)
+            {
+                if (_bio == null)
+                {
+                    _bio = runtime;
+                    return true;
+                }
+                return ReferenceEquals(_bio, runtime);
+            }
+        }
+
         internal DungeonBossRouteRuntime BossRoute
         {
             get
@@ -207,16 +233,19 @@ namespace DfoServer.Game.Dungeon
         internal void OnInstanceEnding()
         {
             BloodAltarDungeonRuntime bloodAltar;
+            Bio.BioDungeonRuntime bio;
             Events.GuardianAltar.GuardianAltarEnergyRuntime guardianEnergy;
             Events.GuardianAltar.GuardianAltarCombatRuntime guardianCombat;
             lock (_syncRoot)
             {
                 bloodAltar = _bloodAltar;
+                bio = _bio;
                 guardianEnergy = _guardianAltarEnergy;
                 guardianCombat = _guardianAltarCombat;
             }
 
             bloodAltar?.Timers.CancelAll();
+            bio?.End();
             guardianEnergy?.Close();
             guardianCombat?.Close();
         }

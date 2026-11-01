@@ -134,6 +134,7 @@ namespace DfoServer
             ("--selftest-npc-favor", SelfTests.NpcFavorSystemSelfTest.Run),
             ("--selftest-random-option-value-roll", SelfTests.RandomOptionValueRollSelfTest.Run),
             ("--selftest-random-option-grade-reroll", SelfTests.RandomOptionGradeRerollSelfTest.Run),
+            ("--selftest-bio-domain", SelfTests.BioDomainSelfTest.Run),
         };
 
         // 顺序跑全部自测, 输出汇总表; 任一失败(或抛异常)退出码为 1。
