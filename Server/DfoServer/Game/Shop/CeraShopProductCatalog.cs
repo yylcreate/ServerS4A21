@@ -80,6 +80,9 @@ namespace DfoServer.Game.Shop
             ParseStandardSection(content, "creature", 9, entries);
             ParseStandardSection(content, "coin", 9, entries);
             ParseStandardSection(content, "material", 9, entries);
+            // A21 2B20B3C reads the same nine fields as [item] (2B20A14).
+            // Wedding invitation commodities are in this distinct section.
+            ParseStandardSection(content, "community item", 9, entries);
             ParseStandardSection(content, "recoveryitem", 9, entries);
             ParseStandardSection(content, "visual", 8, entries);
             ParseStandardSection(content, "package", 11, entries);

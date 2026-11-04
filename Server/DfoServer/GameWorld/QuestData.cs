@@ -355,14 +355,16 @@ namespace DfoServer.GameWorld
             int growType,
             HashSet<int> clearedQuestIds,
             Dictionary<int, int> clearedFlags,
-            ISet<int> allowedCreatureKinds)
+            ISet<int> allowedCreatureKinds,
+            bool weddingEligible = false)
             => QuestRelationIndex.ComputeAcceptableQuests(
                 characterLevel,
                 characterJob,
                 growType,
                 clearedQuestIds,
                 clearedFlags,
-                allowedCreatureKinds);
+                allowedCreatureKinds,
+                weddingEligible);
 
 
         public static List<int> GetCollisionQuests(int questId)
@@ -682,6 +684,16 @@ namespace DfoServer.GameWorld
         {
             int typeCode = MapTypeString(qst.Type);
             string typeTag = NormalizeQuestTag(qst.Type);
+
+            if (WeddingClearQuestDefinition.IsWeddingClear(qst))
+            {
+                if (!WeddingClearQuestDefinition.TryParse(qst, out var weddingTargets))
+                    throw new InvalidOperationException("Invalid wedding clear quest triples.");
+                uint weddingTrigger = 0;
+                foreach (var target in weddingTargets)
+                    weddingTrigger |= (uint)target.RequiredCount << (target.ChannelIndex * 9);
+                return weddingTrigger;
+            }
 
             if (typeTag == "raid phase clear"
                 && TryParseRaidPhaseClearTargets(qst, out var raidTargets))

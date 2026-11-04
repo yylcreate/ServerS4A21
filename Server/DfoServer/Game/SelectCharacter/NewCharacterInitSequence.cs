@@ -83,7 +83,7 @@ namespace DfoServer.Game.SelectCharacter
             Raw(0x00, 0x036A);
             // A21 consumes premium state from the cmd=1 response branch of 0x036F.
             Raw(0x01, (ushort)CmdPacketTypeA21.PREMIUM_SERVICE);
-            Raw(0x00, 0x03D8);                      
+            Raw(0x00, (ushort)NotiPacketTypeA21.COUPLE_ROOM);
             Raw(0x00, 0x025B);                      
             Raw(0x00, 0x0331);                      
             Raw(0x00, (ushort)NotiPacketTypeA21.UPGRADE_CARRY_GOLD);
@@ -106,7 +106,6 @@ namespace DfoServer.Game.SelectCharacter
             Raw(0x00, 0x0077);   // 宠物欢迎语; 无宠物或无缓存时 builder 返回 false 跳过
             // 婚姻/双人房间回放尾段
             Raw(0x00, (ushort)NotiPacketTypeA21.WEDDING_INFO);
-            Raw(0x01, (ushort)CmdPacketTypeA21.WEDDING_CHARAC);
             Raw(0x00, (ushort)NotiPacketTypeA21.DIMENSION_GATE_ENTRANCE_INFO);
             Raw(0x00, (ushort)NotiPacketTypeA21.COUPLE_ROOM, 1);
 

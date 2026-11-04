@@ -25,5 +25,8 @@ namespace DfoServer.Game.SelectCharacter
         public KnightShieldDeckSnapshot KnightShieldDeck { get; set; }
 
         public CharacterRecord CharacterRecord { get; set; }
+        internal DfoServer.Game.Wedding.WeddingState Wedding { get; set; }
+        internal CharacterRecord WeddingPartner { get; set; }
+        internal DfoServer.Game.Wedding.WeddingRoomState WeddingRoom { get; set; }
     }
 }

@@ -64,6 +64,8 @@ namespace DfoServer.Sqlite
                 new MigrationStep(39, "add_guild_dungeon_progress", ApplyGuildDungeonProgress),
                 new MigrationStep(40, "add_guild_contents", ApplyGuildContents),
                 new MigrationStep(41, "add_character_rename_history", CharacterRenameSchema.Apply),
+                new MigrationStep(42, "add_wedding_relationships", WeddingSchema.Apply),
+                new MigrationStep(43, "add_wedding_guests_and_money_gifts", WeddingGuestsMigration.Apply),
             };
 
         internal static int CurrentVersion =>

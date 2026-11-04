@@ -91,7 +91,8 @@ namespace DfoServer.Network.Builders
             Register(new SkillPointSlotBodyBuilder());                                  
             Register(new CollectionBoxBodyBuilder(collectBoxProgressRepository));
             Register(new RentalInfoBodyBuilder());                                      
-            Register(new LotteryBufferBodyBuilder(_database));                          
+            // COUPLE_ROOM is projected below from the marriage snapshot. The
+            // old lottery registration used this A21 packet identifier too.
             Register(new CubeInfoBodyBuilder());                                        
             Register(new BoosterGageBodyBuilder());
             Register(new FatigueAccelBodyBuilder());                                    
@@ -107,7 +108,6 @@ namespace DfoServer.Network.Builders
             Register(new DimensionGateEntranceInfoBodyBuilder(_database));
             Register(new StrikerSupportTagCharacterBodyBuilder(_database));
             RegisterCmd(new MercenaryInfoCmdBodyBuilder(_database));
-            RegisterCmd(new WeddingCharacCmdBodyBuilder());
         }
 
         public bool HasBuilder(ushort notiType)
@@ -118,9 +118,9 @@ namespace DfoServer.Network.Builders
 
         public bool TryBuild(ushort notiType, SelectCharacterDataSnapshot snapshot, int occurrenceIndex, out byte[] body)
         {
-            if (notiType == (ushort)NotiPacketTypeA21.COUPLE_ROOM && occurrenceIndex == 1)
+            if (notiType == (ushort)NotiPacketTypeA21.COUPLE_ROOM)
             {
-                body = CoupleRoomBodyBuilder.BuildBody();
+                body = WeddingRoomPacketBuilder.StateBody(snapshot?.WeddingRoom ?? new Game.Wedding.WeddingRoomState());
                 return true;
             }
 

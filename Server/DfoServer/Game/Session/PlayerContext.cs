@@ -187,6 +187,9 @@ namespace DfoServer.Game.Session
         {
             if (record == null) throw new ArgumentNullException(nameof(record));
 
+            ClearWeddingCeremony();
+            WeddingAreaAdmission = null;
+            WeddingRoomPairId = 0;
             CharacterId = record.CharacterId;
             Name = record.Name ?? Name;
             UserId = (ushort)record.CharacterId;

@@ -35,6 +35,9 @@
 - Dungeon、任务副本、特殊机制、塔类、Tournament、Blood Altar：`Docs/副本架构业务接入规范.md`
 - 副职业、分解、附魔、炼金、控偶：`Docs/副职业架构业务接入规范.md`
 - timer、在线恢复、周期任务：`Docs/ClockService.md`
+- 婚姻、婚房、夫妻树与胶囊：`Docs/服务端业务开发规范.md` 第 5.11 节；费用、共享爱心、家具与胶囊数量必须使用对应 CommitService 的事务，不能从协议 Handler 直写或沿用其他版本常量。
+
+婚姻相关修改使用 `--selftest-wedding-schema`、`--selftest-wedding-catalog`、`--selftest-wedding-commit`、`--selftest-wedding-handler`、`--selftest-wedding-replay`、`--selftest-wedding-scene`、`--selftest-wedding-room`、`--selftest-wedding-room-buff`、`--selftest-wedding-shop-packet`、`--selftest-wedding-capsule`、`--selftest-wedding-clear-effect`、`--selftest-wedding-quest`、`--selftest-wedding-guest-book`、`--selftest-wedding-partner-travel`、`--selftest-wedding-guest-invitation`、`--selftest-wedding-guest-protocol`、`--selftest-wedding-money-gift`、`--selftest-a21-wedding-guest-entry`、`--selftest-wedding-guest-lifecycle`；私人场景同时回归 `--selftest-upgrade-broadcast`。订婚任务子类型 22 使用实际 PVF 三元组、canonical clear 的两人订婚资格与现有 Quest receipt/activation，不得通过客户端 trigger 或婚后爱心资格替代。显式设置当前 `PVF_ARCHIVE_PATH`，按业务范围串行执行。涉及公共刷新、Inventory 或 Dungeon 结算时再跑 `--selftest-all`，记录仍待客户端实测的窗口、场景与重登行为。
 
 如果只记五件事，请记这些：
 

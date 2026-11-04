@@ -17,6 +17,7 @@ using DfoServer.Infrastructure;
 using DfoServer.Network;
 using DfoServer.Network.Builders;
 using DfoServer.Network.Handlers.Pets;
+using Microsoft.Data.Sqlite;
 
 namespace DfoServer.Game.Quests
 {
@@ -297,7 +298,18 @@ namespace DfoServer.Game.Quests
                 return;
 
             var character = _sender.Player;
-            var record = _characterRepository.GetById(characterId);
+            CharacterRecord record;
+            Dictionary<int, int> clearedFlags;
+            bool weddingEligible;
+            using (var connection = new SqliteConnection(_connectionString))
+            {
+                connection.Open();
+                using var transaction = connection.BeginTransaction(deferred: true);
+                record = SqliteCharacterRepository.LoadById(connection, transaction, characterId);
+                clearedFlags = QuestRepository.LoadClearedFlags(connection, transaction, characterId);
+                weddingEligible = WeddingQuestEligibility.Load(connection, transaction, characterId);
+                transaction.Commit();
+            }
             int level = record != null
                 ? record.Level
                 : character != null ? character.Level : 1;
@@ -317,8 +329,6 @@ namespace DfoServer.Game.Quests
                 character.GrowType = record.GrowType;
                 character.GrowupChangeCount = record.GrowupChangeCount;
             }
-            var clearedFlags = new QuestRepository(_connectionString)
-                .LoadClearedFlags(characterId);
             var allowedCreatureKinds = InventoryContext.TryGetLease(characterId, out var lease)
                 ? PetCreatureEvolutionRuntimeService
                     .LoadEligiblePetCreatureEvolutionQuestKinds(lease.Inventory)
@@ -330,7 +340,8 @@ namespace DfoServer.Game.Quests
                     job,
                     growType,
                     clearedFlags,
-                    allowedCreatureKinds));
+                    allowedCreatureKinds,
+                    weddingEligible));
         }
 
         internal async Task SendClearQuestListAsync()

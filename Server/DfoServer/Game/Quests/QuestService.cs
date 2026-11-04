@@ -613,7 +613,9 @@ namespace DfoServer.Game.Quests
             Guid sourceEventId = default,
             IReadOnlyCollection<ushort> eligibleQuestIds = null,
             IReadOnlyDictionary<ushort, QuestActivationId>
-                eligibleQuestActivations = null)
+                eligibleQuestActivations = null,
+            int difficulty = 0,
+            WeddingQuestClearEvidence weddingClear = null)
         {
             if (string.IsNullOrWhiteSpace(connectionString)
                 || characterId <= 0
@@ -633,12 +635,16 @@ namespace DfoServer.Game.Quests
                     SourceEventId = sourceEventId,
                     DungeonId = dungeonId,
                     MapId = mapId,
+                    Difficulty = difficulty,
+                    WeddingClear = weddingClear,
                     EligibleQuestIds = eligibleQuestIds,
                     EligibleQuestActivations = eligibleQuestActivations,
                 },
                 matchesClearMapQuest);
             if (!applied.Success)
             {
+                if (weddingClear != null)
+                    throw new InvalidOperationException("Authoritative clear quest persistence failed: " + applied.Error);
                 FileLogger.Log(
                     $"[QuestService] CLEAR_MAP progress failed: " +
                     $"cid={characterId} dungeon={dungeonId} map={mapId} " +
@@ -647,6 +653,13 @@ namespace DfoServer.Game.Quests
             }
             return applied.Changes.Count;
         }
+
+        internal bool SyncWeddingClearQuestProgress(int characterId, int dungeonId, int difficulty, int mapId,
+            Guid sourceEventId, IReadOnlyCollection<ushort> eligibleQuestIds,
+            IReadOnlyDictionary<ushort, QuestActivationId> eligibleQuestActivations, WeddingQuestClearEvidence evidence)
+            => SyncClearMapQuestProgressCore(_connectionString, characterId, dungeonId, mapId,
+                (questId, targetDungeonId, targetMapId) => GameWorld.QuestData.MatchesClearMapTarget(questId, targetDungeonId, targetMapId), sourceEventId, eligibleQuestIds,
+                eligibleQuestActivations, difficulty, evidence) > 0;
 
         public bool IsQuestCleared(int characterId, ushort questId)
             => _repository.IsQuestCleared(characterId, questId);

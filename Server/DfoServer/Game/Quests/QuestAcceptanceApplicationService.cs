@@ -82,6 +82,8 @@ namespace DfoServer.Game.Quests
                             var utcNow = DateTime.UtcNow;
                             if (!owner.IsCurrentInventoryOwner())
                                 return QuestAcceptResult.Fail(0x17);
+                            if (!WeddingQuestEligibility.IsAllowed(connection, transaction, characterId, questId))
+                                return QuestAcceptResult.Fail(21);
 
                             if (isDaily
                                 && DailyQuestCompletionCycle.GetCurrentCounter(

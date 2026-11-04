@@ -227,6 +227,7 @@ namespace DfoServer.Game.Dungeon
 
     internal sealed class DungeonRunSettlementData
     {
+        internal DungeonWeddingClearIdentity Wedding { get; set; }
         internal SemaphoreSlim CardProjectionGate { get; } =
             new SemaphoreSlim(1, 1);
         internal SemaphoreSlim DeathTowerProjectionGate { get; } =

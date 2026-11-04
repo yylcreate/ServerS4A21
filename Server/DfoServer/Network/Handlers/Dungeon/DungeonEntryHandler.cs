@@ -808,7 +808,7 @@ namespace DfoServer.Network.Handlers.Dungeon
                 }
                 await _svc.GrowthCapsuleSync.SendExpProgressAsync(
                     session, "enter-select-dungeon", honor: honorSummary);
-                // USER_STATE 投影之后补发婚礼回放三包。只覆盖进/出本
+                // USER_STATE 投影之后补发婚姻状态和婚房。只覆盖进/出本
                 // 触发点，不挂城镇内每次过图。
                 await InventoryRefreshSender.SendWeddingReplayRefresh(session);
                 if (!selection.TryCompletePartyProjection())

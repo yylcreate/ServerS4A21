@@ -17,7 +17,7 @@ namespace DfoServer.Network.Handlers
         private readonly object _sync = new();
         private readonly Dictionary<ushort, UpgradeBroadcastRoom> _rooms = new();
         private readonly Dictionary<Guid, UpgradeBroadcastRoom> _membership = new();
-        private readonly Dictionary<Guid, (int Character, byte Town, byte Area)> _discovery = new();
+        private readonly Dictionary<Guid, (int Character, byte Town, byte Area, long WeddingPair, WeddingCeremonyAttendance Ceremony)> _discovery = new();
         private readonly ISessionDirectory _sessions;
         private readonly CharacterTransitionCoordinator _transitions;
         private readonly InventoryRefreshSender _refresh;
@@ -47,7 +47,9 @@ namespace DfoServer.Network.Handlers
         private bool Eligible(EnhancedClientSession s) => Current(s) && s.Player.UserState == 0
             && s.Player.TownPresenceReady && !s.Player.DungeonSelectionPending && s.Player.CurrentRun == null;
         private bool SameArea(UpgradeBroadcastRoom r, EnhancedClientSession s) => Eligible(s)
-            && r.Listener == s.ListenerPort && r.Town == s.Player.CurTownId && r.Area == s.Player.CurAreaId;
+            && r.Listener == s.ListenerPort && r.Town == s.Player.CurTownId && r.Area == s.Player.CurAreaId
+            && WeddingSceneAdmission.SameCohort(r.Town, r.Area, r.WeddingRoomPairId,
+                r.WeddingCeremony?.PairId ?? 0, r.WeddingCeremony?.StartAt ?? 0, s.Player);
         private bool Live(UpgradeBroadcastRoom r)
         { lock (_sync) return !r.Closed && _rooms.TryGetValue(r.Id, out var active) && ReferenceEquals(r, active)
             && SameArea(r, r.Host) && r.Host.Player.CharacterId == r.CharacterId && r.Host.Player.UserId == r.HostUid; }
@@ -107,6 +109,8 @@ namespace DfoServer.Network.Handlers
                 do { _next++; } while (_next == 0 || _rooms.ContainsKey(_next));
                 room = new UpgradeBroadcastRoom { Id = _next, Host = host, CharacterId = host.Player.CharacterId,
                     HostUid = host.Player.UserId, Listener = host.ListenerPort, Town = host.Player.CurTownId, Area = host.Player.CurAreaId,
+                    WeddingRoomPairId = host.Player.WeddingRoomPairId,
+                    WeddingCeremony = host.Player.WeddingCeremony,
                     X = BitConverter.ToInt16(body, 0), Y = BitConverter.ToInt16(body, 2),
                     Title = ClientTextEncoding.GetBytes(ClientTextEncoding.GetString(host.Player.Name) + "的强化直播") };
                 _rooms.Add(room.Id, room); _membership[host.SessionId] = room;
@@ -286,14 +290,14 @@ namespace DfoServer.Network.Handlers
             if (host)
             {
                 foreach (var viewer in room.Viewers.ToArray())
-                    await Send(viewer, UpgradeBroadcastPacketBuilder.Left(viewer.Player.UserId), () => Current(viewer));
+                    await Send(viewer, UpgradeBroadcastPacketBuilder.Left(viewer.Player.UserId), () => SameArea(room, viewer));
                 foreach (var target in _sessions.GetAllGameSessions().Where(s => SameArea(room, s)))
                     await Send(target, UpgradeBroadcastPacketBuilder.Destroyed(room), () => SameArea(room, target));
             }
             else
             {
                 await Members(room, UpgradeBroadcastPacketBuilder.Left(session.Player.UserId));
-                await Send(session, UpgradeBroadcastPacketBuilder.Left(session.Player.UserId), () => Current(session));
+                await Send(session, UpgradeBroadcastPacketBuilder.Left(session.Player.UserId), () => SameArea(room, session));
             }
         }
 
@@ -313,7 +317,7 @@ namespace DfoServer.Network.Handlers
                 lock (_sync) _discovery.Remove(session.SessionId);
                 return;
             }
-            var key = (session.Player.CharacterId, session.Player.CurTownId, session.Player.CurAreaId);
+            var key = DiscoveryKey(session);
             byte[][] packets;
             lock (_sync)
             {
@@ -326,8 +330,12 @@ namespace DfoServer.Network.Handlers
                     .Select(r => UpgradeBroadcastPacketBuilder.Result(r, r.LastResult))).ToArray();
             }
             foreach (var packet in packets)
-                await Send(session, packet, () => Eligible(session) && key == (session.Player.CharacterId, session.Player.CurTownId, session.Player.CurAreaId));
+                await Send(session, packet, () => Eligible(session) && key == DiscoveryKey(session));
         }
+
+        private static (int, byte, byte, long, WeddingCeremonyAttendance) DiscoveryKey(EnhancedClientSession session)
+            => (session.Player.CharacterId, session.Player.CurTownId, session.Player.CurAreaId,
+                session.Player.WeddingRoomPairId, session.Player.WeddingCeremony);
 
         private Task Area(UpgradeBroadcastRoom room, byte[] packet) => Task.WhenAll(_sessions.GetAllGameSessions()
             .Where(s => SameArea(room, s)).Select(s => Send(s, packet, () => Live(room) && SameArea(room, s))));

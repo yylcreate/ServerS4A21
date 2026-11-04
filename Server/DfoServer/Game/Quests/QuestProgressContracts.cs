@@ -25,12 +25,14 @@ namespace DfoServer.Game.Quests
         internal byte? QuestionAnswerIndex { get; set; }
         internal int DungeonId { get; set; }
         internal int Difficulty { get; set; }
+        internal WeddingQuestClearEvidence WeddingClear { get; set; }
         internal int MapId { get; set; }
         internal int MonsterCode { get; set; }
         internal byte MonsterType { get; set; }
         internal int EnemyType { get; set; }
         internal int RaidPhaseIndex { get; set; }
         internal bool RepairLegacyRaidPhaseTrigger { get; set; }
+        internal bool RepairLegacyWeddingClearTrigger { get; set; }
         internal IReadOnlyCollection<ushort> EligibleQuestIds { get; set; }
         internal IReadOnlyDictionary<ushort, QuestActivationId>
             EligibleQuestActivations { get; set; }

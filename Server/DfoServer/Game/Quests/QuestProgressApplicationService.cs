@@ -207,6 +207,12 @@ namespace DfoServer.Game.Quests
                 QuestProgressEvaluation evaluation;
                 try
                 {
+                    request.RepairLegacyWeddingClearTrigger = request.Operation == QuestProgressOperation.ClearDungeon
+                        && request.WeddingClear?.Allows(request.SourceEventId, request.CharacterId) == true
+                        && GameWorld.WeddingClearQuestDefinition.CanRepairLegacyDefaultOne(
+                            GameWorld.QuestData.GetQuestFile(quest.QuestId), quest.TriggerValue)
+                        && !QuestRepository.HasProgressEventKind(connection, transaction, request.CharacterId,
+                            quest.ActivationId, request.EventKind);
                     request.RepairLegacyRaidPhaseTrigger =
                         request.Operation == QuestProgressOperation.RaidPhaseClear
                         && quest.TriggerValue == 1

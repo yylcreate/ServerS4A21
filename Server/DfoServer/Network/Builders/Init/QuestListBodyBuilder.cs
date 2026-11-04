@@ -34,7 +34,8 @@ namespace DfoServer.Network.Builders
                     ? PetCreatureEvolutionRuntimeService.LoadEligiblePetCreatureEvolutionQuestKinds(lease.Inventory)
                     : null;
 
-            body = BuildBody(level, job, growType, clearedFlags, allowedCreatureKinds);
+            body = BuildBody(level, job, growType, clearedFlags, allowedCreatureKinds,
+                WeddingQuestEligibility.FromInitializationSnapshot(snapshot));
             return true;
         }
 
@@ -48,7 +49,8 @@ namespace DfoServer.Network.Builders
             int job,
             int growType,
             Dictionary<int, int> clearedFlags,
-            ISet<int> allowedCreatureKinds)
+            ISet<int> allowedCreatureKinds,
+            bool weddingEligible = false)
         {
             var clearedSet = new HashSet<int>(clearedFlags.Keys);
             var questIds = GameWorld.QuestData.ComputeAcceptableQuests(
@@ -57,7 +59,8 @@ namespace DfoServer.Network.Builders
                 growType,
                 clearedSet,
                 clearedFlags,
-                allowedCreatureKinds);
+                allowedCreatureKinds,
+                weddingEligible);
             AppendGuardianShieldOpenQuests(
                 questIds,
                 level,

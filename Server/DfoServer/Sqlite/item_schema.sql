@@ -1670,3 +1670,147 @@ CREATE TABLE IF NOT EXISTS character_rename_history (
 );
 CREATE INDEX IF NOT EXISTS idx_character_rename_old_name
     ON character_rename_history(old_name, changed_at);
+
+CREATE TABLE IF NOT EXISTS wedding_pairs (
+    pair_id INTEGER PRIMARY KEY AUTOINCREMENT CHECK(pair_id BETWEEN 1 AND 4294967294),
+    left_character_id INTEGER NOT NULL REFERENCES characters(character_id),
+    right_character_id INTEGER NOT NULL REFERENCES characters(character_id),
+    status INTEGER NOT NULL CHECK(status BETWEEN 0 AND 4),
+    ceremony INTEGER NOT NULL DEFAULT 0 CHECK(ceremony BETWEEN 0 AND 2),
+    ring INTEGER NOT NULL DEFAULT 0 CHECK(ring BETWEEN 0 AND 5),
+    love INTEGER NOT NULL DEFAULT 0 CHECK(love >= 0),
+    married_at INTEGER NOT NULL DEFAULT 0,
+    start_at INTEGER NOT NULL DEFAULT 0,
+    channel_id INTEGER NOT NULL DEFAULT 0,
+    room INTEGER NOT NULL DEFAULT 0 CHECK(room BETWEEN 0 AND 255),
+    version INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    CHECK(left_character_id < right_character_id)
+);
+CREATE TABLE IF NOT EXISTS wedding_members (
+    character_id INTEGER PRIMARY KEY REFERENCES characters(character_id) ON DELETE CASCADE,
+    pair_id INTEGER NOT NULL REFERENCES wedding_pairs(pair_id),
+    seat INTEGER NOT NULL CHECK(seat IN (0,1)),
+    UNIQUE(pair_id, seat)
+);
+CREATE TABLE IF NOT EXISTS wedding_character_cooldowns (
+    character_id INTEGER PRIMARY KEY REFERENCES characters(character_id) ON DELETE CASCADE,
+    divorced_at INTEGER NOT NULL DEFAULT 0,
+    next_wedding_at INTEGER NOT NULL DEFAULT 0
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_wedding_reserved_room
+    ON wedding_pairs(channel_id, room) WHERE status IN (2,3);
+CREATE INDEX IF NOT EXISTS idx_wedding_pending_ceremony
+    ON wedding_pairs(status, start_at) WHERE status IN (2,3);
+CREATE TABLE IF NOT EXISTS wedding_progress_events (
+    pair_id INTEGER NOT NULL REFERENCES wedding_pairs(pair_id),
+    source_event_id TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY(pair_id, source_event_id)
+);
+
+CREATE TABLE IF NOT EXISTS wedding_rooms (
+    pair_id INTEGER PRIMARY KEY REFERENCES wedding_pairs(pair_id) ON DELETE CASCADE,
+    tree_id INTEGER NOT NULL DEFAULT 0 CHECK(tree_id>=0),
+    tree_expires INTEGER NOT NULL DEFAULT 0 CHECK(tree_expires BETWEEN 0 AND 4294967295),
+    tree_growth INTEGER NOT NULL DEFAULT 0 CHECK(tree_growth>=0),
+    water_day INTEGER NOT NULL DEFAULT 0 CHECK(water_day>=0),
+    water_count INTEGER NOT NULL DEFAULT 0 CHECK(water_count BETWEEN 0 AND 255),
+    harvest_sequence INTEGER NOT NULL DEFAULT 0 CHECK(harvest_sequence>=0),
+    version INTEGER NOT NULL DEFAULT 0 CHECK(version>=0)
+);
+CREATE TABLE IF NOT EXISTS wedding_room_items (
+    pair_id INTEGER NOT NULL REFERENCES wedding_pairs(pair_id) ON DELETE CASCADE,
+    container INTEGER NOT NULL CHECK(container IN (0,1)),
+    slot INTEGER NOT NULL CHECK((container=0 AND slot BETWEEN 0 AND 27) OR (container=1 AND slot BETWEEN 0 AND 39)),
+    item_id INTEGER NOT NULL CHECK(item_id>0),
+    count INTEGER NOT NULL CHECK((container=0 AND count=1) OR (container=1 AND count BETWEEN 1 AND 65535)),
+    PRIMARY KEY(pair_id,container,slot)
+);
+CREATE TABLE IF NOT EXISTS wedding_capsules (
+    pair_id INTEGER NOT NULL REFERENCES wedding_pairs(pair_id) ON DELETE CASCADE,
+    character_id INTEGER NOT NULL REFERENCES characters(character_id) ON DELETE CASCADE,
+    progress INTEGER NOT NULL DEFAULT 0 CHECK(progress BETWEEN 0 AND 2147483647),
+    own_count INTEGER NOT NULL DEFAULT 0 CHECK(own_count BETWEEN 0 AND 255),
+    taken_count INTEGER NOT NULL DEFAULT 0 CHECK(taken_count BETWEEN 0 AND 255),
+    PRIMARY KEY(pair_id,character_id)
+);
+CREATE TABLE IF NOT EXISTS wedding_guest_comments (
+    comment_id INTEGER PRIMARY KEY AUTOINCREMENT CHECK(comment_id BETWEEN 1 AND 4294967294),
+    pair_id INTEGER NOT NULL REFERENCES wedding_pairs(pair_id) ON DELETE CASCADE,
+    author_id INTEGER NOT NULL REFERENCES characters(character_id),
+    author_name BLOB NOT NULL CHECK(length(author_name) BETWEEN 1 AND 29),
+    created_at INTEGER NOT NULL CHECK(created_at BETWEEN 0 AND 4294967295),
+    content BLOB NOT NULL CHECK(length(content) BETWEEN 1 AND 255)
+);
+CREATE INDEX IF NOT EXISTS idx_wedding_guest_comments_pair ON wedding_guest_comments(pair_id,comment_id);
+
+CREATE TABLE IF NOT EXISTS wedding_guest_invitations (
+    pair_id INTEGER NOT NULL REFERENCES wedding_pairs(pair_id),
+    ceremony_start_at INTEGER NOT NULL CHECK(ceremony_start_at BETWEEN 1 AND 4294967295),
+    guest_character_id INTEGER NOT NULL REFERENCES characters(character_id),
+    inviter_character_id INTEGER NOT NULL REFERENCES characters(character_id),
+    created_at INTEGER NOT NULL CHECK(created_at BETWEEN 0 AND 4294967295),
+    CHECK(guest_character_id<>inviter_character_id),
+    PRIMARY KEY(pair_id,ceremony_start_at,guest_character_id)
+);
+CREATE INDEX IF NOT EXISTS idx_wedding_guest_invitations_host
+    ON wedding_guest_invitations(pair_id,ceremony_start_at,inviter_character_id,guest_character_id);
+CREATE INDEX IF NOT EXISTS idx_wedding_guest_invitations_guest
+    ON wedding_guest_invitations(guest_character_id,pair_id,ceremony_start_at);
+
+CREATE TABLE IF NOT EXISTS wedding_money_gifts (
+    pair_id INTEGER NOT NULL REFERENCES wedding_pairs(pair_id),
+    ceremony_start_at INTEGER NOT NULL CHECK(ceremony_start_at>0),
+    guest_character_id INTEGER NOT NULL REFERENCES characters(character_id),
+    left_character_id INTEGER NOT NULL REFERENCES characters(character_id),
+    right_character_id INTEGER NOT NULL REFERENCES characters(character_id),
+    ceremony INTEGER NOT NULL CHECK(ceremony BETWEEN 0 AND 2),
+    amount INTEGER NOT NULL CHECK(amount BETWEEN 1 AND 2147483647),
+    charge_percent INTEGER NOT NULL CHECK(charge_percent BETWEEN 0 AND 100),
+    charge_gold INTEGER NOT NULL CHECK(charge_gold>=0),
+    net_gold INTEGER NOT NULL CHECK(net_gold>=0),
+    blessing BLOB NOT NULL CHECK(length(blessing)<=20),
+    created_at INTEGER NOT NULL,
+    state INTEGER NOT NULL DEFAULT 0 CHECK(state BETWEEN 0 AND 2),
+    completed_at INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(pair_id,ceremony_start_at,guest_character_id),
+    CHECK(left_character_id<right_character_id),
+    CHECK(guest_character_id<>left_character_id AND guest_character_id<>right_character_id),
+    CHECK(charge_gold+net_gold=amount)
+);
+CREATE INDEX IF NOT EXISTS idx_wedding_money_gifts_pending_guest ON wedding_money_gifts(guest_character_id) WHERE state=0;
+CREATE TABLE IF NOT EXISTS wedding_money_gift_items (
+    pair_id INTEGER NOT NULL,
+    ceremony_start_at INTEGER NOT NULL,
+    guest_character_id INTEGER NOT NULL,
+    ordinal INTEGER NOT NULL CHECK(ordinal>=0),
+    item_id INTEGER NOT NULL CHECK(item_id>0),
+    item_count INTEGER NOT NULL CHECK(item_count>0),
+    PRIMARY KEY(pair_id,ceremony_start_at,guest_character_id,ordinal),
+    FOREIGN KEY(pair_id,ceremony_start_at,guest_character_id)
+      REFERENCES wedding_money_gifts(pair_id,ceremony_start_at,guest_character_id)
+);
+
+CREATE TABLE IF NOT EXISTS wedding_reservation_receipts (
+    pair_id INTEGER NOT NULL REFERENCES wedding_pairs(pair_id),
+    ceremony_start_at INTEGER NOT NULL CHECK(ceremony_start_at > 0),
+    payer_character_id INTEGER NOT NULL REFERENCES characters(character_id),
+    gold INTEGER NOT NULL CHECK(gold >= 0),
+    ticket_item_id INTEGER NOT NULL CHECK(ticket_item_id >= 0),
+    ticket_count INTEGER NOT NULL CHECK(ticket_count >= 0),
+    refunded INTEGER NOT NULL DEFAULT 0 CHECK(refunded IN (0,1)),
+    PRIMARY KEY(pair_id,ceremony_start_at)
+);
+
+CREATE TABLE IF NOT EXISTS wedding_ceremony_comments (
+    comment_id INTEGER PRIMARY KEY AUTOINCREMENT CHECK(comment_id BETWEEN 1 AND 4294967294),
+    pair_id INTEGER NOT NULL REFERENCES wedding_pairs(pair_id),
+    ceremony_start_at INTEGER NOT NULL CHECK(ceremony_start_at > 0),
+    author_id INTEGER NOT NULL REFERENCES characters(character_id),
+    author_name BLOB NOT NULL CHECK(length(author_name) BETWEEN 1 AND 29),
+    created_at INTEGER NOT NULL CHECK(created_at BETWEEN 0 AND 4294967295),
+    content BLOB NOT NULL CHECK(length(content) BETWEEN 1 AND 255)
+);
+CREATE INDEX IF NOT EXISTS idx_wedding_ceremony_comments_event
+ON wedding_ceremony_comments(pair_id,ceremony_start_at,comment_id);

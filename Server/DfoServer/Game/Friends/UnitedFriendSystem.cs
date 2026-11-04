@@ -816,7 +816,11 @@ namespace DfoServer.Game.Friends
                 }
 
                 w.WriteByte(0);                    // 黑名单位，普通好友为 0
-                w.WriteInt32(0);                   // Z=0
+                // 1A2C742..74D stores this field in friendrow+38; the
+                // wedding invitation list copies it to row+2C for CID matching.
+                w.WriteInt32(onlineByName.TryGetValue(name, out var identified)
+                    ? identified.Player.CharacterId
+                    : offlineRecords.TryGetValue(name, out var stored) ? stored.CharacterId : 0);
             }
             return w.ToArray();
         }

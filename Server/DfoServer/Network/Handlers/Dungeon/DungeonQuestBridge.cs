@@ -77,6 +77,10 @@ namespace DfoServer.Network.Handlers.Dungeon
 
                 case DungeonQuestProgressKind.ClearMap:
                 case DungeonQuestProgressKind.ClearDungeon:
+                    if (progressEvent.Kind == DungeonQuestProgressKind.ClearDungeon && progressEvent.WeddingClear != null)
+                        return questManager.SyncWeddingClearQuestProgressAsync(progressEvent.DungeonId, progressEvent.Difficulty,
+                            progressEvent.MapId, progressEvent.SourceEventId, eligibleQuestIds,
+                            eligibleQuestActivations, progressEvent.WeddingClear);
                     return questManager.SyncClearMapQuestProgressAsync(
                         progressEvent.DungeonId,
                         progressEvent.MapId,

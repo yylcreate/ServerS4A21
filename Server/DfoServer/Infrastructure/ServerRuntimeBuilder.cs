@@ -693,6 +693,9 @@ namespace DfoServer.Infrastructure
             var guildRepository = new DfoServer.Game.Guilds.GuildRepository(core.Database);
             var guildPublisher = new GuildStatePublisher(guildRepository, world.CharacterTransitions, world.Sessions, inventoryRefresh);
             chat.ConfigureGuilds(guildRepository, world.CharacterTransitions);
+            var wedding = new WeddingHandler(world.Sessions, world.CharacterTransitions, core.Database,
+                core.CharacterRepository, inventoryRefresh, townDungeon.Town);
+            wedding.ConfigureGuestFriendLookup(DfoServer.Game.Friends.UnitedFriendSystem.IsFriend);
 
             return new GameProtocolSocialHandlers(
                 party,
@@ -715,7 +718,8 @@ namespace DfoServer.Infrastructure
                 new GuildManagementHandler(guildRepository, world.CharacterTransitions, guildPublisher),
                 new GuildFacilityHandler(guildRepository, world.CharacterTransitions, guildPublisher, inventoryRefresh),
                 new GuildInviteHandler(guildRepository, world.CharacterTransitions, world.Sessions, guildPublisher),
-                new ItemTradeHandler(world.Sessions, world.CharacterTransitions, core.Database));
+                new ItemTradeHandler(world.Sessions, world.CharacterTransitions, core.Database),
+                wedding);
         }
 
         internal GameProtocolFeatureHandlers GetOrCreateGameProtocolFeatureHandlers(

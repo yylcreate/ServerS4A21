@@ -5,6 +5,7 @@ namespace DfoServer.Network
 {
     public static class GamePacketEnvelopeBuilder
     {
+        public const int HeaderSize = 15;
         public static byte[] Build(byte command, ushort type, byte[] body)
         {
             var buffer = new List<byte>();
@@ -13,7 +14,7 @@ namespace DfoServer.Network
             buffer.Add(command);
             buffer.AddRange(BitConverter.GetBytes(type));
             // Server-to-client A21 packets use the 15-byte inbound envelope.
-            buffer.AddRange(BitConverter.GetBytes(bodySize + 15));
+            buffer.AddRange(BitConverter.GetBytes(bodySize + HeaderSize));
             buffer.AddRange(new byte[4]);
             buffer.AddRange(new byte[4]);
 

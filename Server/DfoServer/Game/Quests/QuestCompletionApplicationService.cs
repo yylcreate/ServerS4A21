@@ -253,6 +253,8 @@ namespace DfoServer.Game.Quests
                             var utcNow = DateTime.UtcNow;
                             if (!owner.IsCurrentInventoryOwner())
                                 return QuestFinishResult.Fail(22);
+                            if (!WeddingQuestEligibility.IsAllowed(connection, transaction, characterId, questId))
+                                return QuestFinishResult.Fail(22);
 
                             ActiveQuest transactionQuest = null;
                             var transactionClearedFlagValue = clearedFlagValue;
