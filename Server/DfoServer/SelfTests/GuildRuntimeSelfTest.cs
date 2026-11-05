@@ -21,6 +21,30 @@ namespace DfoServer.SelfTests
     {
         internal static async Task RunAsync(IGameDatabase database, Action<string, bool> check)
         {
+            // 本用例用 listener 端口 10010/10011 区分两名在线成员(201/202)的频道。
+            // GameNetworkConfig 的频道目录是进程级静态状态, 其它自测会临时改成自定义目录
+            // 或置 null(--selftest-all 串行执行时本篇顺序靠后), 于是同一端口在不同轮次
+            // 可能解析出不同频道, 使 all-member 快照与期望字节不一致而偶发失败。
+            // 这里显式固定本用例需要的映射, 结束后恢复到未加载目录的基线状态。
+            GameNetworkConfig.ConfigureChannelCatalog(new[]
+            {
+                new GameChannelEndpoint(10, 10010, 10010),
+                new GameChannelEndpoint(11, 10011, 10011),
+            });
+            try
+            {
+                await RunScenarioAsync(database, check);
+            }
+            finally
+            {
+                GameNetworkConfig.ConfigureChannelCatalog(null);
+            }
+        }
+
+        private static async Task RunScenarioAsync(
+            IGameDatabase database,
+            Action<string, bool> check)
+        {
             database.Write((c,t) =>
             {
                 using var cmd=c.CreateCommand(); cmd.Transaction=t;
@@ -48,13 +72,23 @@ namespace DfoServer.SelfTests
             var handler=new GuildManagementHandler(repository,transitions,publisher);
             var invites=new GuildInviteHandler(repository,transitions,sessions,publisher);
             var members=new GuildMemberHandler(repository,transitions,sessions);
+            // offline 成员的 OfflineSeconds 由 SQL 的 unixepoch('now') 实时算出,
+            // 因此「发包前读一次 roster 算期望」和「生产端发包时再读一次」若跨过
+            // 整秒边界就会差 1, 导致整包比较偶发不等。用请求前后各读一次构成区间,
+            // 命中任一即可; 其余每个字节仍逐字节精确比较。
+            var rosterBefore=repository.GetRosterForMember(201);
             await members.Handle(leader.Session,new GamePacketHeader{type=(ushort)CmdPacketTypeA21.GUILD_ALL_MEMBER_LIST},new byte[4]);
             var allMemberPackets=leader.Drain();
-            var expectedAll=GuildMemberPacketBuilder.Build(repository.GetRosterForMember(201), id =>
+            var rosterAfter=repository.GetRosterForMember(201);
+            byte[] BuildExpected(GuildRoster r)=>GuildMemberPacketBuilder.Build(r, id =>
                 id!=204 && GameNetworkConfig.TryResolveGameChannel(id==201 ? 10010 : 10011, out var channel)
                     ? checked((byte)channel.ChannelId) : null, allMembers:true);
+            var expectedAll=BuildExpected(rosterAfter);
+            var expectedBefore=BuildExpected(rosterBefore);
             check("all-member request returns complete snapshot with its own opcode and trailer",
-                allMemberPackets.Count==2 && allMemberPackets[1].SequenceEqual(expectedAll)
+                allMemberPackets.Count==2
+                && (allMemberPackets[1].SequenceEqual(expectedAll)
+                    || allMemberPackets[1].SequenceEqual(expectedBefore))
                 && BitConverter.ToUInt32(allMemberPackets[1],allMemberPackets[1].Length-4)==0
                 && allMemberPackets[0].SequenceEqual(GuildJoinPacketBuilder.Rank((byte)1)));
             await members.Handle(leader.Session,new GamePacketHeader{type=(ushort)CmdPacketTypeA21.GUILD_ALL_MEMBER_LIST},BitConverter.GetBytes(1));
@@ -189,12 +223,19 @@ namespace DfoServer.SelfTests
             check("unimplemented guild services return failure without charge",repoBalance()==300
                 && replacement.Drain().Any(p=>p[0]==1 && p[15]==0) && member.Drain().Count==0);
             int repoBalance()=>repository.GetRosterForMember(201).Guild.Contribution;
+            // GuildStatePublisher 在 Refresh 时按当时的 expires_at 注册到期 timer,
+            // 因此必须先写过期点再 Refresh。过期点取「当前 +2 秒」而不是 +1 秒:
+            // 随后的 Refresh + 三次 Drain 在高负载下可能耗时接近 1 秒, 若取 +1 秒,
+            // 内容会在自己的 Drain 之前就过期, DEL_BUFF 被那次 Drain 提前吞掉。
+            var expiry=DateTimeOffset.UtcNow.ToUnixTimeSeconds()+2;
             database.Write((c,t)=>{using var cmd=c.CreateCommand();cmd.Transaction=t;
                 cmd.CommandText="UPDATE guild_contents SET expires_at=@expiry WHERE guild_id=@guild;";
-                cmd.Parameters.AddWithValue("@expiry",DateTimeOffset.UtcNow.ToUnixTimeSeconds()+1);
+                cmd.Parameters.AddWithValue("@expiry",expiry);
                 cmd.Parameters.AddWithValue("@guild",guild.Id);cmd.ExecuteNonQuery();});
             await publisher.RefreshAsync(new[]{201,202}); replacement.Drain(); member.Drain(); leader.Drain();
-            await Task.Delay(1500);
+            var waitUntil=DateTimeOffset.FromUnixTimeSeconds(expiry+1);
+            var remaining=waitUntil-DateTimeOffset.UtcNow;
+            if (remaining>TimeSpan.Zero) await Task.Delay(remaining);
             ClockService.Instance.CheckOnce(DateTime.UtcNow);
             await Task.Delay(100);
             var expiredPackets=member.Drain();
