@@ -5,6 +5,7 @@ using DfoServer.Game.Characters;
 using DfoServer.Game.Inventory;
 using DfoServer.Game.SelectCharacter;
 using DfoServer.Game.Session;
+using DfoServer.Game.Wedding;
 using DfoServer.Infrastructure;
 using DfoServer.Network.Builders;
 using System;
@@ -12,6 +13,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
+using System.Threading;
 
 namespace DfoServer.Network.Handlers
 {
@@ -25,6 +27,10 @@ namespace DfoServer.Network.Handlers
         private readonly SqliteSubtype0FieldsRepository _subtype0Repository;
         private readonly IGameDatabase _database;
         private ISessionDirectory _sessions;
+        private Func<EnhancedClientSession, EnhancedClientSession, CancellationToken, Task> _weddingActorProjection;
+
+        internal void BindWeddingActorProjection(Func<EnhancedClientSession, EnhancedClientSession, CancellationToken, Task> sender)
+            => _weddingActorProjection = sender ?? throw new ArgumentNullException(nameof(sender));
 
         public InventoryRefreshSender(
             SqliteSelectCharacterDataSource dataSource,
@@ -52,6 +58,8 @@ namespace DfoServer.Network.Handlers
             var packet = GamePacketEnvelopeBuilder.Build(0x00, 0x0002, noti2Body);
             FileLogger.Log($"[{ProtocolName}] NOTI 2 appearance update: {session.Player.AppearanceEntries.Length} entries, body={noti2Body.Length}B");
             await session.SendPacketAsync(packet);
+            if (_weddingActorProjection != null)
+                await _weddingActorProjection(session, session, CancellationToken.None);
             if (_sessions == null
                 || session?.Player == null
                 || session.Player.CharacterId <= 0
@@ -66,6 +74,10 @@ namespace DfoServer.Network.Handlers
                 session.Player.CharacterId,
                 packet,
                 session.ListenerPort);
+            if (_weddingActorProjection != null)
+                foreach (var recipient in _sessions.GetSessionsInArea(session.Player.CurTownId, session.Player.CurAreaId,
+                    session.Player.CharacterId, session.ListenerPort))
+                    await _weddingActorProjection(session, recipient, CancellationToken.None);
         }
 
         public async Task SendUserInfoSubtype1Refresh(
@@ -145,29 +157,36 @@ namespace DfoServer.Network.Handlers
             return _honorLevel.SendInfoAsync(session, ProtocolName, reason);
         }
 
-        // 婚礼回放三包（WEDDING_INFO -> WEDDING_CHARAC -> COUPLE_ROOM），
-        // 包体与选角序列末尾（NewCharacterInitSequence）一致，COUPLE_ROOM 用 occurrence 1 的包体。
+        // 婚姻状态与婚房回放。WEDDING_INFO 的原生 reader 会主动查询配偶，
+        // WEDDING_CHARAC 仅由该实际查询回复，不能在此重复创建配偶预览。
+        // COUPLE_ROOM 用选角序列 occurrence 1 的包体。
         // 注意 COUPLE_ROOM 不可省略：实机验证左下角图标由 WEDDING_INFO 驱动，
-        // 但面板结婚属性是客户端按 COUPLE_ROOM 的婚家家具列表计算的，只发前两个会导致图标在、属性丢。
+        // 但面板结婚属性是客户端按 COUPLE_ROOM 的婚家家具列表计算的，只发婚姻状态会导致图标在、属性丢。
         // 代价是客户端收到 COUPLE_ROOM 会重建结婚房间界面，动画从头重播一次（纯视觉，无实际影响）。
         // 静态入口：换宠物、进本、回城等没有 InventoryRefreshSender 实例的路径也可直接调用。
         internal static async Task SendWeddingReplayRefresh(EnhancedClientSession session)
         {
-            if (session == null)
+            int cid = session?.Player?.CharacterId ?? 0;
+            if (cid <= 0 || !InventoryContext.TryGetOwnedLease(session.SessionId, cid, out var lease))
                 return;
-
-            await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(
-                0x00,
-                (ushort)NotiPacketTypeA21.WEDDING_INFO,
-                WeddingInfoBodyBuilder.BuildBody()));
-            await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(
-                0x01,
-                (ushort)CmdPacketTypeA21.WEDDING_CHARAC,
-                WeddingCharacCmdBodyBuilder.BuildBody()));
-            await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(
-                0x00,
-                (ushort)NotiPacketTypeA21.COUPLE_ROOM,
-                CoupleRoomBodyBuilder.BuildBody()));
+            var database = lease.Inventory.Database;
+            if (database == null) return;
+            try
+            {
+                var snapshot = WeddingReplaySnapshot.Load(database, cid, DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+                var packets = new[] { WeddingPacketBuilder.State(snapshot.Wedding),
+                    WeddingRoomPacketBuilder.State(snapshot.Room) };
+                await session.TrySendPacketBatchAsync(packets, packets.SelectMany(x => x).ToArray(), default,
+                    () => session.Player.CharacterId == cid
+                        && InventoryContext.TryGetOwnedLease(session.SessionId, cid, out var current) && ReferenceEquals(current, lease)
+                        && snapshot.MatchesCurrent(database, cid, DateTimeOffset.UtcNow.ToUnixTimeSeconds()));
+            }
+            catch (Exception ex)
+            {
+                // The refresh is a projection after another gameplay operation.
+                // A failed read/transport must not roll back that accepted move.
+                FileLogger.Log($"[Wedding] replay refresh deferred cid={cid}: {ex}");
+            }
         }
 
         public async Task SendItemListRefresh(EnhancedClientSession session, params InventoryListType[] listTypes)

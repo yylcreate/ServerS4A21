@@ -22,7 +22,7 @@ using DungeonData = DfoServer.GameWorld.Dungeon;
 
 namespace DfoServer.Network.Handlers.Dungeon
 {
-    internal sealed class DungeonSettlementHandler
+    internal sealed partial class DungeonSettlementHandler
     {
         private readonly DungeonSharedServices _svc;
         private readonly DungeonEntryHandler _entry;
@@ -2418,6 +2418,10 @@ namespace DfoServer.Network.Handlers.Dungeon
                 roster,
                 out _);
 
+            // Freeze once before either recipient can return, cancel the
+            // engagement or finish its own quest during participant fanout.
+            FreezeWeddingQuestClear(run, clearFact);
+
             if (factCreated)
                 await CullRemainingBlockingActorsOnClearAsync(session, run, clearFact);
 
@@ -2519,6 +2523,10 @@ namespace DfoServer.Network.Handlers.Dungeon
                 return false;
             }
 
+            // Also retries a failed eligibility read before a deferred/recovered
+            // canonical clear starts any participant effects.
+            FreezeWeddingQuestClear(run, clearFact);
+
             if (!run.Instance.ParticipantEffects.TryBegin(
                     clearFact.SourceEventId,
                     DungeonParticipantEffectAudience.Instance,
@@ -2578,6 +2586,13 @@ namespace DfoServer.Network.Handlers.Dungeon
 
                 if (clearFact.BossCode != 0)
                     run.BossCode = clearFact.BossCode;
+
+                if (!await ApplyWeddingClearProgressAsync(session, run, identity, clearFact))
+                {
+                    run.Effects.TryFail(clearReservation);
+                    run.Instance.ParticipantEffects.TryFail(participantReservation);
+                    return false;
+                }
 
                 var standardPresentation = clearFact.PresentationKind
                     == DungeonClearPresentationKind.Standard;

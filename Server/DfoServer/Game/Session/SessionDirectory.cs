@@ -17,6 +17,21 @@ namespace DfoServer.Game.Session
 
         private readonly ConcurrentDictionary<int, EnhancedClientSession> _byCharacterId = new ConcurrentDictionary<int, EnhancedClientSession>();
         private readonly Func<byte, byte, bool> _isShareableTownArea;
+        private Func<PlayerContext, PlayerContext, bool> _townCohort = (_, _) => true;
+        private Func<PlayerContext, Func<PlayerContext, bool>> _captureTownCohort;
+        private sealed class EndingPresence
+        {
+            internal PlayerContext Player;
+            internal volatile bool Active = true;
+        }
+        private readonly AsyncLocal<EndingPresence> _endingPlayer = new();
+
+        internal void ConfigureTownCohort(Func<PlayerContext, PlayerContext, bool> sameCohort,
+            Func<PlayerContext, Func<PlayerContext, bool>> captureCohort = null)
+        {
+            _townCohort = sameCohort ?? throw new ArgumentNullException(nameof(sameCohort));
+            _captureTownCohort = captureCohort;
+        }
 
         public SessionDirectory()
             : this(IsShareableTownArea)
@@ -132,26 +147,30 @@ namespace DfoServer.Game.Session
             int characterId,
             EnhancedClientSession endingSession)
         {
-            var handler = SessionEnding;
-            if (handler != null)
+            var previousEnding = _endingPlayer.Value;
+            var ending = new EndingPresence { Player = endingSession.Player };
+            _endingPlayer.Value = ending;
+            try
             {
-                // Isolate subscribers so one cleanup failure cannot prevent the
-                // remaining lifecycle callbacks from running.
-                foreach (var d in handler.GetInvocationList())
+                var handler = SessionEnding;
+                if (handler != null)
                 {
-                    try
+                    // Isolate subscribers so one cleanup failure cannot prevent
+                    // the remaining lifecycle callbacks from running.
+                    foreach (var d in handler.GetInvocationList())
                     {
-                        await ((Func<int, EnhancedClientSession, Task>)d)(
-                            characterId, endingSession);
-                    }
-                    catch (Exception ex)
-                    {
-                        FileLogger.Log(
-                            $"[SessionDirectory] SessionEnding subscriber failed " +
-                            $"for characterId={characterId}: {ex}");
+                        try
+                        {
+                            await ((Func<int, EnhancedClientSession, Task>)d)(characterId, endingSession);
+                        }
+                        catch (Exception ex)
+                        {
+                            FileLogger.Log($"[SessionDirectory] SessionEnding subscriber failed for characterId={characterId}: {ex}");
+                        }
                     }
                 }
             }
+            finally { ending.Active = false; _endingPlayer.Value = previousEnding; }
         }
 
         public bool TryGet(int characterId, out EnhancedClientSession session)
@@ -195,6 +214,16 @@ namespace DfoServer.Game.Session
             int excludeCharacterId,
             int listenerPort = 0)
         {
+            _byCharacterId.TryGetValue(excludeCharacterId, out var source);
+            var ending = _endingPlayer.Value;
+            var sourcePlayer = ending is { Active: true } && ending.Player.CharacterId == excludeCharacterId
+                ? ending.Player : source?.Player;
+            return GetSessionsInAreaFor(sourcePlayer, townId, areaId, excludeCharacterId, listenerPort);
+        }
+
+        public IReadOnlyList<EnhancedClientSession> GetSessionsInAreaFor(
+            PlayerContext source, byte townId, byte areaId, int excludeCharacterId, int listenerPort = 0)
+        {
             // The Cera room is private per character. Connections may share
             // the same town/area ids without occupying one shared room.
             if (!_isShareableTownArea(townId, areaId))
@@ -214,6 +243,7 @@ namespace DfoServer.Game.Session
                 }
                 if (!IsTownPresence(player)) continue;
                 if (player.CurTownId != townId || player.CurAreaId != areaId) continue;
+                if (!_townCohort(source, player)) continue;
                 if (session.TcpClient == null || !session.TcpClient.Connected) continue;
                 result.Add(session);
             }
@@ -227,18 +257,37 @@ namespace DfoServer.Game.Session
             byte[] packet,
             int listenerPort = 0)
         {
-            var targets = GetSessionsInArea(
-                townId,
-                areaId,
-                excludeCharacterId,
-                listenerPort);
+            _byCharacterId.TryGetValue(excludeCharacterId, out var source);
+            var ending = _endingPlayer.Value;
+            var sourcePlayer = ending is { Active: true } && ending.Player.CharacterId == excludeCharacterId
+                ? ending.Player : source?.Player;
+            await BroadcastToAreaForAsync(sourcePlayer, townId, areaId, excludeCharacterId, packet, listenerPort);
+        }
+
+        public Task BroadcastToAreaForAsync(PlayerContext source, byte townId, byte areaId,
+            int excludeCharacterId, byte[] packet, int listenerPort = 0)
+        {
+            var cohort = _captureTownCohort?.Invoke(source) ?? (candidate => _townCohort(source, candidate));
+            return SendAreaTargetsAsync(GetSessionsInAreaFor(source, townId, areaId, excludeCharacterId, listenerPort),
+                packet, townId, areaId, listenerPort, cohort);
+        }
+
+        private async Task SendAreaTargetsAsync(IReadOnlyList<EnhancedClientSession> targets, byte[] packet,
+            byte town, byte area, int listenerPort, Func<PlayerContext, bool> cohort)
+        {
             if (targets.Count == 0) return;
             var tasks = new List<Task>(targets.Count);
             foreach (var session in targets)
             {
+                int characterId = session.Player.CharacterId;
+                ushort userId = session.Player.UserId;
                 tasks.Add(TrySendBestEffortAsync(
                     cancellationToken =>
-                        session.SendPacketAsync(packet, cancellationToken),
+                        session.TrySendPacketAsync(packet, cancellationToken, () =>
+                            session.Player.CharacterId == characterId && session.Player.UserId == userId
+                            && _byCharacterId.TryGetValue(characterId, out var current) && ReferenceEquals(current, session)
+                            && IsTownPresence(session.Player) && session.Player.CurTownId == town && session.Player.CurAreaId == area
+                            && (listenerPort <= 0 || session.ListenerPort == listenerPort) && cohort(session.Player)),
                     $"characterId={session.Player?.CharacterId ?? 0}"));
             }
             await Task.WhenAll(tasks);

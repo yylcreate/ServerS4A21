@@ -993,6 +993,8 @@ WHERE character_id = @cid AND delete_flag = 0;";
         {
             if (context.CompletedThisTicket.Contains(questId))
                 return;
+            if (!WeddingQuestEligibility.IsAllowed(connection, transaction, characterId, questId))
+                throw new InvalidOperationException("Wedding quest completion no longer has an active engagement.");
 
             QuestRepository.DeleteActiveQuestsByQuestId(
                 connection,
@@ -1019,6 +1021,8 @@ WHERE character_id = @cid AND delete_flag = 0;";
         {
             if (context.CompletedThisTicket.Contains(questId))
                 return;
+            if (!WeddingQuestEligibility.IsAllowed(connection, transaction, characterId, questId))
+                throw new InvalidOperationException("Wedding quest completion no longer has an active engagement.");
 
             if (!QuestData.TryResolveCompletionDefinition(
                     questId,
@@ -1204,16 +1208,19 @@ WHERE character_id = @cid AND delete_flag = 0;";
                 PetCreatureEvolutionRuntimeService
                     .LoadEligiblePetCreatureEvolutionQuestKinds(
                         context.Inventory);
+            bool weddingEligible = WeddingQuestEligibility.Load(connection, transaction, characterId);
             var acceptable = QuestData.ComputeAcceptableQuests(
                 context.Character.Level,
                 context.Character.Job,
                 context.Character.GrowType,
                 clearedQuestIds,
                 clearedFlags,
-                allowedCreatureKinds);
+                allowedCreatureKinds,
+                weddingEligible);
 
             return new VisibleQuestSet(
-                active.Select(quest => quest.QuestId).ToList(),
+                active.Where(quest => weddingEligible || !WeddingQuestEligibility.IsWeddingQuest(quest.QuestId))
+                    .Select(quest => quest.QuestId).ToList(),
                 acceptable);
         }
 

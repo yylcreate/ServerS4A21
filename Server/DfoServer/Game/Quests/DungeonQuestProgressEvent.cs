@@ -44,6 +44,11 @@ namespace DfoServer.Game.Quests
         public int MonsterCode => ActorCode;
         public byte MonsterType { get; }
         public int EnemyType { get; }
+        internal WeddingQuestClearEvidence WeddingClear { get; private init; }
+
+        internal DungeonQuestProgressEvent WithWeddingClear(WeddingQuestClearEvidence evidence, int difficulty)
+            => new DungeonQuestProgressEvent(Envelope, Kind, DungeonId, difficulty, MapId, ActorCode, MonsterType, EnemyType)
+            { WeddingClear = evidence };
 
         public static DungeonQuestProgressEvent HuntMonster(
             DungeonEventEnvelope envelope,

@@ -1,5 +1,6 @@
 using System.Collections.Generic;
 using DfoServer.Game.Inventory;
+using DfoServer.Game.Session;
 using DfoServer.Network;
 
 namespace DfoServer.Game.ItemUpgrade
@@ -13,6 +14,8 @@ namespace DfoServer.Game.ItemUpgrade
         internal ushort HostUid;
         internal int Listener;
         internal byte Town, Area;
+        internal long WeddingRoomPairId;
+        internal WeddingCeremonyAttendance WeddingCeremony;
         internal short X, Y;
         internal byte[] Title;
         internal readonly HashSet<EnhancedClientSession> Viewers = new();

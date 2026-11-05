@@ -72,6 +72,10 @@ namespace DfoServer.Network
                 : 1;
             if (townId == RaidTownId || townId == PvpTownId)
                 townId = NormalTownFallbackId;
+            // A private wedding home has no Seria gate. Older saved positions
+            // must return through the church town resolved from this PVF.
+            if (townId == WeddingSceneCatalog.NativeCoupleTown)
+                townId = WeddingSceneCatalog.Get().CeremonyRooms[0].Town;
             var gate = Town.GetCeraRoomInfo(townId);
             if (gate.Town <= 0)
                 throw new InvalidOperationException(
@@ -166,6 +170,7 @@ namespace DfoServer.Network
             // 公会营地(town 8)是赛丽亚右门进入的据点城镇，不持久化位置：
             // 落库应保持进入营地前所在城镇，重登才能回到该城镇的赛丽亚房间。
             return townId != GuildAgitTownId
+                   && townId != WeddingSceneCatalog.NativeCoupleTown
                    && !GameNetworkConfig.IsPvpListener(listenerGamePort)
                    && !GameNetworkConfig.IsChannel100Listener(listenerGamePort)
                    && !GameNetworkConfig.IsRaidListener(listenerGamePort);

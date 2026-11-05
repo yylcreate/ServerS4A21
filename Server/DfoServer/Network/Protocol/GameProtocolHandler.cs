@@ -214,6 +214,14 @@ namespace DfoServer.Network
             _rentalHandler = featureHandlers.Rental;
             _mercenaryExpeditionHandler = featureHandlers.MercenaryExpedition;
             _mailboxHandler = featureHandlers.Mailbox;
+            socialHandlers.Wedding.ConfigureMailNotifier(cid => SessionDirectory.TrySendBestEffortAsync(
+                ct => _mailboxHandler.NotifyCommittedSystemMailAsync(cid, ct), "wedding-mail-alarm"));
+            var weddingAdmission = new WeddingSceneAdmission(database, sessionDirectory);
+            _townHandler.ConfigureWeddingAreaAdmission(weddingAdmission.CanEnter, socialHandlers.Wedding.SendActorStateAsync,
+                weddingAdmission.CaptureEntryCommit);
+            _inventoryRefreshSender.BindWeddingActorProjection(socialHandlers.Wedding.SendActorStateAsync);
+            if (sessionDirectory is SessionDirectory directory)
+                directory.ConfigureTownCohort(WeddingSceneAdmission.SameCohort, WeddingSceneAdmission.CaptureCohort);
             _collectionBoxHandler = featureHandlers.CollectionBox;
             _shopCoinEventHandler = featureHandlers.ShopCoinEvent;
             _mercenaryHandler = featureHandlers.Mercenary;
@@ -240,6 +248,7 @@ namespace DfoServer.Network
             _cmdDispatch = new GameCommandRegistry();
             _cmdDispatch.RegisterGroup("login", RegisterLoginHandlers);
             _cmdDispatch.RegisterGroup("character", RegisterCharacterHandlers);
+            _cmdDispatch.RegisterGroup("wedding", socialHandlers.Wedding.Register);
             _cmdDispatch.RegisterGroup("upgrade-broadcast", _upgradeBroadcast.Register);
             if (_auctionHandler != null)
                 _cmdDispatch.RegisterGroup("auction", d => {
@@ -342,6 +351,7 @@ namespace DfoServer.Network
         internal IDisposable StartLevelUpRewardRecovery(ClockService clock)
         {
             _levelUpRewards.StartRecovery(clock);
+            _socialHandlers.Wedding.StartRecovery();
             return _levelUpRewards;
         }
 
@@ -434,6 +444,7 @@ namespace DfoServer.Network
             {
                 _auctionHandler?.Clear(s);
                 await _characterSessionLifecycle.HandleSelectCharacterAsync(s, h, b);
+                await _socialHandlers.Wedding.RestoreAsync(s);
                 await _raidHandler.HandleRaidChannelWelcomeAsync(s);
                 await _raidHandler.HandleRebindResyncAsync(s);
                 if (_auctionHandler != null) await _auctionHandler.SendService(s);
@@ -561,6 +572,7 @@ namespace DfoServer.Network
             {
                 var player = s.Player;
                 var characterId = player?.CharacterId;
+                if (await _socialHandlers.Wedding.TryBuyItemAsync(s, h, b)) return;
                 await _inventoryHandler.Handle_ENUM_CMDPACKET_BUY_ITEM(s, h, b);
                 if (player == s.Player && player?.CharacterId == characterId)
                     await _raidHandler.RefreshEntryCostsAsync(s);

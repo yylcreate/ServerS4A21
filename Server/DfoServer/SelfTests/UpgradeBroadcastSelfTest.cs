@@ -11,6 +11,7 @@ using DfoServer.Game.Inventory;
 using DfoServer.Game.ItemUpgrade;
 using DfoServer.Game.SelectCharacter;
 using DfoServer.Game.Session;
+using DfoServer.GameWorld;
 using DfoServer.Infrastructure;
 using DfoServer.Network;
 using DfoServer.Network.Builders;
@@ -303,6 +304,106 @@ namespace DfoServer.SelfTests
             check("cleared membership is not cleaned twice", viewer.Drain().Count == 0);
             await Request(host, CmdPacketTypeA21.UPGRADE_ROOM_UPGRADE_START);
             check("displaced host cannot retain a room or spend", !await handler.TryHandleUpgradeCompletion(replacement.Session, default, Array.Empty<byte>()));
+            await VerifyPrivateAudiences(check);
+            await VerifyChurchAudiences(check);
+        }
+
+        private static async Task VerifyChurchAudiences(Action<string, bool> check)
+        {
+            using var db = SelfTestDatabase.Create("upgrade-church-event");
+            foreach (int id in new[] { 714, 715, 716 }) SeedOwner(db.Database, id + 100, id, "live" + id);
+            var sessions = new SessionDirectory();
+            sessions.ConfigureTownCohort(WeddingSceneAdmission.SameCohort, WeddingSceneAdmission.CaptureCohort);
+            using var host = await Peer.Create(db.Database, sessions, 714, 10011);
+            using var guest = await Peer.Create(db.Database, sessions, 715, 10011);
+            using var later = await Peer.Create(db.Database, sessions, 716, 10011);
+            var church = WeddingSceneCatalog.Get().CeremonyRooms[0];
+            foreach (var peer in new[] { host, guest, later })
+            {
+                peer.Session.Player.CurTownId = church.Town; peer.Session.Player.CurAreaId = church.Area;
+                peer.Session.Player.BindWeddingCeremony(88, peer == later ? 2000 : 1000);
+            }
+            var characters = new SqliteCharacterRepository(db.Database);
+            var refresh = new InventoryRefreshSender(new SqliteSelectCharacterDataSource(db.Database, characters), characters, db.Database);
+            using var handler = new UpgradeBroadcastHandler(sessions, new CharacterTransitionCoordinator(sessions), refresh, null);
+            Task Request(Peer peer, CmdPacketTypeA21 type, byte[] body = null)
+                => handler.Handle(peer.Session, new GamePacketHeader { type = (ushort)type }, body ?? Array.Empty<byte>());
+            await Request(host, CmdPacketTypeA21.CREATE_UPGRADE_ROOM, Pair(123, 234));
+            ushort oldRoom = BitConverter.ToUInt16(host.Drain().Single(Is(NotiPacketTypeA21.UPGRADE_ROOM_INFO)), 15);
+            check("church live markers are scoped to the exact reservation start, even for the same pair",
+                guest.Drain().Any(Is(NotiPacketTypeA21.CREATE_UPGRADE_ROOM_INFO)) && later.Drain().Count == 0);
+            await handler.Reconcile(later.Session);
+            check("a later ceremony cannot discover a still-existing old-event room", later.Drain().Count == 0);
+            await Request(later, CmdPacketTypeA21.JOIN_SPECTATOR_UPGRADE_ROOM, Pair(oldRoom, 714));
+            check("an old church room id cannot bypass event membership", !later.Drain().Any(Is(NotiPacketTypeA21.UPGRADE_ROOM_INFO)));
+            later.Session.Player.BindWeddingCeremony(88, 1000);
+            await handler.Reconcile(later.Session);
+            check("church discovery invalidates its cached key when only the reservation start changes",
+                later.Drain().Any(Is(NotiPacketTypeA21.UPGRADE_ROOM_LIST_INFO)));
+            later.Session.Player.BindWeddingCeremony(88, 2000);
+            await Request(guest, CmdPacketTypeA21.JOIN_SPECTATOR_UPGRADE_ROOM, Pair(oldRoom, 714)); host.Drain();
+            check("an invited attendee can join a live room in its current ceremony",
+                guest.Drain().Any(Is(NotiPacketTypeA21.UPGRADE_ROOM_INFO)));
+
+            var sendLock = (System.Threading.SemaphoreSlim)typeof(EnhancedClientSession)
+                .GetField("_sendLock", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic).GetValue(guest.Session);
+            await sendLock.WaitAsync();
+            Task closing;
+            try
+            {
+                host.Session.Player.BindWeddingCeremony(88, 2000);
+                closing = handler.Reconcile(host.Session);
+                guest.Session.Player.BindWeddingCeremony(88, 2000);
+            }
+            finally { sendLock.Release(); }
+            await closing; host.Drain();
+            check("queued old-room leave and destroy frames cannot reach attendees of a reused church event",
+                guest.Drain().Count == 0 && later.Drain().Count == 0);
+            await Request(host, CmdPacketTypeA21.CREATE_UPGRADE_ROOM, Pair(123, 234));
+            ushort nextRoom = BitConverter.ToUInt16(host.Drain().Single(Is(NotiPacketTypeA21.UPGRADE_ROOM_INFO)), 15);
+            check("a new ceremony can create its own live room after retiring the former event",
+                nextRoom != oldRoom && guest.Drain().Any(Is(NotiPacketTypeA21.CREATE_UPGRADE_ROOM_INFO))
+                && later.Drain().Any(Is(NotiPacketTypeA21.CREATE_UPGRADE_ROOM_INFO)));
+        }
+
+        private static async Task VerifyPrivateAudiences(Action<string, bool> check)
+        {
+            using var db = SelfTestDatabase.Create("upgrade-private-home");
+            foreach (int id in new[] { 711, 712, 713 }) SeedOwner(db.Database, id + 100, id, "live" + id);
+            var sessions = new SessionDirectory(); sessions.ConfigureTownCohort(WeddingSceneAdmission.SameCohort);
+            using var host = await Peer.Create(db.Database, sessions, 711, 10011);
+            using var spouse = await Peer.Create(db.Database, sessions, 712, 10011);
+            using var foreign = await Peer.Create(db.Database, sessions, 713, 10011);
+            var home = WeddingSceneCatalog.Get().CoupleRoom;
+            foreach (var peer in new[] { host, spouse, foreign })
+            { peer.Session.Player.CurTownId = home.Town; peer.Session.Player.CurAreaId = home.Area; peer.Session.Player.WeddingRoomPairId = peer == foreign ? 22 : 11; }
+            var characters = new SqliteCharacterRepository(db.Database);
+            var refresh = new InventoryRefreshSender(new SqliteSelectCharacterDataSource(db.Database, characters), characters, db.Database);
+            using var handler = new UpgradeBroadcastHandler(sessions, new CharacterTransitionCoordinator(sessions), refresh, null);
+            Task Request(Peer peer, CmdPacketTypeA21 type, byte[] body = null)
+                => handler.Handle(peer.Session, new GamePacketHeader { type = (ushort)type }, body ?? Array.Empty<byte>());
+            await Request(host, CmdPacketTypeA21.CREATE_UPGRADE_ROOM, Pair(123, 234));
+            ushort room = BitConverter.ToUInt16(host.Drain().Single(Is(NotiPacketTypeA21.UPGRADE_ROOM_INFO)), 15);
+            check("a home broadcast room publishes its marker only to the spouse",
+                spouse.Drain().Any(Is(NotiPacketTypeA21.CREATE_UPGRADE_ROOM_INFO)) && foreign.Drain().Count == 0);
+            await handler.Reconcile(foreign.Session);
+            check("another couple cannot discover rooms sharing the same physical home coordinates", foreign.Drain().Count == 0);
+            await Request(foreign, CmdPacketTypeA21.JOIN_SPECTATOR_UPGRADE_ROOM, Pair(room, 711));
+            check("knowing the room id does not allow a foreign couple to join", !foreign.Drain().Any(Is(NotiPacketTypeA21.UPGRADE_ROOM_INFO)));
+            await handler.Reconcile(spouse.Session);
+            check("the spouse can discover its own home broadcast room", spouse.Drain().Any(Is(NotiPacketTypeA21.UPGRADE_ROOM_LIST_INFO)));
+            await Request(spouse, CmdPacketTypeA21.JOIN_SPECTATOR_UPGRADE_ROOM, Pair(room, 711)); host.Drain();
+            check("the spouse can join the captured private room", spouse.Drain().Any(Is(NotiPacketTypeA21.UPGRADE_ROOM_INFO)));
+            host.Session.Player.CurTownId = 1; host.Session.Player.CurAreaId = 0; host.Session.Player.WeddingRoomPairId = 0;
+            await handler.Reconcile(host.Session); host.Drain();
+            check("host departure still destroys the marker in the old private audience after clearing its live pair",
+                spouse.Drain().Any(Is(NotiPacketTypeA21.DESTROY_UPGRADE_ROOM_INFO)) && foreign.Drain().Count == 0);
+            host.Session.Player.CurTownId = home.Town; host.Session.Player.CurAreaId = home.Area; host.Session.Player.WeddingRoomPairId = 22;
+            await Request(host, CmdPacketTypeA21.CREATE_UPGRADE_ROOM, Pair(123, 234)); host.Drain(); foreign.Drain(); spouse.Drain();
+            spouse.Session.Player.WeddingRoomPairId = 22;
+            await handler.Reconcile(spouse.Session);
+            check("private discovery is invalidated when the pair changes without changing map coordinates",
+                spouse.Drain().Any(Is(NotiPacketTypeA21.UPGRADE_ROOM_LIST_INFO)));
         }
         private static Func<byte[], bool> Is(NotiPacketTypeA21 type) => p => p[0] == 0 && BitConverter.ToUInt16(p, 1) == (ushort)type;
         private static Func<byte[], bool> IsAck(CmdPacketTypeA21 type) => p => p[0] == 1 && BitConverter.ToUInt16(p, 1) == (ushort)type

@@ -88,12 +88,17 @@ namespace DfoServer.SelfTests
                 ref failures);
 
             var initSequence = NewCharacterInitSequence.Build();
+            Check(
+                "A21 actual init sequence never sends an unsolicited WEDDING_CHARAC query ACK",
+                !initSequence.Any(entry => entry.Kind == SelectCharacterPacketTemplateKind.Raw
+                    && entry.Command == 0x01 && entry.Type == (ushort)CmdPacketTypeA21.WEDDING_CHARAC),
+                ref failures);
             var weddingIndex = initSequence.FindIndex(entry =>
                 entry.Kind == SelectCharacterPacketTemplateKind.Raw
-                && entry.Command == 0x01
-                && entry.Type == (ushort)CmdPacketTypeA21.WEDDING_CHARAC);
+                && entry.Command == 0x00
+                && entry.Type == (ushort)NotiPacketTypeA21.WEDDING_INFO);
             Check(
-                "A21 init sequence places DIMENSION_GATE_ENTRANCE_INFO after WEDDING_CHARAC",
+                "A21 init sequence places DIMENSION_GATE_ENTRANCE_INFO after authoritative WEDDING_INFO",
                 weddingIndex >= 0
                 && weddingIndex + 1 < initSequence.Count
                 && initSequence[weddingIndex + 1].Kind == SelectCharacterPacketTemplateKind.Raw

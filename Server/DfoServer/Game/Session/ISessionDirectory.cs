@@ -29,6 +29,12 @@ namespace DfoServer.Game.Session
             int excludeCharacterId,
             int listenerPort = 0);
 
+        // Explicit source for departure after unregister/replacement. Test
+        // directories that have no private cohorts retain the existing contract.
+        IReadOnlyList<EnhancedClientSession> GetSessionsInAreaFor(
+            PlayerContext source, byte townId, byte areaId, int excludeCharacterId, int listenerPort = 0)
+            => GetSessionsInArea(townId, areaId, excludeCharacterId, listenerPort);
+
         /// <summary>
         /// 向同一频道监听端口、同一 (townId, areaId) 的其它会话广播封包
         /// (排除 excludeCharacterId 自己)。
@@ -39,6 +45,10 @@ namespace DfoServer.Game.Session
             int excludeCharacterId,
             byte[] packet,
             int listenerPort = 0);
+
+        Task BroadcastToAreaForAsync(PlayerContext source, byte townId, byte areaId,
+            int excludeCharacterId, byte[] packet, int listenerPort = 0)
+            => BroadcastToAreaAsync(townId, areaId, excludeCharacterId, packet, listenerPort);
 
         event Func<int, EnhancedClientSession, Task> SessionEnding;
     }

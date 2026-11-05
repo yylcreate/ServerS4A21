@@ -85,5 +85,13 @@ VALUES (@characterId, @slotIndex, @questId);";
                 }
             }
         }
+
+        internal static void RemoveQuest(SqliteConnection connection, SqliteTransaction transaction, int characterId, int questId)
+        {
+            using var command = connection.CreateCommand(); command.Transaction = transaction;
+            command.CommandText = "DELETE FROM character_quest_notify_selections WHERE character_id=@cid AND quest_id=@quest;";
+            command.Parameters.AddWithValue("@cid", characterId); command.Parameters.AddWithValue("@quest", questId);
+            command.ExecuteNonQuery();
+        }
     }
 }

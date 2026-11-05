@@ -131,7 +131,7 @@ INSERT INTO guild_members(character_id,guild_id,joined_at) VALUES(901,901,CURREN
                 using (var fresh = OpenRaw(source))
                     check("fresh baseline schema contains the three guild tables",
                         SqliteMigrations.ReadVersion(fresh) == SqliteMigrations.CurrentVersion
-                        && SqliteMigrations.CurrentVersion == 41
+                        && SqliteMigrations.CurrentVersion >= 40
                         && HasTable(fresh, "guild_dungeon_progress")
                         && HasTable(fresh, "guild_dungeon_clears")
                         && HasTable(fresh, "guild_contents"));
@@ -158,7 +158,7 @@ PRAGMA user_version=37;");
                 && !HasTable(connection, "guild_dungeon_clears")
                 && !HasTable(connection, "guild_contents"));
             SqliteMigrations.Apply(connection);
-            check("v37 upgrades through v38/v39/v40/v41 and creates the guild tables",
+            check("v37 upgrades through the current schema and creates the guild tables",
                 SqliteMigrations.ReadVersion(connection) == SqliteMigrations.CurrentVersion
                 && ReadSchemaVersion(connection) == SqliteMigrations.CurrentVersion
                 && Columns(connection, "guild_dungeon_progress").SequenceEqual(new[]

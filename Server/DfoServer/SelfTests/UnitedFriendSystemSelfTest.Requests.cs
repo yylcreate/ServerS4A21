@@ -32,7 +32,7 @@ namespace DfoServer.SelfTests
                 command.ExecuteNonQuery();
             }
             Execute("INSERT INTO accounts(account_id,m_id) VALUES(1,'friends-test');"
-                + "INSERT INTO characters(character_id,account_id,name,level) VALUES(101,1,'甲',20),(102,1,'乙',30),(103,1,'旁观者',40),(104,1,'离线',50);");
+                + "INSERT INTO characters(character_id,account_id,name,level) VALUES(101,1,'甲',20),(102,1,'乙',30),(103,1,'旁观者',40),(70004,1,'离线',50);");
             SetStatic("_characterRepository", new SqliteCharacterRepository(path, ServerPaths.SchemaFilePath));
             var sessions = new SessionDirectory();
             var transitions = new CharacterTransitionCoordinator(sessions);
@@ -93,6 +93,13 @@ namespace DfoServer.SelfTests
             Check("same-channel identity follows the complete ordinary list", ListBeforeIdentity(added));
             Check("login and runtime publish identical native friend entries", init.TryBuild(snapshot, 0, out initBody)
                 && added.Single(p => IsFriendSubcommand(p, 0)).AsSpan(15).SequenceEqual(initBody));
+            Check("online friend row carries its canonical character ID for invitation status",
+                BitConverter.ToInt32(initBody, initBody.Length - 4) == 102);
+            b.Session.Player.UserId = 61002;
+            var distinctUid = UnitedFriendSystem.BuildFriendListBody(a.Session, sessions, new[] { "乙" });
+            b.Session.Player.UserId = 102;
+            Check("friend character identity is independent of the current actor UID",
+                BitConverter.ToInt32(distinctUid, distinctUid.Length - 4) == 102);
             await Task.WhenAll(Add(a, "乙"), Add(a, "乙"));
             var repeated = a.Drain();
             Check("duplicate ADD is idempotent without reverse edge or invitation", repeated.Count(p => p[0] == 1 && p[15] == 1) == 2
@@ -196,6 +203,9 @@ namespace DfoServer.SelfTests
             Check("existing offline character can be added without confirmation", UnitedFriendSystem.IsFriend("甲", "离线")
                 && !UnitedFriendSystem.IsFriend("离线", "甲") && HasFriendList(offline, "离线") && !offline.Any(IsIdentity)
                 && offline.Single(p => p[0] == 0)[34] == 50);
+            var offlineList = offline.Single(p => IsFriendSubcommand(p, 0));
+            Check("offline friend row retains the full character ID above the actor UID range",
+                BitConverter.ToInt32(offlineList, offlineList.Length - 4) == 70004);
             await Delete(a, "离线"); a.Drain();
 
             for (int i = 0; i < UnitedFriendSystem.MaximumFriends; i++) UnitedFriendSystem.RecordFriendship("乙", "full-" + i);
@@ -218,6 +228,9 @@ namespace DfoServer.SelfTests
             var cross = a.Drain();
             Check("cross-channel ADD refreshes owner without foreign UID or target notification", HasFriendList(cross, "旁观者")
                 && !cross.Any(IsIdentity) && outsider.Drain().Count == 0 && !UnitedFriendSystem.IsFriend("旁观者", "甲"));
+            var crossList = cross.Single(p => IsFriendSubcommand(p, 0));
+            Check("cross-channel friend list still carries the canonical target ID",
+                BitConverter.ToInt32(crossList, crossList.Length - 4) == 103);
             await Add(a, "乙");
             Check("adding another friend preserves every existing list entry", HasFriendList(a.Drain(), "乙", "旁观者"));
             await Delete(a, "乙");
@@ -267,7 +280,7 @@ namespace DfoServer.SelfTests
                 int length = reader.ReadInt32();
                 if (ClientTextEncoding.GetString(reader.ReadBytes(length)) != name) return false;
                 reader.ReadByte(); reader.ReadUInt32(); reader.ReadByte();
-                if (reader.ReadByte() != 0 || reader.ReadInt32() != 0) return false;
+                if (reader.ReadByte() != 0 || reader.ReadInt32() <= 0) return false;
             }
             return stream.Position == stream.Length;
         }

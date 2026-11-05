@@ -40,12 +40,16 @@ namespace DfoServer.Network.Handlers.Dungeon
                 source ?? "clear-map-quest");
             try
             {
+                var progress = DungeonQuestProgressEvent.ClearMap(sourceEvent, dungeonId, mapId);
+                if (dungeonId > 0 && run.Instance?.ClearedFact?.SourceEventId == sourceEvent.SourceEventId)
+                {
+                    var evidence = run.Instance.Mechanisms.WeddingQuest.Get(sourceEvent.SourceEventId)
+                        ?? throw new System.InvalidOperationException("Canonical clear wedding quest eligibility was not frozen.");
+                    progress = progress.WithWeddingClear(evidence, run.Difficulty);
+                }
                 await DungeonQuestBridge.ApplyAsync(
                     session,
-                    DungeonQuestProgressEvent.ClearMap(
-                        sourceEvent,
-                        dungeonId,
-                        mapId));
+                    progress);
             }
             catch
             {

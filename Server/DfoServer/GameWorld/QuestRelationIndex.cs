@@ -72,7 +72,8 @@ namespace DfoServer.GameWorld
             int growType,
             HashSet<int> clearedQuestIds,
             Dictionary<int, int> clearedFlags,
-            ISet<int> allowedCreatureKinds)
+            ISet<int> allowedCreatureKinds,
+            bool weddingEligible = false)
         {
             var result = new List<ushort>();
             var prerequisiteState = new QuestPrerequisiteEvaluationState(
@@ -113,6 +114,8 @@ namespace DfoServer.GameWorld
                 }
 
                 if (!IsSelectableGrade(grade))
+                    continue;
+                if (grade == "[wedding]" && !weddingEligible)
                     continue;
 
                 if (!MeetsCharacterRestrictions(
@@ -450,7 +453,8 @@ namespace DfoServer.GameWorld
                 || grade == "[special daily]"
                 || grade == "[common unique]"
                 || grade == "[realization]"
-                || grade == "[system]";
+                || grade == "[system]"
+                || grade == "[wedding]";
 
         private static int ParseExposedValue(string value)
             => int.TryParse((value ?? string.Empty).Trim(), out var parsed)

@@ -660,6 +660,17 @@ namespace DfoServer.Game.Quests
             await _notifications.SendActiveQuestListAsync(cid);
         }
 
+        internal async Task SyncWeddingClearQuestProgressAsync(int dungeonId, int difficulty, int mapId,
+            Guid sourceEventId, IReadOnlyCollection<ushort> eligibleQuestIds,
+            IReadOnlyDictionary<ushort, QuestActivationId> eligibleQuestActivations, WeddingQuestClearEvidence evidence)
+        {
+            int cid = _sender.CharacterId;
+            if (cid <= 0) return;
+            if (_service.SyncWeddingClearQuestProgress(cid, dungeonId, difficulty, mapId, sourceEventId,
+                eligibleQuestIds, eligibleQuestActivations, evidence))
+                await _notifications.SendActiveQuestListAsync(cid);
+        }
+
         public Task SyncHuntMonsterQuestProgressAsync(
             int dungeonId,
             int difficulty,

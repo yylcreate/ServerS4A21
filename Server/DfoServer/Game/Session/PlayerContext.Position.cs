@@ -10,6 +10,25 @@ namespace DfoServer.Game.Session
         private long _townMovementSequence;
 
         public byte CurTownId { get; set; }
+        internal DfoServer.Game.Wedding.WeddingState Wedding { get; set; }
+        internal long WeddingRoomPairId { get; set; }
+        private WeddingCeremonyAttendance _weddingCeremony;
+        internal WeddingCeremonyAttendance WeddingCeremony => Volatile.Read(ref _weddingCeremony);
+        internal long WeddingCeremonyPairId => WeddingCeremony?.PairId ?? 0;
+        internal long WeddingCeremonyStartAt => WeddingCeremony?.StartAt ?? 0;
+        private WeddingSceneEntry _weddingAreaAdmission;
+        internal WeddingSceneEntry WeddingAreaAdmission
+        {
+            get => Volatile.Read(ref _weddingAreaAdmission);
+            set => Volatile.Write(ref _weddingAreaAdmission, value);
+        }
+
+        internal void BindWeddingCeremony(long pairId, long startAt)
+        {
+            if (pairId <= 0 || startAt <= 0) throw new ArgumentOutOfRangeException(nameof(pairId));
+            Volatile.Write(ref _weddingCeremony, new WeddingCeremonyAttendance(pairId, startAt));
+        }
+        internal void ClearWeddingCeremony() => Volatile.Write(ref _weddingCeremony, null);
         public byte CurAreaId { get; set; }
         public short CurPosX { get; set; }
         public short CurPosY { get; set; }
@@ -51,4 +70,10 @@ namespace DfoServer.Game.Session
         /// </summary>
         public DateTime LastPositionPersistAt { get; set; } = DateTime.MinValue;
     }
+
+    // Both values form one identity: a failed ceremony may reserve again with
+    // the same pair and physical church room but a different start time.
+    internal sealed record WeddingCeremonyAttendance(long PairId, long StartAt);
+    internal sealed record WeddingSceneEntry(int CharacterId, byte Town, byte Area,
+        long HomePairId, WeddingCeremonyAttendance Ceremony, DfoServer.Game.Wedding.WeddingState HomeState = null);
 }

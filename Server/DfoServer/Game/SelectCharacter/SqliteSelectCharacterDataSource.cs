@@ -489,11 +489,15 @@ namespace DfoServer.Game.SelectCharacter
                 }
             }
 
+            var wedding = DfoServer.Game.Wedding.WeddingReplaySnapshot.Load(_database, characterId, DateTimeOffset.UtcNow.ToUnixTimeSeconds());
             return new SelectCharacterDataSnapshot
             {
                 InitializationSnapshot = initSnapshot,
                 KnightShieldDeck = knightShieldDeck,
                 CharacterRecord = characterRecord,
+                Wedding = wedding.Wedding,
+                WeddingPartner = wedding.Partner,
+                WeddingRoom = wedding.Room,
             };
         }
 

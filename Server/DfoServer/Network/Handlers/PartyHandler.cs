@@ -2112,7 +2112,8 @@ namespace DfoServer.Network.Handlers
                 !Game.Session.SessionDirectory.IsTownPresence(
                     inviteePlayer) ||
                 (inviterPlayer.CurTownId == inviteePlayer.CurTownId &&
-                 inviterPlayer.CurAreaId == inviteePlayer.CurAreaId))
+                 inviterPlayer.CurAreaId == inviteePlayer.CurAreaId &&
+                 WeddingSceneAdmission.SameCohort(inviterPlayer, inviteePlayer)))
             {
                 return null;
             }

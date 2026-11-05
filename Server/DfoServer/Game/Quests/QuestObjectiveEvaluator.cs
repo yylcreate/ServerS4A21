@@ -85,6 +85,25 @@ namespace DfoServer.Game.Quests
                 {
                     if (current.IsComplete)
                         return result;
+                    var file = GameWorld.QuestData.GetQuestFile(quest.QuestId);
+                    if (GameWorld.WeddingClearQuestDefinition.IsWeddingClear(file))
+                    {
+                        if (request.Operation != QuestProgressOperation.ClearDungeon
+                            || request.WeddingClear?.Allows(request.SourceEventId, request.CharacterId) != true
+                            || !GameWorld.WeddingClearQuestDefinition.TryParse(file, out var targets)) return result;
+                        if (request.RepairLegacyWeddingClearTrigger)
+                            result.Trigger = new QuestTrigger(GameWorld.QuestData.GetInitTrigger(quest.QuestId));
+                        foreach (var target in targets)
+                        {
+                            if (!target.Matches(request.DungeonId, request.Difficulty)) continue;
+                            var next = QuestProgressReducer.DecrementChannel(result.Trigger, target.ChannelIndex);
+                            if (next.Equals(result.Trigger)) continue;
+                            result.Matched = true;
+                            result.AddChange(quest.QuestId, current, next);
+                            result.Trigger = next;
+                        }
+                        return result;
+                    }
                     var matcher = clearMapMatcher
                         ?? ((questId, dungeonId, mapId) =>
                             GameWorld.QuestData.MatchesClearMapTarget(

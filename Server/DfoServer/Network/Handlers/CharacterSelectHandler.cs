@@ -1148,6 +1148,15 @@ namespace DfoServer.Network.Handlers
                 return;
             }
 
+            if (new Game.Wedding.WeddingRepository(_database).IsBound(target.CharacterId)
+                || _database.Read(c => Game.Wedding.WeddingMoneyGiftCommitService.HasPendingEscrow(c, null, target.CharacterId)))
+            {
+                FileLogger.Log($"[{ProtocolName}] DELETE_CHARACTER blocked: character_id={target.CharacterId} has an active wedding relationship");
+                await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(
+                    0x01, (ushort)CmdPacketTypeA21.DELETE_CHARACTER, new byte[] { 0x28 }));
+                return;
+            }
+
             try
             {
                 // 软删 + 前移 slot 在同一事务内原子完成: 被删 slot 之后所有活跃角色 slot 前移一位,

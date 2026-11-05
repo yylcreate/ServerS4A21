@@ -17,6 +17,7 @@ using DfoServer.Network.Parsers.Town;
 using System;
 using System.Collections.Generic;
 using System.Threading.Tasks;
+using System.Threading;
 
 namespace DfoServer.Network.Handlers
 {
@@ -73,6 +74,18 @@ namespace DfoServer.Network.Handlers
             _dungeonGiveupPartyDeparture;
         private Func<Task> _publishTownPartyLists;
         private Func<EnhancedClientSession, byte, byte, Task> _raidTownAreaChanged;
+        private Func<EnhancedClientSession, byte, byte, bool> _weddingAreaAdmission;
+        private Func<EnhancedClientSession, EnhancedClientSession, CancellationToken, Task> _weddingActorProjection;
+        private Func<EnhancedClientSession, byte, byte, Func<bool>> _captureWeddingAreaCommit;
+
+        internal void ConfigureWeddingAreaAdmission(Func<EnhancedClientSession, byte, byte, bool> admission,
+            Func<EnhancedClientSession, EnhancedClientSession, CancellationToken, Task> actorProjection = null,
+            Func<EnhancedClientSession, byte, byte, Func<bool>> captureEntryCommit = null)
+        {
+            _weddingAreaAdmission = admission ?? throw new ArgumentNullException(nameof(admission));
+            _weddingActorProjection = actorProjection;
+            _captureWeddingAreaCommit = captureEntryCommit;
+        }
 
         private readonly InventoryRefreshSender _refresh;
 
@@ -178,6 +191,12 @@ namespace DfoServer.Network.Handlers
             {
                 if (session?.Player == null || session.Player.CharacterId <= 0)
                     return;
+                if (_weddingAreaAdmission != null && session.Player.CurTownId == WeddingSceneCatalog.NativeChurchTown)
+                {
+                    var weddingScenes = WeddingSceneCatalog.Get();
+                    if (System.Linq.Enumerable.Any(weddingScenes.ChurchScenes,
+                        x => x.Town == session.Player.CurTownId && x.Area == session.Player.CurAreaId)) return;
+                }
                 if (!GameChannelSpawnPolicy.ShouldPersistPosition(
                         session.ListenerPort,
                         session.Player.CurTownId))
@@ -291,7 +310,8 @@ namespace DfoServer.Network.Handlers
         private async Task SetUserAreaCoreAsync(
             EnhancedClientSession session,
             byte[] body,
-            TownProjectionGuard projectionGuard)
+            TownProjectionGuard projectionGuard,
+            bool weddingFallback = false)
         {
             if (body == null || body.Length < 6) return;
             if (!CanContinueTownProjection(session, projectionGuard))
@@ -300,6 +320,12 @@ namespace DfoServer.Network.Handlers
             var gotoAreaId = body[1];
             var gotoPosX = BitConverter.ToInt16(body, 2);
             var gotoPosY = BitConverter.ToInt16(body, 4);
+
+            if (_weddingAreaAdmission != null && !_weddingAreaAdmission(session, gotoTownId, gotoAreaId))
+            {
+                await ChannelTownRestrictionSender.SendCurrentAreaAsync(session);
+                return;
+            }
 
             if (!CanChangeRaidArea(session, gotoTownId, gotoAreaId))
             {
@@ -327,6 +353,9 @@ namespace DfoServer.Network.Handlers
 
             var previousTownId = session.Player.CurTownId;
             var previousAreaId = session.Player.CurAreaId;
+            var weddingPlayer = session.Player;
+            var weddingEntry = weddingPlayer.WeddingAreaAdmission;
+            var commitWeddingArea = _captureWeddingAreaCommit?.Invoke(session, gotoTownId, gotoAreaId);
 
             session.Player.CurTownId = gotoTownId;
             session.Player.CurAreaId = gotoAreaId;
@@ -365,7 +394,35 @@ namespace DfoServer.Network.Handlers
                     $"listener={session.ListenerPort}");
             }
 
-            await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(0x00, 0x0017, TownAreaNotificationBuilder.BuildUserArea(selfSnapshot)));
+            if (commitWeddingArea != null && !commitWeddingArea())
+            {
+                // Admission can expire or be cancelled while old-area writes
+                // wait on a socket. Retire that projection through the normal
+                // public-area path; never re-enter a former private room.
+                if (!weddingFallback && ReferenceEquals(session.Player, weddingPlayer)
+                    && weddingEntry != null && weddingPlayer.CharacterId == weddingEntry.CharacterId
+                    && ReferenceEquals(weddingPlayer.WeddingAreaAdmission, weddingEntry)
+                    && weddingPlayer.CurTownId == gotoTownId && weddingPlayer.CurAreaId == gotoAreaId
+                    && (_sessions == null || _sessions.TryGet(weddingEntry.CharacterId, out var current) && ReferenceEquals(current, session)))
+                {
+                    var record = _characterRepository.GetById(weddingEntry.CharacterId);
+                    if (record != null)
+                    {
+                        var spawn = GameChannelSpawnPolicy.Resolve(session.ListenerPort, record.TownId);
+                        var fallbackBody = new byte[6]; fallbackBody[0] = spawn.TownId; fallbackBody[1] = spawn.AreaId;
+                        BitConverter.GetBytes(spawn.X).CopyTo(fallbackBody, 2); BitConverter.GetBytes(spawn.Y).CopyTo(fallbackBody, 4);
+                        await SetUserAreaCoreAsync(session, fallbackBody, projectionGuard, weddingFallback: true);
+                    }
+                }
+                return;
+            }
+            var arrivalPlayer = session.Player;
+            int arrivalCharacter = arrivalPlayer.CharacterId;
+            var arrivalCohort = WeddingSceneAdmission.CaptureCohort(arrivalPlayer);
+            await session.TrySendPacketAsync(GamePacketEnvelopeBuilder.Build(0x00, 0x0017, TownAreaNotificationBuilder.BuildUserArea(selfSnapshot)),
+                CancellationToken.None, () => ReferenceEquals(session.Player, arrivalPlayer) && arrivalPlayer.CharacterId == arrivalCharacter
+                    && arrivalPlayer.CurTownId == gotoTownId && arrivalPlayer.CurAreaId == gotoAreaId
+                    && arrivalCohort(arrivalPlayer) && CanContinueTownProjection(session, projectionGuard));
             if (!CanContinueTownProjection(session, projectionGuard))
                 return;
 
@@ -465,54 +522,79 @@ namespace DfoServer.Network.Handlers
                 return;
             var townId = session.Player.CurTownId;
             var areaId = session.Player.CurAreaId;
+            var sourcePlayer = session.Player;
+            int sourceCharacter = sourcePlayer.CharacterId;
+            var cohort = WeddingSceneAdmission.CaptureCohort(sourcePlayer);
+            bool StillHere() => ReferenceEquals(session.Player, sourcePlayer) && sourcePlayer.CharacterId == sourceCharacter
+                && sourcePlayer.CurTownId == townId && sourcePlayer.CurAreaId == areaId
+                && cohort(sourcePlayer) && CanContinueTownProjection(session, projectionGuard);
+            bool PeerStillHere(EnhancedClientSession peer) => StillHere() && peer?.Player != null
+                && peer.Player.CurTownId == townId && peer.Player.CurAreaId == areaId
+                && peer.ListenerPort == session.ListenerPort && cohort(peer.Player)
+                && SessionDirectory.IsTownPresence(peer.Player)
+                && (_sessions == null || _sessions.TryGet(peer.Player.CharacterId, out var current) && ReferenceEquals(current, peer));
 
-            IReadOnlyList<EnhancedClientSession> others = _sessions?.GetSessionsInArea(
-                    townId,
-                    areaId,
-                    session.Player.CharacterId,
-                    session.ListenerPort)
-                ?? System.Array.Empty<EnhancedClientSession>();
+            IReadOnlyList<EnhancedClientSession> others = System.Array.Empty<EnhancedClientSession>();
+            // 到达者本人：0x18 进场景后先消费自己的 USERINFO0(+47)，
+            // 再按远程插入顺序发他人 USERINFO0 + USER_AREA。
+            // 14932：0x17(无 USERINFO) -> 0x18 -> 他人 USERINFO 看不到先到的人；
+            // 已在场玩家能看到后来者，是因为收的是 USERINFO0 + 0x17。
+            await session.SendPreparedPacketBatchAsync(() =>
+            {
+                if (!StillHere()) return System.Array.Empty<byte[]>();
+                // The required arrival frame must still be sent if an unrelated
+                // peer departed while this socket was busy. Choose the current
+                // audience under the send lock instead of dropping AREA_USERS.
+                var candidates = _sessions?.GetSessionsInAreaFor(sourcePlayer, townId, areaId,
+                    sourceCharacter, session.ListenerPort) ?? System.Array.Empty<EnhancedClientSession>();
+                var currentOthers = new List<EnhancedClientSession>(candidates.Count);
+                var roster = new List<TownUserSnapshot>(candidates.Count + 1) { selfSnapshot };
+                foreach (var peer in candidates)
+                {
+                    if (!PeerStillHere(peer)) continue;
+                    currentOthers.Add(peer);
+                    roster.Add(TownAreaNotificationBuilder.CreateCurrentSnapshot(peer.Player));
+                }
+                others = currentOthers;
+                return new[] { GamePacketEnvelopeBuilder.Build(0x00, 0x0018,
+                    TownAreaNotificationBuilder.BuildAreaUsers(townId, areaId, roster)) };
+            });
+            if (!StillHere())
+                return;
 
             FileLogger.Log(
                 $"[{ProtocolName}] AREA co-presence: uid={session.Player.UserId} " +
                 $"town={townId} area={areaId} listener={session.ListenerPort} " +
                 $"others={others.Count}");
 
-            // 全体名册(自己 + 其它人)。
-            var roster = new List<TownUserSnapshot>(others.Count + 1) { selfSnapshot };
-            foreach (var o in others)
-                roster.Add(TownAreaNotificationBuilder.CreateCurrentSnapshot(o.Player));
-
-            // 到达者本人：0x18 进场景后先消费自己的 USERINFO0(+47)，
-            // 再按远程插入顺序发他人 USERINFO0 + USER_AREA。
-            // 14932：0x17(无 USERINFO) -> 0x18 -> 他人 USERINFO 看不到先到的人；
-            // 已在场玩家能看到后来者，是因为收的是 USERINFO0 + 0x17。
-            await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(0x00, 0x0018,
-                TownAreaNotificationBuilder.BuildAreaUsers(townId, areaId, roster)));
-            if (!CanContinueTownProjection(session, projectionGuard))
-                return;
-
             var selfAppearance = GamePacketEnvelopeBuilder.Build(
                 0x00,
                 0x0002,
                 AppearanceService.BuildNoti2Body(session.Player, _database));
-            await session.SendPacketAsync(selfAppearance);
-            if (!CanContinueTownProjection(session, projectionGuard))
+            await session.TrySendPacketAsync(selfAppearance, CancellationToken.None, StillHere);
+            if (!StillHere())
                 return;
+            if (_weddingActorProjection != null && StillHere())
+                await _weddingActorProjection(session, session, CancellationToken.None);
+            if (!StillHere()) return;
 
             foreach (var o in others)
             {
-                await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(0x00, 0x0002,
+                if (!PeerStillHere(o)) continue;
+                await session.TrySendPacketAsync(GamePacketEnvelopeBuilder.Build(0x00, 0x0002,
                     AppearanceService.BuildNoti2Body(
                         o.Player,
-                        _database)));
-                if (!CanContinueTownProjection(session, projectionGuard))
+                        _database)), CancellationToken.None, () => PeerStillHere(o));
+                if (!StillHere())
                     return;
-                await session.SendPacketAsync(
+                await session.TrySendPacketAsync(
                     BuildCoPresenceInsert(
-                        TownAreaNotificationBuilder.CreateCurrentSnapshot(o.Player)));
-                if (!CanContinueTownProjection(session, projectionGuard))
+                        TownAreaNotificationBuilder.CreateCurrentSnapshot(o.Player)), CancellationToken.None, () => PeerStillHere(o));
+                if (!StillHere())
                     return;
+                if (_weddingActorProjection != null && PeerStillHere(o))
+                    await _weddingActorProjection(o, session, CancellationToken.None);
+                if (!StillHere()) return;
             }
 
             if (onRecipientReady != null
@@ -538,9 +620,9 @@ namespace DfoServer.Network.Handlers
                         {
                             return;
                         }
-                        await recipient.SendPacketAsync(
+                        await recipient.TrySendPacketAsync(
                             selfAppearance,
-                            cancellationToken);
+                            cancellationToken, () => PeerStillHere(recipient));
                         if (!CanContinueTownProjection(
                                 session,
                                 projectionGuard))
@@ -549,9 +631,11 @@ namespace DfoServer.Network.Handlers
                         }
                         // 已在场玩家只插入到达者，不能跟 AREA_USERS：
                         // 42596/46364 实机 0x18 会 setDrawLoadingMode 并切到 TOWN 模块。
-                        await recipient.SendPacketAsync(
+                        await recipient.TrySendPacketAsync(
                             selfArea,
-                            cancellationToken);
+                            cancellationToken, () => PeerStillHere(recipient));
+                        if (_weddingActorProjection != null && PeerStillHere(recipient))
+                            await _weddingActorProjection(session, recipient, cancellationToken);
                     },
                     $"town-presence characterId=" +
                     $"{recipient.Player?.CharacterId ?? 0}"));
@@ -570,7 +654,8 @@ namespace DfoServer.Network.Handlers
         {
             if (_sessions == null || session?.Player == null || session.Player.CharacterId <= 0)
                 return;
-            await _sessions.BroadcastToAreaAsync(
+            await _sessions.BroadcastToAreaForAsync(
+                session.Player,
                 session.Player.CurTownId,
                 session.Player.CurAreaId,
                 session.Player.CharacterId,
@@ -748,6 +833,12 @@ namespace DfoServer.Network.Handlers
                     || !InventoryContext.IsCurrentLease(lease, session.SessionId, cid))
                     return;
             }
+
+            // Preserve the old private identity through departure, then retire
+            // it before any later arrival or delayed ceremony projection.
+            player.ClearWeddingCeremony();
+            player.WeddingRoomPairId = 0;
+            player.WeddingAreaAdmission = null;
 
             FileLogger.Log(
                 $"[{ProtocolName}] TELEPORT: consumed item=" +
@@ -971,7 +1062,8 @@ namespace DfoServer.Network.Handlers
             => leader != null
                && member != null
                && leader.CurTownId == member.CurTownId
-               && leader.CurAreaId == member.CurAreaId;
+               && leader.CurAreaId == member.CurAreaId
+               && WeddingSceneAdmission.SameCohort(leader, member);
 
         public async Task Handle_ENUM_CMDPACKET_SOLO_TELEPOART(
             EnhancedClientSession session,
@@ -1293,7 +1385,7 @@ namespace DfoServer.Network.Handlers
                         projectionGuard);
                 }
                 // 回城过图后客户端重置结婚属性 UI：城镇 USER_STATE/USER_AREA
-                // 投影之后补发婚礼回放三包。只覆盖进/出本触发点，
+                // 投影之后补发婚姻状态和婚房。只覆盖进/出本触发点，
                 // 不挂城镇内每次过图。
                 await InventoryRefreshSender.SendWeddingReplayRefresh(session);
                 return CanContinueTownProjection(

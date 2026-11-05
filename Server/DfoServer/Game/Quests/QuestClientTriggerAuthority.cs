@@ -20,6 +20,8 @@ namespace DfoServer.Game.Quests
                 return QuestClientTriggerDisposition.Reject;
 
             var type = GameWorld.QuestData.NormalizeQuestTag(quest.Type);
+            if (GameWorld.WeddingClearQuestDefinition.IsWeddingClear(quest))
+                return QuestClientTriggerDisposition.EchoOnly;
             if (type == "question")
             {
                 return triggerType == 0

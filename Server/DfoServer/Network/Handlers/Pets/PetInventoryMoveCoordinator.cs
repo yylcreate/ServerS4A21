@@ -49,7 +49,7 @@ namespace DfoServer.Network.Handlers.Pets
             await refresh.SendCreatureItemListRefresh(session);
             await refresh.SendNoti2AppearanceUpdate(session);
             // USERINFO0 重建后客户端会重置名誉/婚礼 UI 状态，按选角序列
-            // 「USERINFO0 在前、补偿包在后」的相对顺序补发 0x0289 与婚礼回放三包。
+            // 「USERINFO0 在前、补偿包在后」的相对顺序补发 0x0289 与婚姻状态、婚房。
             await refresh.SendHonorLevelInfoRefresh(session, "pet creature switch");
             await InventoryRefreshSender.SendWeddingReplayRefresh(session);
             FileLogger.Log($"[{ProtocolName}] pet creature switch: 0x0069 + NOTI2 mode0 + HONOR_LEVEL_INFO + wedding replay sent");

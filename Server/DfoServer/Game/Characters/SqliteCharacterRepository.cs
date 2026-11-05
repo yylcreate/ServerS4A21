@@ -44,12 +44,16 @@ namespace DfoServer.Game.Characters
         }
 
         public static CharacterRecord LoadById(SqliteConnection conn, int characterId)
+            => LoadById(conn, null, characterId);
+
+        internal static CharacterRecord LoadById(SqliteConnection conn, SqliteTransaction transaction, int characterId)
         {
             if (conn == null)
                 throw new ArgumentNullException(nameof(conn));
 
             using (var cmd = conn.CreateCommand())
             {
+                cmd.Transaction = transaction;
                 cmd.CommandText = SelectColumns + " WHERE character_id = @id;";
                 cmd.Parameters.AddWithValue("@id", characterId);
                 using (var reader = cmd.ExecuteReader())
@@ -279,13 +283,25 @@ WHERE character_id = @id;";
         private void SoftDeleteCore(int characterId)
         {
             using (var conn = Open())
+            using (var tx = conn.BeginTransaction())
             using (var cmd = conn.CreateCommand())
             {
+                EnsureNoWeddingMembership(conn, tx, characterId);
+                cmd.Transaction = tx;
                 cmd.CommandText = @"UPDATE characters SET delete_flag = 1, updated_at = CURRENT_TIMESTAMP
                                     WHERE character_id = @id;";
                 cmd.Parameters.AddWithValue("@id", characterId);
                 cmd.ExecuteNonQuery();
+                tx.Commit();
             }
+        }
+
+        private static void EnsureNoWeddingMembership(SqliteConnection connection, SqliteTransaction transaction, int characterId)
+        {
+            if (Wedding.WeddingRepository.IsBound(connection, transaction, characterId))
+                throw new InvalidOperationException("Character has an active wedding relationship.");
+            if (Wedding.WeddingMoneyGiftCommitService.HasPendingEscrow(connection, transaction, characterId))
+                throw new InvalidOperationException("Character has unsettled wedding gift assets.");
         }
 
         public void SoftDeleteAndCompactSlots(int accountId, int characterId, byte slotIndex)
@@ -298,6 +314,7 @@ WHERE character_id = @id;";
             {
                 try
                 {
+                    EnsureNoWeddingMembership(conn, tx, characterId);
                     using (var cmd = conn.CreateCommand())
                     {
                         cmd.Transaction = tx;
