@@ -28,17 +28,18 @@ internal sealed class AuctionHandler
 
     internal void Clear(EnhancedClientSession session) { if (session != null) states.Remove(session); }
 
-    // Client handler 0x01189FB0 reads `u8 serviceType, u8 state` and requires
-    // serviceType == 1 to open the window:  cmp byte[ebp-1],1 / jne closed-branch.
-    // The legacy body {0, state} therefore always took the "service closed"
-    // branch (dstr 0xa490/0xa491), which is what players saw as
-    // "金币寄售系统暂时关闭".
+    // Client handler 0x01189FB0 reads `u8 serviceType, u8 state` and forks on
+    // serviceType; the two branches write DIFFERENT availability globals, and each
+    // global has exactly one writer. Both notices must therefore be sent:
+    //   serviceType 0 -> 0x02335A10(state) -> byte [0x3B71101]  (ordinary auction)
+    //   serviceType 1 -> byte [0x3A42F85] = state               (gold consignment)
+    // The ordinary auction window 0x023458A0 refuses to open when [0x3B71101] is 0
+    // (0x02345AD1 cmp byte [0x3B71101],0 / je -> return false), so sending only the
+    // serviceType-1 notice silently closed the auction window.
     internal async Task SendService(EnhancedClientSession session)
     {
         if (!Current(session, out var lease)) return;
-        var enabled = AuctionServiceNotificationBuilder.GoldConsignEnabled
-            || runtime.EntryEnabled;
-        foreach (var packet in AuctionServiceNotificationBuilder.BuildPackets(enabled))
+        foreach (var packet in AuctionServiceNotificationBuilder.BuildPackets(runtime.EntryEnabled))
         {
             await session.TrySendPacketAsync(packet, default,
                 () => Current(session, out var current) && ReferenceEquals(current, lease));
@@ -72,7 +73,8 @@ internal sealed class AuctionHandler
                 {
                     // ---- Gold consignment (金币寄售) ---------------------------
                     // Independent of the ordinary auction entry gate below: the
-                    // consignment board must work even when AUCTION_ENABLED=0.
+                    // consignment board must still work when the ordinary auction's
+                    // EntryEnabled is false (PVF catalog failed to load).
                     if (body != null && AuctionRequestParser.TryParse(command, body, out var consignRequest)
                         && consignRequest is GoldConsignAveragePriceRequest or GoldConsignRegisterRequest)
                     {
@@ -167,9 +169,9 @@ internal sealed class AuctionHandler
                     }
                     // ---- Gold consignment listings (0x00BC) ---------------------
                     // The consignment board shares 0x00BC with the ordinary auction but
-                    // must work when AUCTION_ENABLED=0, so it is answered before the
-                    // entry gate below. Falls through untouched when the seller has no
-                    // consignment rows.
+                    // must work when the ordinary auction entry is unavailable, so it is
+                    // answered before the entry gate below. Falls through untouched when
+                    // the seller has no consignment rows.
                     if (command == CmdPacketTypeA21.AUCTION_MY_REGISTED_ITEM_INFO)
                     {
                         var consignBody = GoldConsignment.TryBuildListingsReply(

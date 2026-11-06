@@ -22,7 +22,11 @@ public sealed partial class ServerRuntimeBuilder
         var core = GetOrCreateGameProtocolCoreDependencies();
         _auctionRuntime = new AuctionRuntime(Database, AuctionDatabase.DefaultPath, LoadAuctionCatalog,
             () => DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
-            Environment.GetEnvironmentVariable("AUCTION_ENABLED") == "1",
+            // New auction entry is always requested. There is no operator enable
+            // switch: the only thing that can still leave EntryEnabled false is a
+            // genuine catalog load failure, which AuctionRuntime.Start records as
+            // "[Auction] Entry unavailable" and reports through the 0x00B7 notice.
+            entryEnabled: true,
             historyDatabasePath: Environment.GetEnvironmentVariable("AUCTION_HISTORY_DATABASE_PATH"));
         core.CharacterRepository.ConfigureDeletionGuard(_auctionRuntime.DeletionGuard.TryExecuteWhenClear);
     }

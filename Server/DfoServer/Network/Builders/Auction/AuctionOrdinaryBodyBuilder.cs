@@ -6,8 +6,9 @@ namespace DfoServer.Network.Builders.Auction
 {
     /// <summary>
     /// Body only, ordinary identity zero. No envelope/registration or transaction success is emitted.
-    /// Consumers: 0111F970 search, 0111FC90 listings, 0111FE70 bids, 0112CBB0 average,
-    /// 01189FB0 service. See Docs/拍卖行业务与运营接口.md.
+    /// Consumers: 0111F970 search, 0111FC90 listings, 0111FE70 bids, 0112CBB0 average.
+    /// The service notice (01189FB0) is built by
+    /// <see cref="AuctionServiceNotificationBuilder"/>, not here.
     /// </summary>
     public static class AuctionOrdinaryBodyBuilder
     {
@@ -65,8 +66,6 @@ namespace DfoServer.Network.Builders.Auction
             }
             return body;
         }
-
-        public static byte[] Service(bool enabled) => new byte[] { 0, enabled ? (byte)1 : (byte)0 };
 
         /// <summary>
         /// Gold consignment price reference. The consignment board has no order
