@@ -13,7 +13,7 @@ using DfoServer.Network.Parsers.Auction;
 
 namespace DfoServer.Game.Auction.Queries
 {
-    // Read policy is documented in Docs/拍卖行业务与运营接口.md.
+    // Read policy is documented in Docs/拍卖行业务与持久化.md.
     // Client evidence establishes field meanings and pagination, not the
     // original backend's stable order, snapshot TTL or reference-price formula.
     internal sealed class AuctionQueryEngine

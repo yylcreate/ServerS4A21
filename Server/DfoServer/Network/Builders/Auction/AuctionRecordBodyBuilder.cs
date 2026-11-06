@@ -6,7 +6,7 @@ namespace DfoServer.Network.Builders.Auction
     /// <summary>
     /// Fixed record bytes only; every unknown byte has an explicit immutable DTO source.
     /// Mapping: native 0232D2A0, listings 0232DDC4..0232E02F, bids 0232E073..0232E2DF.
-    /// Evidence and compatibility scope: Docs/拍卖行业务与运营接口.md.
+    /// Evidence and compatibility scope: Docs/拍卖行业务与持久化.md.
     /// These methods do not establish a canonical item projection or an executable order.
     /// </summary>
     public static class AuctionRecordBodyBuilder
