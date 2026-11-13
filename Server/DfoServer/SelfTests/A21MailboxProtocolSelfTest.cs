@@ -211,6 +211,7 @@ namespace DfoServer.SelfTests
                 "avatar/creature UID allocate reuses the ambient IMMEDIATE connection",
                 TryAllocateUidsOnImmediateTransaction(),
                 ref failures);
+            VerifyUidAllocationThroughSymlinkedDirectory(ref failures);
 
             VerifyGuildMedalMailClaims(ref failures);
 
@@ -510,8 +511,69 @@ WHEN NEW.list_type = 38 BEGIN SELECT RAISE(ABORT, 'mailbox-medal-selftest'); END
             Directory.CreateDirectory(tempDir);
             try
             {
+                return TryAllocateUidsOnImmediateTransaction(tempDir);
+            }
+            finally
+            {
+                try
+                {
+                    Directory.Delete(tempDir, true);
+                }
+                catch
+                {
+                }
+            }
+        }
+
+        // SQLite 报告的连接路径会解析符号链接；经链接目录打开的库也必须命中外层事务。
+        private static void VerifyUidAllocationThroughSymlinkedDirectory(ref int failures)
+        {
+            const string name =
+                "avatar/creature UID allocate reuses the ambient IMMEDIATE connection through a symlinked directory";
+            var rootDir = Path.Combine(
+                Path.GetTempPath(),
+                "a21-mailbox-uid-link-" + Guid.NewGuid().ToString("N"));
+            var realDir = Path.Combine(rootDir, "real");
+            var linkDir = Path.Combine(rootDir, "link");
+            Directory.CreateDirectory(realDir);
+            try
+            {
+                try
+                {
+                    Directory.CreateSymbolicLink(linkDir, realDir);
+                }
+                catch (Exception ex) when (
+                    ex is IOException
+                    || ex is UnauthorizedAccessException
+                    || ex is PlatformNotSupportedException)
+                {
+                    Console.WriteLine($"[SKIP] {name}: {ex.Message}");
+                    return;
+                }
+
+                Check(
+                    name,
+                    TryAllocateUidsOnImmediateTransaction(linkDir),
+                    ref failures);
+            }
+            finally
+            {
+                try
+                {
+                    Directory.Delete(rootDir, true);
+                }
+                catch
+                {
+                }
+            }
+        }
+
+        private static bool TryAllocateUidsOnImmediateTransaction(string databaseDirectory)
+        {
+            try
+            {
                 var database = new GameDatabase(
-                    Path.Combine(tempDir, "inventory.db"),
+                    Path.Combine(databaseDirectory, "inventory.db"),
                     Path.Combine(AppContext.BaseDirectory, "Sqlite", "item_schema.sql"));
                 using (var connection = database.OpenConnection())
                 using (var transaction = connection.BeginTransaction(deferred: false))
@@ -530,16 +592,6 @@ WHEN NEW.list_type = 38 BEGIN SELECT RAISE(ABORT, 'mailbox-medal-selftest'); END
             {
                 Console.WriteLine($"[info] uid ambient allocate failed: {ex.Message}");
                 return false;
-            }
-            finally
-            {
-                try
-                {
-                    Directory.Delete(tempDir, true);
-                }
-                catch
-                {
-                }
             }
         }
 

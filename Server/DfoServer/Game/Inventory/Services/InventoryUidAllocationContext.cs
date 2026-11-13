@@ -53,7 +53,9 @@ namespace DfoServer.Game.Inventory
             if (string.IsNullOrWhiteSpace(database.DatabasePath))
                 return true;
 
-            var currentPath = connection.DataSource;
+            // connection.DataSource 是 SQLite 解析符号链接后的真实路径，与 DatabasePath 不可比；
+            // 按打开连接时连接串里的 Data Source 比较。
+            var currentPath = new SqliteConnectionStringBuilder(connection.ConnectionString).DataSource;
             if (string.IsNullOrWhiteSpace(currentPath))
                 return false;
             if (string.Equals(database.DatabasePath, currentPath, StringComparison.OrdinalIgnoreCase))
