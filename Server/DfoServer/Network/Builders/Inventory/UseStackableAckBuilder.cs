@@ -4,7 +4,7 @@ namespace DfoServer.Network.Builders
 {
     public static class UseStackableAckBuilder
     {
-        private const byte InvalidItemErrorCode = 23;
+        internal const byte InvalidItemErrorCode = 23;
 
         // Practice rooms accept the use action without reporting a persistent inventory mutation.
         public static byte[] BuildPracticeSuccess(byte listType, int instanceValue, int itemCode)

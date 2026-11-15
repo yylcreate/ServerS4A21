@@ -148,6 +148,16 @@ namespace DfoServer.Game.Dungeon
         PersistenceFailed = 3,
     }
 
+    internal enum FatigueRestoreOutcome : byte
+    {
+        // 已成功恢复并持久化。
+        Restored = 0,
+        // 当日已用疲劳低于恢复量（官方规则拒绝），未恢复。
+        Insufficient = 1,
+        // 数据库异常，未恢复；调用方必须按失败处理。
+        PersistenceFailed = 2,
+    }
+
     // 角色疲劳真源：character_daily_counters 的 fatigue_used_micros 日计数器，
     // 以整数微点数保存小数疲劳；旧 fatigue_used 整数计数器仅作首次兼容回填。
     internal sealed class CharacterFatigueService
@@ -410,6 +420,96 @@ namespace DfoServer.Game.Dungeon
                 StoredCounterKey,
                 legacyBase + scaledCost,
                 MaxStoredFatigue);
+        }
+
+        // [add fatigue] 药剂的事务内恢复（与扣道具同一事务提交）。
+        // 读、日切锚点、写回共用同一个冻结时间，杜绝跨 06:00 窗口内
+        // "读按旧日、写按新日"造成的负值；生产入口委托 internal 重载供 SelfTest
+        // 注入确定性边界时间（先例：DailyResetAccountSelfTest）。
+        internal FatigueRestoreOutcome TryRestoreInTransaction(
+            DbConnection conn,
+            DbTransaction tx,
+            int characterId,
+            int restorePoints,
+            out long usedBeforeMicros,
+            out long usedAfterMicros)
+            => TryRestoreInTransaction(
+                (SqliteConnection)conn,
+                (SqliteTransaction)tx,
+                characterId,
+                restorePoints,
+                DateTime.UtcNow,
+                out usedBeforeMicros,
+                out usedAfterMicros);
+
+        internal FatigueRestoreOutcome TryRestoreInTransaction(
+            SqliteConnection conn,
+            SqliteTransaction tx,
+            int characterId,
+            int restorePoints,
+            DateTime utcNow,
+            out long usedBeforeMicros,
+            out long usedAfterMicros)
+        {
+            usedBeforeMicros = 0;
+            usedAfterMicros = 0;
+            if (conn == null || tx == null || characterId <= 0 || restorePoints <= 0)
+                return FatigueRestoreOutcome.PersistenceFailed;
+
+            var restoreMicros = (long)restorePoints * StorageScale;
+            LockCharacter(conn, tx, characterId);
+
+            long stored;
+            try
+            {
+                stored = _dailyReset.GetCounter(
+                    conn,
+                    tx,
+                    characterId,
+                    StoredCounterKey,
+                    period: null,
+                    utcNow: utcNow);
+            }
+            catch (InvalidOperationException)
+            {
+                return FatigueRestoreOutcome.PersistenceFailed;
+            }
+
+            // 与 TryConsumeScaledInTransaction/GetSnapshot 同口径的遗留整数计数回填。
+            var effective = stored;
+            if (stored == 0)
+            {
+                var legacy = _dailyReset.GetCounter(
+                    conn,
+                    tx,
+                    characterId,
+                    CounterKey,
+                    period: null,
+                    utcNow: utcNow);
+                if (legacy > 0 && legacy <= MaxFatigue)
+                    effective = legacy * StorageScale;
+            }
+
+            usedBeforeMicros = Math.Min(effective, MaxStoredFatigue);
+            if (usedBeforeMicros < restoreMicros)
+            {
+                usedAfterMicros = usedBeforeMicros;
+                return FatigueRestoreOutcome.Insufficient;
+            }
+
+            usedAfterMicros = usedBeforeMicros - restoreMicros;
+            if (!_dailyReset.TrySetCounterValue(
+                    conn,
+                    tx,
+                    characterId,
+                    StoredCounterKey,
+                    usedAfterMicros,
+                    utcNow))
+            {
+                return FatigueRestoreOutcome.PersistenceFailed;
+            }
+
+            return FatigueRestoreOutcome.Restored;
         }
 
         private long ScaleCost(int baseCost)
