@@ -2900,10 +2900,38 @@ namespace DfoServer.Network.Handlers.Dungeon
                 return;
             }
 
+            int[] entryFatigueCosts;
+            try
+            {
+                entryFatigueCosts = partyEntryPlans
+                    .Select(plan => _svc.Fatigue.ResolveStartOnlyEntryCost(
+                        plan.Session?.Player?.CharacterId ?? 0,
+                        run.DungeonId))
+                    .ToArray();
+            }
+            catch (Exception ex)
+            {
+                // 疲劳成本解析失败按持久化失败 fail closed：整队回城并拒绝，
+                // 不得伪装成免费入场。
+                FileLogger.Log(
+                    $"[{DungeonSharedServices.ProtocolLogName}] " +
+                    $"SELECT_DUNGEON entry fatigue resolution failed: " +
+                    $"cid={session.Player.CharacterId} " +
+                    $"dungeon={run.DungeonId} error={ex.Message}");
+                RollbackLicensedDungeonEntry(licensedDungeonPlan);
+                await ReturnPreparedPartyRunsToTownAsync(
+                    session,
+                    header.type,
+                    partyEntryPlans,
+                    DungeonAdmissionReject.DungeonUnavailable,
+                    "entry_fatigue_resolution_failed");
+                return;
+            }
             var commitRequests = partyEntryPlans
-                .Select(plan => new DungeonEntryAdmissionCommitRequest(
+                .Select((plan, index) => new DungeonEntryAdmissionCommitRequest(
                     plan.Lease,
-                    plan.Preparation))
+                    plan.Preparation,
+                    entryFatigueCosts[index]))
                 .ToList();
             IReadOnlyList<EntryCostResult> entryCosts;
             try
@@ -2914,11 +2942,26 @@ namespace DfoServer.Network.Handlers.Dungeon
                     || entryCosts.Count != partyEntryPlans.Count)
                 {
                     RollbackLicensedDungeonEntry(licensedDungeonPlan);
+                    var rejection = DungeonAdmissionReject.InvalidSelectionState;
+                    if (entryCosts != null)
+                    {
+                        for (var index = 0;
+                             index < entryCosts.Count && index < partyEntryPlans.Count;
+                             index++)
+                        {
+                            if (entryCosts[index].FailureKind
+                                != EntryCostFailureKind.InsufficientFatigue)
+                                continue;
+                            rejection = DungeonAdmissionReject.InsufficientFatigue(
+                                partyEntryPlans[index].PartySlot);
+                            break;
+                        }
+                    }
                     await ReturnPreparedPartyRunsToTownAsync(
                         session,
                         header.type,
                         partyEntryPlans,
-                        DungeonAdmissionReject.InvalidSelectionState,
+                        rejection,
                         "party_cost_commit_failed");
                     return;
                 }
@@ -2933,6 +2976,23 @@ namespace DfoServer.Network.Handlers.Dungeon
             var entryCost = partyEntryPlans
                 .First(plan => ReferenceEquals(plan.Session, session))
                 .CostResult;
+            for (var fatigueIndex = 0;
+                 fatigueIndex < partyEntryPlans.Count;
+                 fatigueIndex++)
+            {
+                if (entryFatigueCosts[fatigueIndex] <= 0)
+                    continue;
+                FileLogger.Log(
+                    $"[{DungeonSharedServices.ProtocolLogName}] " +
+                    $"SELECT_DUNGEON: entry fatigue consumed " +
+                    $"cid=" +
+                    $"{partyEntryPlans[fatigueIndex].Session?.Player?.CharacterId ?? 0} " +
+                    $"dungeon={run.DungeonId} " +
+                    $"cost={entryFatigueCosts[fatigueIndex]}");
+                await FatigueNotificationSender.SendAsync(
+                    partyEntryPlans[fatigueIndex].Session,
+                    _svc.Fatigue);
+            }
             if (!session.Player.IsCurrentDungeonRun(runIdentity))
             {
                 RollbackLicensedDungeonEntry(licensedDungeonPlan);
@@ -4804,6 +4864,8 @@ namespace DfoServer.Network.Handlers.Dungeon
             {
                 case EntryCostFailureKind.MissingRequiredItem:
                     return DungeonAdmissionReject.MissingRequiredItem(memberSlot);
+                case EntryCostFailureKind.InsufficientFatigue:
+                    return DungeonAdmissionReject.InsufficientFatigue(memberSlot);
                 case EntryCostFailureKind.MissingPrerequisite:
                     return DungeonAdmissionReject.MissingPrerequisite(memberSlot);
                 case EntryCostFailureKind.MissingPermission:

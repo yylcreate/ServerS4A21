@@ -139,7 +139,7 @@ namespace DfoServer.Network.Builders
             {
                 if (SelectCharacterAckBodyBuilder.TryBuild(
                         snapshot,
-                        _database.ConnectionString,
+                        _database,
                         out body))
                     return true;
             }

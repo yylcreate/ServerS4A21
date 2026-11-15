@@ -109,14 +109,18 @@ namespace DfoServer.Game.Dungeon
     {
         internal DungeonEntryCostCommitRequest(
             InventoryLease lease,
-            DungeonEntryCostPlan plan)
+            DungeonEntryCostPlan plan,
+            int fatigueCost = 0)
         {
             Lease = lease;
             Plan = plan;
+            FatigueCost = fatigueCost;
         }
 
         internal InventoryLease Lease { get; }
         internal DungeonEntryCostPlan Plan { get; }
+        // 仅进本扣副本的入场疲劳成本（每角色各自持久化，同一事务提交）。
+        internal int FatigueCost { get; }
     }
 
     internal sealed class DungeonEntryCostService
@@ -281,7 +285,8 @@ namespace DfoServer.Game.Dungeon
                         consumedCounts.Keys);
                 }
 
-                if (states.All(state => state.ConsumedCounts.Count == 0))
+                if (states.All(state => state.ConsumedCounts.Count == 0
+                        && state.Request.FatigueCost <= 0))
                 {
                     foreach (var state in states)
                         state.Result.Success = true;
@@ -308,6 +313,10 @@ namespace DfoServer.Game.Dungeon
                     foreach (var state in states)
                     {
                         ApplyGroupCostLocked(state);
+                        ApplyGroupFatigueLocked(
+                            connection,
+                            transaction,
+                            state);
                         FinalizeGroupResult(state);
                     }
                     var committedResults = ProjectGroupResults(source, states);
@@ -344,6 +353,16 @@ namespace DfoServer.Game.Dungeon
                 }
 
                 return true;
+            }
+            catch (InsufficientEntryFatigueException ex)
+            {
+                var failed = states.FirstOrDefault(
+                    state => state.Request.Lease.CharacterId == ex.CharacterId);
+                failed?.Result.Fail(
+                    ex.Message,
+                    EntryCostFailureKind.InsufficientFatigue);
+                results = ProjectGroupResults(source, states);
+                return false;
             }
             catch (Exception ex)
             {
@@ -383,6 +402,17 @@ namespace DfoServer.Game.Dungeon
                     }
                 }
             }
+        }
+
+        private sealed class InsufficientEntryFatigueException : InvalidOperationException
+        {
+            internal InsufficientEntryFatigueException(int characterId, int cost)
+                : base($"entry fatigue consumption failed cid={characterId} cost={cost}")
+            {
+                CharacterId = characterId;
+            }
+
+            internal int CharacterId { get; }
         }
 
         private sealed class GroupCommitState
@@ -440,6 +470,28 @@ namespace DfoServer.Game.Dungeon
                     ItemTemplateId = 0,
                     Count = goldConsume.ConsumedCount,
                 });
+            }
+        }
+
+        private static void ApplyGroupFatigueLocked(
+            System.Data.Common.DbConnection connection,
+            System.Data.Common.DbTransaction transaction,
+            GroupCommitState state)
+        {
+            var fatigueCost = state.Request.FatigueCost;
+            if (fatigueCost <= 0)
+                return;
+            var service = new CharacterFatigueService(
+                state.Request.Lease.Inventory.Database);
+            if (!service.TryConsumeInTransaction(
+                    connection,
+                    transaction,
+                    state.Request.Lease.CharacterId,
+                    fatigueCost))
+            {
+                throw new InsufficientEntryFatigueException(
+                    state.Request.Lease.CharacterId,
+                    fatigueCost);
             }
         }
 
@@ -1054,6 +1106,7 @@ namespace DfoServer.Game.Dungeon
         MissingPermission = 3,
         MissingRequiredItem = 4,
         MissingPrerequisite = 5,
+        InsufficientFatigue = 6,
     }
 
     internal sealed class ItemConsumeUpdate

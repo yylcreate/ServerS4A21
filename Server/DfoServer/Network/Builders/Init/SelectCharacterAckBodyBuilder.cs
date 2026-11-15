@@ -14,13 +14,41 @@ namespace DfoServer.Network.Builders
             return CommonPacketBodyBuilder.BuildCmdError(errorCode);
         }
 
-        public static bool TryBuild(SelectCharacterDataSnapshot snapshot, out byte[] body)
+        public static bool TryBuild(
+            SelectCharacterDataSnapshot snapshot,
+            Infrastructure.IGameDatabase database,
+            out byte[] body)
         {
-            return TryBuild(snapshot, connectionString: null, out body);
+            return TryBuild(snapshot, database, connectionString: null, out body);
+        }
+
+        private static short ReadUsedFatigue(
+            Infrastructure.IGameDatabase database,
+            int characterId)
+        {
+            if (database == null || characterId <= 0)
+                return 0;
+            try
+            {
+                var snapshot =
+                    new Game.Dungeon.CharacterFatigueService(database)
+                        .GetSnapshot(characterId);
+                return (short)Math.Ceiling(Math.Min(
+                    snapshot.Used,
+                    (decimal)Game.Dungeon.CharacterFatigueService.MaxFatigue));
+            }
+            catch (Exception ex)
+            {
+                FileLogger.Log(
+                    "[SelectCharacterAck] used fatigue read failed: " +
+                    $"cid={characterId} error={ex.Message}");
+                return 0;
+            }
         }
 
         internal static bool TryBuild(
             SelectCharacterDataSnapshot snapshot,
+            Infrastructure.IGameDatabase database,
             string connectionString,
             out byte[] body)
         {
@@ -50,13 +78,18 @@ namespace DfoServer.Network.Builders
             // [9] u16 uniqueId
             writer.WriteInt16(record != null ? (short)record.CharacterId : (short)initSnap.AckUniqueId);
 
-            // [11] i16 totalFatigue
-            writer.WriteInt16(0);
+            // 0136A187 的疲劳 UI 用 max 减去 019DDB80 写入的已用值；
+            // 019DDB80 的输入来自 ACK [11]，不能只更新 [15]。
+            var usedFatigue = ReadUsedFatigue(
+                database ?? Infrastructure.GameDatabase.CreateDefault(),
+                record.CharacterId);
+            writer.WriteInt16(usedFatigue);
 
-            writer.WriteInt16(188);
+            writer.WriteInt16(Game.Dungeon.CharacterFatigueService.MaxFatigue);
 
-            // [15] i16 usedFatigue
-            writer.WriteInt16(0);
+            // [15] i16 usedFatigue — 微点真源向上取整到整数协议字段；
+            // 读取失败保留 0 并记录日志，不阻断进号（准入检查在读图时 fail closed）。
+            writer.WriteInt16(usedFatigue);
 
             // [17] u8 premiumCount + N × (u8 type + u8[8] endTime)
             var premiums = initSnap.AckPremiums;

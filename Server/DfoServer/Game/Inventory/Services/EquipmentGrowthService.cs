@@ -58,7 +58,7 @@ namespace DfoServer.Game.Inventory
                 progress = ushort.MaxValue;
 
             core.TailUnknown0 = (ushort)progress;
-            // 蓄能值对应角色疲劳消耗，当前没有疲劳值接入点，保持 0。
+            // 疲劳真源已存在，但蓄能值联动尚未接入，保持 0。
             // 不能用进度折算：两者在协议和玩法上都是独立字段。
             core.TailUnknown1 = 0;
         }
