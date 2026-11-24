@@ -302,6 +302,47 @@ WHERE character_daily_counters.period = @period
             }
         }
 
+        // 事务内绝对值写：先按调用方冻结的 utcNow 收敛锚点（含跨日归零），再落绝对值。
+        // 供疲劳恢复等"读-算-写"必须共用同一时间口径的调用方使用；period 固定为日计数。
+        internal bool TrySetCounterValue(
+            SqliteConnection conn,
+            SqliteTransaction tx,
+            int characterId,
+            string key,
+            long value,
+            DateTime utcNow)
+        {
+            if (conn == null
+                || tx == null
+                || characterId <= 0
+                || string.IsNullOrWhiteSpace(key)
+                || value < 0)
+            {
+                return false;
+            }
+
+            if (EnsureRowAndRollover(conn, tx, characterId, utcNow)
+                    == DailyResetAnchorStatus.Stale)
+            {
+                return false;
+            }
+
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.Transaction = tx;
+                cmd.CommandText = @"
+INSERT INTO character_daily_counters (character_id, counter_key, period, value)
+VALUES (@cid, @key, @day, @value)
+ON CONFLICT (character_id, counter_key) DO UPDATE SET value = @value;";
+                cmd.Parameters.AddWithValue("@cid", characterId);
+                cmd.Parameters.AddWithValue("@key", key);
+                cmd.Parameters.AddWithValue("@day", PeriodDay);
+                cmd.Parameters.AddWithValue("@value", value);
+                cmd.ExecuteNonQuery();
+                return true;
+            }
+        }
+
         public void AddCounter(SqliteConnection conn, SqliteTransaction tx, int characterId, string key, int delta, string period = PeriodDay)
         {
             ValidatePeriod(period);

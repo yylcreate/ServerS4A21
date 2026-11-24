@@ -435,6 +435,42 @@ namespace DfoServer.Network.Handlers.Dungeon
             return result;
         }
 
+        private async Task ChargeRoomEntryFatigue(
+            EnhancedClientSession session,
+            DungeonRun run)
+        {
+            var characterId = session?.Player?.CharacterId ?? 0;
+            if (characterId <= 0 || run == null)
+                return;
+            try
+            {
+                var outcome = _svc.Fatigue.TryChargeRoomEntry(
+                    characterId,
+                    run.DungeonId,
+                    roomEntryTransitioned: true);
+                if (outcome == FatigueConsumeOutcome.Consumed)
+                {
+                    FileLogger.Log(
+                        $"[DungeonFatigue] room entry charged: " +
+                        $"cid={characterId} dungeon={run.DungeonId} " +
+                        $"room=({run.RoomKey.X},{run.RoomKey.Y})");
+                    await FatigueNotificationSender.SendAsync(session, _svc.Fatigue);
+                    return;
+                }
+                if (outcome == FatigueConsumeOutcome.Free)
+                    return;
+                FileLogger.Log(
+                    $"[DungeonFatigue] room entry charge not applied: " +
+                    $"cid={characterId} dungeon={run.DungeonId} outcome={outcome}");
+            }
+            catch (Exception ex)
+            {
+                FileLogger.Log(
+                    $"[DungeonFatigue] room entry charge failed: " +
+                    $"cid={characterId} dungeon={run.DungeonId} error={ex.Message}");
+            }
+        }
+
         internal Task<DungeonParticipantRoomIdentity?> SendStartMapAsync(
             EnhancedClientSession session,
             int nextX,
@@ -523,6 +559,7 @@ namespace DfoServer.Network.Handlers.Dungeon
             byte[] startMapBody;
             List<KeyValuePair<int, int>> hellPartyMonsterInfoAfterStartMap = null;
             var isFirstRunStartMap = false;
+            var chargeFatigueOnEntry = false;
             var sentMapId = maze.Index;
             var sentMapX = maze.X;
             var sentMapY = maze.Y;
@@ -696,7 +733,7 @@ namespace DfoServer.Network.Handlers.Dungeon
                     Lcg = lcg,
                     ParticipantDropLcg = participantDropLcg,
                 };
-                roomState.TryActivate();
+                chargeFatigueOnEntry = roomState.TryActivate();
                 if (instanceRoom.State == DungeonRoomState.Cleared)
                     roomState.TryClear();
                 run.RoomStates[roomKey] = roomState;
@@ -941,6 +978,8 @@ namespace DfoServer.Network.Handlers.Dungeon
             {
                 return null;
             }
+            if (chargeFatigueOnEntry)
+                await ChargeRoomEntryFatigue(session, run);
             if (TowerOfDespairApcInfoBuilder.TryBuild(
                 run.DungeonId,
                 session.Player,

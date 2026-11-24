@@ -160,6 +160,19 @@ namespace DfoServer.Network.Handlers
                 return;
             }
 
+            // [add fatigue] 药剂走 0x2C 动作布局包（19B，偏移 7=动作号 0x3A 而非物品 ID），
+            // 普通解析因 ID 失配必拒；命中后在同事务内消费并恢复疲劳。
+            if (await TryHandleFatiguePotionUseAsync(
+                    session,
+                    header,
+                    cid,
+                    listType,
+                    instanceValue,
+                    body))
+            {
+                return;
+            }
+
             if (await TryRejectUsableCountLimitExceededAsync(
                     session,
                     header,
@@ -464,6 +477,161 @@ namespace DfoServer.Network.Handlers
                 $"added={result.AddedEnterCount} remaining={result.RemainingCount} " +
                 $"extra={result.ExtraCount}");
             return true;
+        }
+
+        // [add fatigue] 药剂：客户端发 0x2C + 19 字节动作布局（偏移 7=动作号 0x3A）。
+        // 槽位取真实物品；过期/每日限用/疲劳不足由提交事务体顺序裁决
+        //（PrepareUse → TryRecordUseIfLimited → afterUse 恢复），失败整体回滚。
+        private async Task<bool> TryHandleFatiguePotionUseAsync(
+            EnhancedClientSession session,
+            GamePacketHeader header,
+            int characterId,
+            InventoryListType listType,
+            int instanceValue,
+            byte[] body)
+        {
+            if (!FatiguePotionActionRequestParser.TryParse(body, out var request)
+                || !TryGetOwnedInventoryLease(session, characterId, out var lease))
+            {
+                return false;
+            }
+
+            FatiguePotionUseDefinition definition;
+            lock (lease.SyncRoot)
+            {
+                var sourceItemId = lease.Inventory.GetItem(listType, request.SlotIndex)?.ItemId ?? 0;
+                if (!FatiguePotionDefinition.TryResolve(sourceItemId, out definition))
+                    return false;
+            }
+
+            var fatigue = new CharacterFatigueService(lease.Inventory.Database);
+            FatigueRestoreOutcome? restoreOutcome = null;
+            long usedBeforeMicros = 0;
+            long usedAfterMicros = 0;
+            var stackableUseResult = InventoryDeleteCommitService.TryCommitStackableUseDetailed(
+                lease,
+                listType,
+                request.SlotIndex,
+                definition.ItemTemplateId,
+                afterUse: (connection, transaction, mutation) =>
+                {
+                    var outcome = fatigue.TryRestoreInTransaction(
+                        connection,
+                        transaction,
+                        characterId,
+                        definition.RestorePoints,
+                        out usedBeforeMicros,
+                        out usedAfterMicros);
+                    restoreOutcome = outcome;
+                    return outcome == FatigueRestoreOutcome.Restored;
+                });
+
+            if (stackableUseResult?.SourceExpiredDeleted == true)
+            {
+                await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(
+                    0x01,
+                    header.type,
+                    UseStackableAckBuilder.BuildError(
+                        (byte)listType,
+                        instanceValue,
+                        definition.ItemTemplateId)));
+                await _refresh.SendUpdateItemList(session, listType, request.SlotIndex);
+                FileLogger.Log(
+                    $"[{ProtocolName}] USE_STACKABLE fatigue-potion: expired source removed " +
+                    $"cid={characterId} item=0x{definition.ItemTemplateId:X8} " +
+                    $"listType={listType} slot={request.SlotIndex}");
+                return true;
+            }
+
+            var used = stackableUseResult != null && stackableUseResult.Used;
+            if (!used)
+            {
+                // 失败映射不得再做数据库访问：提交失败可能源于连接/计数器异常，
+                // 此处任何再查询都可能抛出并吞掉错误 ACK。
+                var reason = restoreOutcome == FatigueRestoreOutcome.Insufficient
+                    ? "insufficient-used"
+                    : restoreOutcome != null
+                        ? "restore-failed"
+                        : "failed to consume";
+
+                await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(
+                    0x01,
+                    header.type,
+                    BuildFatiguePotionAckBody(
+                        restoreOutcome,
+                        used,
+                        null,
+                        listType,
+                        request.SlotIndex,
+                        instanceValue,
+                        definition.ItemTemplateId)));
+                FileLogger.Log(
+                    $"[{ProtocolName}] USE_STACKABLE fatigue-potion: {reason} " +
+                    $"cid={characterId} item=0x{definition.ItemTemplateId:X8} " +
+                    $"restore={definition.RestorePoints} listType={listType} slot={request.SlotIndex}");
+                return true;
+            }
+
+            var mutation = stackableUseResult.Mutation;
+            await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(
+                0x01,
+                header.type,
+                BuildFatiguePotionAckBody(
+                    restoreOutcome,
+                    used,
+                    mutation,
+                    listType,
+                    request.SlotIndex,
+                    instanceValue,
+                    definition.ItemTemplateId)));
+            await Dungeon.FatigueNotificationSender.SendAsync(session, fatigue);
+            if (mutation.UsableCountState != null)
+                await SendUsableCountLimitUpdateAsync(session, mutation.UsableCountState);
+            session.GameSession?.QuestManager
+                ?.RecalibrateItemSeekingQuestProgressAfterInventoryMutationWithoutNotification(
+                    lease,
+                    mutation);
+            FileLogger.Log(
+                $"[{ProtocolName}] USE_STACKABLE fatigue-potion: used " +
+                $"cid={characterId} item=0x{definition.ItemTemplateId:X8} " +
+                $"restore={definition.RestorePoints} " +
+                $"usedBefore={usedBeforeMicros / (decimal)CharacterFatigueService.StorageScale} " +
+                $"usedAfter={usedAfterMicros / (decimal)CharacterFatigueService.StorageScale} " +
+                $"slot={request.SlotIndex} remaining={mutation.RemainingStackCount}");
+            return true;
+        }
+
+        // 疲劳药剂使用的 ACK 字节决策（供 SelfTest 直接钉住）：
+        // 成功回 Mutation.InstanceValue（扣除后剩余数量；动作包 reserved=0 不得回显 0）；
+        // 疲劳不足回 0x5F（客户端弹官方文案），其余失败回默认错误码。
+        internal static byte[] BuildFatiguePotionAckBody(
+            FatigueRestoreOutcome? restoreOutcome,
+            bool used,
+            InventoryMutationResult mutation,
+            InventoryListType listType,
+            short slotIndex,
+            int instanceValue,
+            int itemTemplateId)
+        {
+            if (used && mutation != null)
+            {
+                return UseStackableAckBuilder.BuildSuccess(
+                    slotIndex,
+                    (byte)listType,
+                    mutation.InstanceValue,
+                    itemTemplateId);
+            }
+
+            return restoreOutcome == FatigueRestoreOutcome.Insufficient
+                ? UseStackableAckBuilder.BuildError(
+                    FatiguePotionDefinition.ErrorInsufficientUsed,
+                    (byte)listType,
+                    instanceValue,
+                    itemTemplateId)
+                : UseStackableAckBuilder.BuildError(
+                    (byte)listType,
+                    instanceValue,
+                    itemTemplateId);
         }
 
         private async Task<bool> TryRejectExpiredStackableSourceAsync(

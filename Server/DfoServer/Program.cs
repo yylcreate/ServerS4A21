@@ -83,6 +83,8 @@ namespace DfoServer
             ("--selftest-boss-tower", SelfTests.BossTowerSelfTest.Run),
             ("--selftest-a21-special-dungeon-protocol", SelfTests.A21SpecialDungeonProtocolSelfTest.Run),
             ("--selftest-dungeon-entry-limit", SelfTests.DungeonEntryLimitServiceSelfTest.Run),
+            ("--selftest-dungeon-fatigue", SelfTests.DungeonFatigueSelfTest.Run),
+            ("--selftest-fatigue-potion", SelfTests.FatiguePotionSelfTest.Run),
             ("--selftest-dimension-enter-ticket", SelfTests.DimensionDungeonEnterTicketSelfTest.Run),
             ("--selftest-item-state", SelfTests.ItemStateSelfTest.Run),
             ("--selftest-unlimited-stackable-use", SelfTests.UnlimitedStackableUseSelfTest.Run),

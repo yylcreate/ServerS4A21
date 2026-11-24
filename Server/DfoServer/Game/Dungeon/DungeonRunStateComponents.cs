@@ -223,6 +223,10 @@ namespace DfoServer.Game.Dungeon
         internal bool IsWaitingDeathRespawn { get; set; }
         internal DateTime DeathRespawnAvailableAt { get; set; } = DateTime.MinValue;
         internal bool LicensedDungeonReviveUsed { get; set; }
+
+        // 大会死亡账本属于共享 Instance；疲劳消费去重属于每名玩家的 run。
+        internal HashSet<byte> ChargedTournamentFatigueRounds { get; } =
+            new HashSet<byte>();
     }
 
     internal sealed class DungeonRunSettlementData

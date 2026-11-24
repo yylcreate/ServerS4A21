@@ -62,6 +62,7 @@ namespace DfoServer.Network.Builders
         {
             var t = record.Subtype0Tail ?? new UserInfoMinimumTailSnapshot();
             ApplyOnlineInventoryTailFields(record.CharacterId, t);
+            ApplyFatigueTailFields(record.CharacterId, t);
 
             writer.WriteUInt32(t.CloneTitleItemId);
             writer.WriteByte(t.Forging); // 锻造
@@ -100,6 +101,34 @@ namespace DfoServer.Network.Builders
                 new Noti2InventoryProjectionBuilder().ApplySubtype0TailDynamicFields(lease.Inventory, tail);
         }
 
+        private static void ApplyFatigueTailFields(
+            int characterId,
+            UserInfoMinimumTailSnapshot tail)
+        {
+            if (characterId <= 0 || tail == null)
+                return;
+            try
+            {
+                var snapshot = new Game.Dungeon.CharacterFatigueService(
+                        GameDatabase.CreateDefault())
+                    .GetSnapshot(characterId);
+                ProjectFatigueTailFields(tail, snapshot);
+            }
+            catch (Exception ex)
+            {
+                FileLogger.Log(
+                    $"[UserInfo] fatigue projection failed cid={characterId}: {ex.Message}");
+            }
+        }
+
+        internal static void ProjectFatigueTailFields(
+            UserInfoMinimumTailSnapshot tail,
+            Game.Dungeon.CharacterFatigueSnapshot snapshot)
+        {
+            var used = (ushort)Math.Ceiling(snapshot.Used);
+            tail.FatigueUpdate = used;
+        }
+
         // A21 无工会 64B 尾：ExpertJobType/Exp 在 +23/+24；MoodValue 在 +59。
         // ProgressA/ProgressB（名誉等级/经验）在 +39/+43：偏移按旧 WriteTail 字段序
         // （HardcoreDeathCount(u16)@37-38 之后依次 ProgressA(u32)、ProgressB(u32)、
@@ -115,6 +144,7 @@ namespace DfoServer.Network.Builders
         // 与 64B blob 锚点的恒定 -18 平移推算（ExpertJobType 41→23、ProgressA 57→39、
         // UserStateBits 65→47、WriteByte(100) 70→52 均吻合），旧 79→61。
         internal const int A21AfterAliveSkillTreeIndexOffset = 61;
+        internal const int A21AfterAliveFatigueUpdateOffset = 53;
 
         private static readonly byte[] A21AfterAliveNoGuild =
         {
@@ -159,6 +189,12 @@ namespace DfoServer.Network.Builders
                 A21AfterAliveMoodValueOffset,
                 sizeof(ushort));
             body[A21AfterAliveSkillTreeIndexOffset] = tail.SkillTreeIndex;
+            Buffer.BlockCopy(
+                BitConverter.GetBytes(tail.FatigueUpdate),
+                0,
+                body,
+                A21AfterAliveFatigueUpdateOffset,
+                sizeof(ushort));
             if (tail.GuildId == 0)
                 return body;
 

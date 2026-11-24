@@ -91,8 +91,11 @@ namespace DfoServer.Game.Inventory
             InventoryLease lease,
             InventoryListType listType,
             short slotIndex,
-            int expectedItemId)
-        {
+            int expectedItemId,
+            Func<System.Data.Common.DbConnection,
+                System.Data.Common.DbTransaction,
+                InventoryMutationResult,
+                bool> afterUse = null)        {
             if (lease?.Inventory == null)
                 return null;
 
@@ -159,6 +162,13 @@ namespace DfoServer.Game.Inventory
                     InventoryItemLifecycleService.ApplyUseSuccess(
                         lease.Inventory,
                         lifecyclePlan);
+
+                    // 事务内后置钩子（如疲劳恢复）：失败即整体回滚，道具不扣。
+                    if (afterUse != null
+                        && !afterUse(connection, transaction, committedMutation))
+                    {
+                        return false;
+                    }
 
                     if (committedMutation != null)
                         committedMutation.UsableCountState = usableCountState;

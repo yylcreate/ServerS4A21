@@ -127,6 +127,7 @@ namespace DfoServer.Network.Handlers.Dungeon
             if (transition.Disposition
                 == TournamentActorDeathDisposition.Duplicate)
             {
+                await ChargeCompletedRoundsFatigue(session, run, transition);
                 return transition;
             }
             if (!transition.Accepted)
@@ -147,6 +148,7 @@ namespace DfoServer.Network.Handlers.Dungeon
                     $"next={transition.CurrentRound} " +
                     $"complete={transition.TournamentCompleted}");
             }
+            await ChargeCompletedRoundsFatigue(session, run, transition);
 
             if (transition.TournamentCompleted)
                 await EnsureParticipantRewardsAsync(
@@ -154,6 +156,70 @@ namespace DfoServer.Network.Handlers.Dungeon
                     run,
                     forceProjection: false);
             return transition;
+        }
+
+        private async Task ChargeCompletedRoundsFatigue(
+            EnhancedClientSession session,
+            DungeonRun run,
+            TournamentActorDeathTransition transition)
+        {
+            var latestCompletedRound = transition.RoundCompleted
+                ? transition.CompletedRound
+                : _application.IsTournamentChampion(run)
+                    ? (byte)4
+                    : (byte)Math.Max(0, transition.CurrentRound - 1);
+            for (byte round = 1; round <= latestCompletedRound; round++)
+                await ChargeRoundFatigue(session, run, round);
+        }
+
+        // 共享 death-fact 账本只裁决轮次事实；每名玩家的 run 另做轮次消费去重。
+        private async Task ChargeRoundFatigue(
+            EnhancedClientSession session,
+            DungeonRun run,
+            byte completedRound)
+        {
+            var characterId = session?.Player?.CharacterId ?? 0;
+            if (characterId <= 0 || run == null)
+                return;
+            lock (run.SyncRoot)
+            {
+                if (!run.Combat.ChargedTournamentFatigueRounds.Add(completedRound))
+                    return;
+            }
+            try
+            {
+                var outcome = _services.Fatigue.TryChargeTournamentRound(
+                    characterId,
+                    run.DungeonId);
+                if (outcome == FatigueConsumeOutcome.Consumed)
+                {
+                    FileLogger.Log(
+                        $"[DungeonFatigue] tournament round charged: " +
+                        $"cid={characterId} dungeon={run.DungeonId} round={completedRound}");
+                    await FatigueNotificationSender.SendAsync(session, _services.Fatigue);
+                    return;
+                }
+                if (outcome == FatigueConsumeOutcome.Free)
+                    return;
+                FileLogger.Log(
+                    $"[DungeonFatigue] tournament round charge not applied: " +
+                    $"cid={characterId} dungeon={run.DungeonId} " +
+                    $"round={completedRound} outcome={outcome}");
+                if (outcome == FatigueConsumeOutcome.PersistenceFailed)
+                {
+                    lock (run.SyncRoot)
+                        run.Combat.ChargedTournamentFatigueRounds.Remove(completedRound);
+                }
+            }
+            catch (Exception ex)
+            {
+                lock (run.SyncRoot)
+                    run.Combat.ChargedTournamentFatigueRounds.Remove(completedRound);
+                FileLogger.Log(
+                    $"[DungeonFatigue] tournament round charge failed: " +
+                    $"cid={characterId} dungeon={run.DungeonId} " +
+                    $"round={completedRound} error={ex.Message}");
+            }
         }
 
         internal async Task EnsureParticipantRewardsAsync(

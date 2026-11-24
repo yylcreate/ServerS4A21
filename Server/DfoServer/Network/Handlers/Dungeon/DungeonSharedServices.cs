@@ -57,6 +57,7 @@ namespace DfoServer.Network.Handlers.Dungeon
         internal Game.Premium.DevilContractUsagePolicy DevilContracts { get; }
         internal Game.Dungeon.DungeonEntryAdmissionApplicationService
             EntryAdmission { get; }
+        internal Game.Dungeon.CharacterFatigueService Fatigue { get; }
         internal Game.Dungeon.DungeonEntryLimitService EntryLimits { get; }
         internal Game.Guilds.GuildDungeonService GuildDungeons { get; }
         internal DungeonAdmissionRejectSender AdmissionRejects { get; }
@@ -186,9 +187,11 @@ namespace DfoServer.Network.Handlers.Dungeon
                 ProgressNotifications,
                 Sessions);
             var entryCost = new Game.Dungeon.DungeonEntryCostService(Database);
+            Fatigue = new Game.Dungeon.CharacterFatigueService(Database, dailyReset);
             EntryAdmission =
                 new Game.Dungeon.DungeonEntryAdmissionApplicationService(
-                    entryCost);
+                    entryCost,
+                    Fatigue);
             EntryLimits = new Game.Dungeon.DungeonEntryLimitService(Database);
             Tournaments =
                 new Game.Dungeon.Tournament

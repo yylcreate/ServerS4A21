@@ -13,12 +13,16 @@ namespace DfoServer.Game.Dungeon
         internal const int GorgeousChallengeGoldCost = 190000;
 
         private readonly DungeonEntryCostService _costs;
+        private readonly CharacterFatigueService _fatigue;
 
         internal DungeonEntryAdmissionApplicationService(
-            DungeonEntryCostService costs)
+            DungeonEntryCostService costs,
+            CharacterFatigueService fatigue)
         {
             _costs = costs
                 ?? throw new ArgumentNullException(nameof(costs));
+            _fatigue = fatigue
+                ?? throw new ArgumentNullException(nameof(fatigue));
         }
 
         internal bool CheckHellQuestRequirement(
@@ -122,6 +126,18 @@ namespace DfoServer.Game.Dungeon
             if (!validation.Success)
                 return false;
 
+            if (!_fatigue.TryValidateAdmission(
+                    lease.CharacterId,
+                    run.DungeonId,
+                    out var fatigueFailureKind,
+                    out var fatigueFailureReason))
+            {
+                validation = new EntryCostResult().Fail(
+                    fatigueFailureReason,
+                    fatigueFailureKind);
+                return false;
+            }
+
             preparation = candidate;
             return true;
         }
@@ -155,7 +171,8 @@ namespace DfoServer.Game.Dungeon
                     return false;
                 requests[index] = new DungeonEntryCostCommitRequest(
                     entry.Lease,
-                    entry.Preparation.CostPlan);
+                    entry.Preparation.CostPlan,
+                    entry.FatigueCost);
             }
             return _costs.TryCommitPlans(requests, out results);
         }
@@ -436,14 +453,18 @@ namespace DfoServer.Game.Dungeon
     {
         internal DungeonEntryAdmissionCommitRequest(
             InventoryLease lease,
-            DungeonEntryAdmissionPreparation preparation)
+            DungeonEntryAdmissionPreparation preparation,
+            int fatigueCost = 0)
         {
             Lease = lease;
             Preparation = preparation;
+            FatigueCost = fatigueCost;
         }
 
         internal InventoryLease Lease { get; }
         internal DungeonEntryAdmissionPreparation Preparation { get; }
+        // 仅进本扣副本的入场疲劳成本；普通按房/大会/免费副本为 0。
+        internal int FatigueCost { get; }
     }
 
     internal sealed class HellPartyEntryPreparation
