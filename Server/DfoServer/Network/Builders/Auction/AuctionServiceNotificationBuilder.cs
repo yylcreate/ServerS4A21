@@ -1,50 +1,50 @@
-using System;
 using DfoServer.Network;
 
 namespace DfoServer.Network.Builders.Auction
 {
     public static class AuctionServiceNotificationBuilder
     {
-        // Client handler 0x01189FB0 reads `u8 serviceType, u8 state`:
-        //   cmp byte[ebp-1], 1
-        //   jne 0x118A02F   -> the "service unavailable" branch (dstr 0xa490/0xa491)
-        // So serviceType MUST be 1 for the auction / gold-consignment window to
-        // open; the second byte selects the available-state flavour.
-        private const byte ServiceType0 = 0x00;
-        private const byte ServiceType1 = 0x01;
+        // Client handler 0x01189FB0 reads `u8 serviceType, u8 state` and then forks on
+        // serviceType. The two branches write DIFFERENT globals, so one notice alone
+        // cannot open both windows:
+        //
+        //   serviceType != 1 -> 0x0118A033  call 0x02335A10(state)
+        //                       0x02335A16  mov byte [0x3B71101], al
+        //   serviceType == 1 -> 0x0118A025  mov byte [0x3A42F85], dl
+        //
+        // Those two globals are what the window entry points read:
+        //   ordinary auction  0x02345AD1  cmp byte [0x3B71101], 0 / je -> refuse to open
+        //   gold consignment  0x01455BE3  cmp byte [0x3A42F85], 0 / jne -> continue
+        //
+        // Each global has exactly ONE writer (verified by scanning the image for
+        // dword references), and it is the branch above. A missing notice is therefore
+        // indistinguishable from "service closed": the window never opens at all.
+        // Emitting only {1, state} left 0x3B71101 at its initial 0, which broke the
+        // ordinary auction window outright.
+        private const byte ServiceTypeAuction = 0x00;
+        private const byte ServiceTypeConsignment = 0x01;
         private const byte OpenState = 0x01;
         private const byte ClosedState = 0x00;
 
         /// <summary>
-        /// Whether gold consignment (金币寄售) is exposed. Deliberately a separate
-        /// switch from AUCTION_ENABLED: consignment is its own feature, not a
-        /// sub-feature of the ordinary gold auction.
-        /// </summary>
-        internal static bool GoldConsignEnabled =>
-            Environment.GetEnvironmentVariable("GOLD_CONSIGN_ENABLED") == "1";
-
-        /// <summary>
         /// Builds the service-state notifications sent on character select.
-        /// <paramref name="enabled"/> controls only the state byte; serviceType 1
-        /// is always emitted because the client requires it to leave the
-        /// "service closed" branch.
+        ///
+        /// BOTH notices are always returned: the client keeps one availability global
+        /// per feature and only the matching serviceType ever writes it, so omitting
+        /// either packet silently closes that window.
+        ///
+        /// Gold consignment has no operator switch and is always advertised open.
+        /// <paramref name="auctionEnabled"/> is the ordinary auction's runtime entry
+        /// state, which is true unless the PVF catalog genuinely failed to load, so
+        /// that a broken catalog still tells the client the truth instead of
+        /// pretending the window works.
         /// </summary>
-        public static byte[][] BuildPackets(bool enabled)
-        {
-            var state = enabled ? OpenState : ClosedState;
-            return new[]
-            {
-                BuildPacket(ServiceType1, state)
-            };
-        }
-
-        /// <summary>Legacy open-only helper kept for callers that expect both types.</summary>
-        public static byte[][] BuildOpenPackets()
+        public static byte[][] BuildPackets(bool auctionEnabled)
         {
             return new[]
             {
-                BuildPacket(ServiceType0, OpenState),
-                BuildPacket(ServiceType1, OpenState)
+                BuildPacket(ServiceTypeAuction, auctionEnabled ? OpenState : ClosedState),
+                BuildPacket(ServiceTypeConsignment, OpenState)
             };
         }
 

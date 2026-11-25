@@ -97,8 +97,23 @@ namespace DfoServer.SelfTests
                     .SequenceEqual(new byte[] { 1, 0, 0x12, 0x34, 0x56, 0x78, 0, 0 }));
                 Check("empty listings exact body", AuctionOrdinaryBodyBuilder.EmptyListingsSuccess().SequenceEqual(new byte[] { 1, 0, 0 }));
                 Check("empty bids exact body", AuctionOrdinaryBodyBuilder.EmptyBidsSuccess().SequenceEqual(new byte[] { 1, 0, 0, 0 }));
-                Check("ordinary service bodies", AuctionOrdinaryBodyBuilder.Service(true).SequenceEqual(new byte[] { 0, 1 })
-                    && AuctionOrdinaryBodyBuilder.Service(false).SequenceEqual(new byte[] { 0, 0 }));
+                // 0x01189FB0 forks on serviceType and writes a DIFFERENT availability
+                // global per branch, so both notices are mandatory: omitting the
+                // serviceType-0 one leaves byte[0x3B71101] at 0 and the ordinary
+                // auction window 0x023458A0 refuses to open. Consignment has no
+                // operator switch, so its state is always open.
+                var serviceBoth = AuctionServiceNotificationBuilder.BuildPackets(true);
+                var serviceClosed = AuctionServiceNotificationBuilder.BuildPackets(false);
+                Check("service notice count covers both windows", serviceBoth.Length == 2
+                    && serviceClosed.Length == 2);
+                Check("service notices carry the two serviceTypes in order",
+                    serviceBoth[0][15] == 0 && serviceBoth[1][15] == 1);
+                Check("service notice opens both windows on a healthy catalog",
+                    serviceBoth[0][16] == 1 && serviceBoth[1][16] == 1);
+                Check("failed catalog closes the auction window but not consignment",
+                    serviceClosed[0][16] == 0 && serviceClosed[1][16] == 1);
+                Check("service notice envelope length", serviceBoth[0].Length == 17
+                    && BinaryPrimitives.ReadUInt16LittleEndian(serviceBoth[0].AsSpan(3)) == 17);
                 uint[] valuesA = { 1, 2, 3, 4, 5, uint.MaxValue };
                 uint[] valuesB = { 6, 7, 8, 9, 10, 0x80000000 };
                 var average = AuctionOrdinaryBodyBuilder.AveragePriceSuccess(0x12345678, 0xFEDCBA98, valuesA, valuesB);
