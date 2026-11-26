@@ -32,6 +32,9 @@ namespace DfoServer.Network
         internal const int ChannelListAddressSize = 16;
         internal const int ChannelListEntrySize = 48;
 
+        // channel_info.etc 频道行第 4 列的攻坚组名。
+        internal const string RaidChannelGroupToken = "[raid]";
+
         private enum PACKETS : int
         {
             CS_ASK_CHANNEL_INFO = 0x1,
@@ -204,7 +207,7 @@ namespace DfoServer.Network
                             if (channelId < byte.MinValue ||
                                 channelId > byte.MaxValue ||
                                 (!includeFreeDuel &&
-                                 GameNetworkConfig.IsFreeDuelChannel(channelId)) ||
+                                 GameNetworkConfig.IsPvpChannel(channelId)) ||
                                 !channelIds.Add(channelId))
                             {
                                 continue;
@@ -250,12 +253,15 @@ namespace DfoServer.Network
             var scriptText = File.Exists(ServerPaths.ChannelInfoFilePath)
                 ? File.ReadAllText(ServerPaths.ChannelInfoFilePath, Encoding.UTF8)
                 : null;
-            var channelIdsFromScript =
-                scriptText != null ? ParseScriptChannelIds(scriptText) : null;
-            if (channelIdsFromScript != null && channelIdsFromScript.Count > 0)
+            var scriptChannels =
+                scriptText != null ? ParseScriptChannels(scriptText) : null;
+            if (scriptChannels != null && scriptChannels.Count > 0)
             {
-                foreach (var channelId in channelIdsFromScript)
+                foreach (var channel in scriptChannels)
                 {
+                    if (!includeFreeDuel && GameNetworkConfig.IsPvpEnvironment(channel.ChannelType))
+                        continue;
+                    var channelId = channel.ChannelId;
                     if (!channelIds.Add(channelId))
                         continue;
 
@@ -272,7 +278,7 @@ namespace DfoServer.Network
             else
             {
                 foreach (var channel in
-                         GameNetworkConfig.BuildGameChannels(includeFreeDuel: false))
+                         GameNetworkConfig.BuildGameChannels(includeFreeDuel))
                 {
                     if (channelIds.Add(channel.ChannelId))
                         result.Add(CreateDefaultChannel(channel.ChannelId));
@@ -290,11 +296,10 @@ namespace DfoServer.Network
             return result;
         }
 
-        // 解析 channel_info.etc [server] 组 1 的频道 id(每行一条: id `名称` type `[tag]` ...)。
-        // FreeDuel 频道不在此出,由运行时按监听器开关追加到末尾。
-        internal static List<int> ParseScriptChannelIds(string text)
+        // Parse identity, type and dungeon/town group from channel_info.etc server group 1.
+        internal static List<GameChannelEndpoint> ParseScriptChannels(string text)
         {
-            var ids = new List<int>();
+            var channels = new List<GameChannelEndpoint>();
             var inServer = false;
             var groupMatched = false;
             using var reader = new StringReader(text);
@@ -335,14 +340,55 @@ namespace DfoServer.Network
                         out var channelId)
                     && channelId >= byte.MinValue
                     && channelId <= byte.MaxValue
-                    && trimmed.Contains('`')
-                    && !GameNetworkConfig.IsFreeDuelChannel(channelId))
+                    && trimmed.Contains('`'))
                 {
-                    ids.Add(channelId);
+                    var nameStart = trimmed.IndexOf('`');
+                    var nameEnd = trimmed.IndexOf('`', nameStart + 1);
+                    if (nameEnd < 0)
+                        continue;
+                    var afterName = trimmed.Substring(nameEnd + 1).TrimStart();
+                    var typeEnd = 0;
+                    while (typeEnd < afterName.Length && !char.IsWhiteSpace(afterName[typeEnd]))
+                        typeEnd++;
+                    if (!byte.TryParse(afterName.Substring(0, typeEnd), NumberStyles.Integer,
+                            CultureInfo.InvariantCulture, out var channelType))
+                        continue;
+
+                    // 第 4 列 `[raid]` 声明该频道属于攻坚组, 类型必须是 RaidChannelEnvironment。
+                    // 类型不符的行是坏数据: A21 客户端对 `201 [raid] 32` 会打印
+                    // "CHANNEL>> error [CHANNEL LIST] 201 [raid] 32" 并丢弃该行, 客户端因此
+                    // 没有该频道的名称/类型; 若服务端仍为它建监听并下发条目, 玩家会连入一个
+                    // 客户端不认识、攻坚操作被静默拒绝的频道。这里与客户端保持一致地丢弃。
+                    var channelGroup = ParseBacktickToken(afterName, typeEnd);
+                    if (string.Equals(
+                            channelGroup,
+                            RaidChannelGroupToken,
+                            StringComparison.Ordinal)
+                        && channelType != GameNetworkConfig.RaidChannelEnvironment)
+                    {
+                        FileLogger.Log(
+                            $"[{nameof(ChannelProtocolHandler)}] channel_info.etc skips channel " +
+                            $"{channelId}: group={RaidChannelGroupToken}, type={channelType}, " +
+                            $"expected type={GameNetworkConfig.RaidChannelEnvironment}.");
+                        continue;
+                    }
+
+                    var port = GameNetworkConfig.PortForChannel(channelId);
+                    channels.Add(new GameChannelEndpoint(channelId, port, port, channelType));
                 }
             }
 
-            return ids;
+            return channels;
+        }
+
+        // 反引号包裹的 token(频道名/组名)。找不到闭合反引号时返回 null。
+        private static string ParseBacktickToken(string text, int searchStart)
+        {
+            var start = text.IndexOf('`', searchStart);
+            if (start < 0)
+                return null;
+            var end = text.IndexOf('`', start + 1);
+            return end < 0 ? null : text.Substring(start + 1, end - start - 1);
         }
 
         // 容量字段不在 etc 格式内,按抓包标定:ch.20/21→150、ch.200→250、其余 100。

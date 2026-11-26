@@ -1,4 +1,6 @@
 using System;
+using System.Collections.Generic;
+using System.IO;
 using System.Net.Sockets;
 using System.Text;
 using System.Threading;
@@ -52,6 +54,18 @@ namespace DfoServer.Network
 
         private readonly SemaphoreSlim _sendLock = new SemaphoreSlim(1, 1);
 
+        private volatile bool _supportsRaidMemberColumnV1;
+
+        internal bool SupportsRaidMemberColumnV1 => _supportsRaidMemberColumnV1;
+
+        internal bool TrySetRaidMemberColumnProtocolVersion(uint version)
+        {
+            if (version != 1)
+                return false;
+            _supportsRaidMemberColumnV1 = true;
+            return true;
+        }
+
         public EnhancedClientSession(
             TcpClient client,
             IPacketHeader packetStructure,
@@ -74,13 +88,56 @@ namespace DfoServer.Network
             try
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                PacketFileLogger.Log("SEND", data);
-                await Stream.WriteAsync(
-                    data, 0, data.Length, cancellationToken);
+                await SendFrameAsync(data, cancellationToken);
             }
             finally
             {
                 _sendLock.Release();
+            }
+        }
+
+        // Caller already owns _sendLock. This never changes the native body.
+        private async Task SendFrameAsync(byte[] frame, CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            PacketFileLogger.Log("SEND", frame);
+            await Stream.WriteAsync(frame, 0, frame.Length, cancellationToken);
+        }
+
+        internal Task SendPreparedPacketBatchAsync(Func<IReadOnlyList<byte[]>> prepare,
+            CancellationToken cancellationToken = default, Action onSent = null)
+        {
+            return SendPreparedPacketBatchCoreAsync(_sendLock, prepare, packet =>
+            {
+                return SendFrameAsync(packet, cancellationToken);
+            },cancellationToken,onSent);
+        }
+
+        internal static async Task SendPreparedPacketBatchCoreAsync(
+            SemaphoreSlim sendLock,
+            Func<IReadOnlyList<byte[]>> prepare,
+            Func<byte[], Task> writePacket,
+            CancellationToken cancellationToken = default, Action onSent = null)
+        {
+            ArgumentNullException.ThrowIfNull(sendLock);
+            ArgumentNullException.ThrowIfNull(prepare);
+            ArgumentNullException.ThrowIfNull(writePacket);
+            await sendLock.WaitAsync(cancellationToken);
+            try
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var packets = prepare()
+                    ?? throw new InvalidOperationException("Packet batch preparation returned null");
+                foreach (var packet in packets)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    await writePacket(packet);
+                }
+                onSent?.Invoke();
+            }
+            finally
+            {
+                sendLock.Release();
             }
         }
 
@@ -112,15 +169,88 @@ namespace DfoServer.Network
                 // held. Once accepted, finish the small protocol frame without
                 // cancellation so a timeout cannot create a partial packet.
                 // Any newer projection/cleanup packet queues behind this write.
-                PacketFileLogger.Log("SEND", data);
-                await Stream.WriteAsync(
-                    data, 0, data.Length, CancellationToken.None);
+                await SendFrameAsync(data, CancellationToken.None);
                 onSent?.Invoke();
                 return true;
             }
             finally
             {
                 _sendLock.Release();
+            }
+        }
+
+        internal async Task<bool> TrySendPacketBatchAsync(
+            IReadOnlyList<byte[]> logicalPackets,
+            byte[] wireBatch,
+            CancellationToken cancellationToken,
+            Func<bool> canSend)
+        {
+            try
+            {
+                await _sendLock.WaitAsync(cancellationToken);
+            }
+            catch (OperationCanceledException)
+                when (cancellationToken.IsCancellationRequested)
+            {
+                return false;
+            }
+
+            try
+            {
+                if (cancellationToken.IsCancellationRequested
+                    || (canSend != null && !canSend()))
+                {
+                    return false;
+                }
+
+                try
+                {
+                    // This batch has one send-lock linearization point and one
+                    // transport write. Unlike the ordinary small-frame path,
+                    // its bounded best-effort contract also covers an in-flight
+                    // write. A timed-out write may be partial, so retire the old
+                    // transport before the caller can retry on another session.
+                    await Stream.WriteAsync(
+                        wireBatch,
+                        0,
+                        wireBatch.Length,
+                        cancellationToken);
+                    PacketFileLogger.LogBatchBestEffort(
+                        "SEND",
+                        logicalPackets);
+                    return true;
+                }
+                catch (OperationCanceledException)
+                    when (cancellationToken.IsCancellationRequested)
+                {
+                    AbortTransport();
+                    return false;
+                }
+                catch (Exception ex)
+                    when (ex is IOException
+                          || ex is SocketException
+                          || ex is ObjectDisposedException
+                          || ex is InvalidOperationException)
+                {
+                    AbortTransport();
+                    throw;
+                }
+            }
+            finally
+            {
+                _sendLock.Release();
+            }
+        }
+
+        private void AbortTransport()
+        {
+            try
+            {
+                TcpClient?.Close();
+            }
+            catch
+            {
+                // The transport is already unusable; cleanup is best effort.
             }
         }
 

@@ -290,6 +290,7 @@ namespace DfoServer.Game.Dungeon
             Maze = maze;
             Seed = seed;
             FirstActorSequenceId = firstActorSequenceId;
+            Elevator = maze.HasElevatorControl ? new ElevatorRoomRuntime() : null;
         }
 
         public long RoomInstanceId { get; }
@@ -318,6 +319,7 @@ namespace DfoServer.Game.Dungeon
         public uint Seed { get; }
         public ushort FirstActorSequenceId { get; }
         public DungeonEffectLedger Effects { get; } = new DungeonEffectLedger();
+        internal ElevatorRoomRuntime Elevator { get; }
         public DungeonRoomState State { get { lock (_syncRoot) return _state; } }
         public DungeonEncounterState EncounterState
         {
@@ -725,6 +727,7 @@ namespace DfoServer.Game.Dungeon
                         out var completingDeath)
                             ? completingDeath.Source
                             : fallbackSource;
+                    Elevator?.Complete(_clearSource.OccurredTick);
                 }
 
                 return new DungeonRoomClearCommit(
@@ -829,6 +832,7 @@ namespace DfoServer.Game.Dungeon
                 if (_state == DungeonRoomState.Closed)
                     return false;
                 _state = DungeonRoomState.Closed;
+                Elevator?.Close();
                 _loadingReleased = true;
                 _loadingProjectionId = 0;
                 _loadingProjectedParticipants.Clear();
@@ -908,6 +912,7 @@ namespace DfoServer.Game.Dungeon
                 new HashSet<(long, RoomKey, ushort)>();
         private DungeonSelectionSnapshot _selection;
         private DungeonClearedFact _clearedFact;
+        private SecretShop.SecretShopRoll _secretShopRoll;
         private DungeonInstanceState _state = DungeonInstanceState.Created;
         private int _normalKillCount;
         private int _championKillCount;
@@ -945,6 +950,20 @@ namespace DfoServer.Game.Dungeon
         internal DungeonInstance(
             short dungeonId,
             byte difficulty,
+            GameWorld.SequentialDungeonDefinitionCatalog sequentialCatalog)
+            : this(
+                dungeonId,
+                difficulty,
+                DungeonRewardPolicy.Standard,
+                DungeonDropDefinition.CreateStandard(dungeonId),
+                GameWorld.DungeonExperienceDefinitionCatalog.Resolve(dungeonId),
+                sequentialCatalog)
+        {
+        }
+
+        internal DungeonInstance(
+            short dungeonId,
+            byte difficulty,
             DungeonRewardPolicy rewardPolicy,
             DungeonDropDefinition dropDefinition)
             : this(
@@ -961,7 +980,8 @@ namespace DfoServer.Game.Dungeon
             byte difficulty,
             DungeonRewardPolicy rewardPolicy,
             DungeonDropDefinition dropDefinition,
-            GameWorld.DungeonExperienceDefinition experienceDefinition)
+            GameWorld.DungeonExperienceDefinition experienceDefinition,
+            GameWorld.SequentialDungeonDefinitionCatalog sequentialCatalog = null)
         {
             PartyDungeonInstanceId = DungeonIdentityGenerator.NextInstanceId();
             DungeonId = dungeonId;
@@ -971,6 +991,13 @@ namespace DfoServer.Game.Dungeon
                 ?? throw new ArgumentNullException(nameof(dropDefinition));
             ExperienceDefinition = experienceDefinition
                 ?? throw new ArgumentNullException(nameof(experienceDefinition));
+            var definitionCatalog = sequentialCatalog
+                ?? GameWorld.SequentialDungeonDefinitionCatalog.Current;
+            SequentialDefinitionResolution = definitionCatalog
+                .ResolvePrimaryByDungeonId(
+                    dungeonId,
+                    out var sequentialDefinition);
+            SequentialDefinition = sequentialDefinition;
             CreatedUtc = DateTime.UtcNow;
         }
 
@@ -985,11 +1012,22 @@ namespace DfoServer.Game.Dungeon
         {
             get;
         }
+        internal GameWorld.SequentialDungeonDefinition SequentialDefinition
+        {
+            get;
+        }
+        internal GameWorld.SequentialDungeonCapabilityResolution
+            SequentialDefinitionResolution
+        {
+            get;
+        }
         public DateTime CreatedUtc { get; }
         public DungeonEffectLedger Effects { get; } = new DungeonEffectLedger();
         internal SemaphoreSlim ParticipantLifeGate { get; } =
             new SemaphoreSlim(1, 1);
         internal SemaphoreSlim CardRewardProjectionGate { get; } =
+            new SemaphoreSlim(1, 1);
+        internal SemaphoreSlim CardRewardSendGate { get; } =
             new SemaphoreSlim(1, 1);
         internal SemaphoreSlim SettlementTransitionGate { get; } =
             new SemaphoreSlim(1, 1);
@@ -1174,6 +1212,46 @@ namespace DfoServer.Game.Dungeon
                 return participant.IsValid
                     && _participantDeaths.TryGetValue(participant, out var dead)
                     && dead;
+            }
+        }
+
+        internal bool CanParticipantMoveMap(
+            DungeonRunIdentity participant,
+            IReadOnlyList<DungeonRunIdentity> connectedRoomParticipants)
+        {
+            lock (_syncRoot)
+            {
+                if (!participant.IsValid
+                    || participant.PartyDungeonInstanceId != PartyDungeonInstanceId
+                    || _state == DungeonInstanceState.Ending
+                    || _state == DungeonInstanceState.Ended
+                    || _partyWipeCommitted
+                    || !_participantDeaths.TryGetValue(participant, out var dead))
+                {
+                    return false;
+                }
+                if (!dead)
+                    return true;
+                if (connectedRoomParticipants == null)
+                    return false;
+
+                // The client sending MOVE_MAP can be the dead party host.
+                // Only current connected participants in its physical room
+                // may keep the party moving; this never revives the host.
+                var requesterPresent = false;
+                var livingParticipantPresent = false;
+                foreach (var current in connectedRoomParticipants)
+                {
+                    if (!current.IsValid
+                        || current.PartyDungeonInstanceId != PartyDungeonInstanceId
+                        || !_participantDeaths.TryGetValue(current, out var currentDead))
+                    {
+                        continue;
+                    }
+                    requesterPresent |= current.Equals(participant);
+                    livingParticipantPresent |= !currentDead;
+                }
+                return requesterPresent && livingParticipantPresent;
             }
         }
 
@@ -1382,6 +1460,25 @@ namespace DfoServer.Game.Dungeon
             }
         }
 
+        internal SecretShop.SecretShopRoll GetOrCreateSecretShopRoll(
+            Func<SecretShop.SecretShopRoll> roller)
+        {
+            if (roller == null)
+                throw new ArgumentNullException(nameof(roller));
+
+            lock (_syncRoot)
+            {
+                if (_secretShopRoll != null)
+                    return _secretShopRoll;
+
+                var roll = roller()
+                    ?? throw new InvalidOperationException(
+                        "Secret shop roller returned an invalid roll.");
+                _secretShopRoll = roll;
+                return roll;
+            }
+        }
+
         internal bool TryBeginEnding()
         {
             lock (_syncRoot)
@@ -1395,6 +1492,8 @@ namespace DfoServer.Game.Dungeon
                 _state = DungeonInstanceState.Ending;
                 _partyWipePending = false;
                 _partyWipeDeadlineUtc = DateTime.MinValue;
+                foreach (var room in _rooms.Values)
+                    room.Elevator?.Close();
             }
 
             Mechanisms.OnInstanceEnding();

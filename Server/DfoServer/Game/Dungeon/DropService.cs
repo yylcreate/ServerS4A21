@@ -20,15 +20,50 @@ namespace DfoServer.Game.Dungeon
             HellMonsterDropConfig.WarmUp();
         }
 
+        // "DROP": monster-drop stream domain. Card rewards use "CARD" so a
+        // participant's drop stream and card stream never share state even
+        // when all other derivation inputs are equal.
+        private const uint DropSeedDomain = 0x44524F50u;
+        private const uint CardSeedDomain = 0x43415244u;
+
         internal static uint DeriveParticipantDropSeed(
             uint roomSeed,
             long partyDungeonInstanceId,
             long roomInstanceId,
             int characterId)
+            => DeriveParticipantSeed(
+                roomSeed,
+                partyDungeonInstanceId,
+                roomInstanceId,
+                characterId,
+                DropSeedDomain);
+
+        // Settlement card rewards roll on their own per-participant stream:
+        // party members share the frozen room seed, so deriving from it
+        // without the character/domain split would deal identical cards to
+        // the whole party.
+        internal static uint DeriveParticipantCardSeed(
+            uint roomSeed,
+            long partyDungeonInstanceId,
+            long roomInstanceId,
+            int characterId)
+            => DeriveParticipantSeed(
+                roomSeed,
+                partyDungeonInstanceId,
+                roomInstanceId,
+                characterId,
+                CardSeedDomain);
+
+        private static uint DeriveParticipantSeed(
+            uint roomSeed,
+            long partyDungeonInstanceId,
+            long roomInstanceId,
+            int characterId,
+            uint domain)
         {
             unchecked
             {
-                var value = roomSeed ^ 0x44524F50u;
+                var value = roomSeed ^ domain;
                 value ^= (uint)partyDungeonInstanceId;
                 value ^= (uint)(partyDungeonInstanceId >> 32) * 0x9E3779B9u;
                 value ^= (uint)roomInstanceId * 0x85EBCA6Bu;
@@ -153,6 +188,30 @@ namespace DfoServer.Game.Dungeon
                 GoldAmount = result.goldAmount,
                 Drops = result.drops
             };
+            }
+        }
+
+        internal void RollbackRegistered(
+            DungeonRun run,
+            IReadOnlyList<DropInfo> drops)
+        {
+            if (run == null || drops == null || drops.Count == 0)
+                return;
+
+            lock (run.SyncRoot)
+            {
+                foreach (var expected in drops)
+                {
+                    if (run.Drops.TryGetValue(
+                            expected.SceneSlot,
+                            out var current)
+                        && current.DropGroupId == expected.DropGroupId
+                        && current.TemplateId == expected.TemplateId
+                        && current.StackCount == expected.StackCount)
+                    {
+                        run.Drops.Remove(expected.SceneSlot);
+                    }
+                }
             }
         }
 

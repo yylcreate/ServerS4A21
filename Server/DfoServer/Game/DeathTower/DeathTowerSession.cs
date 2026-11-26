@@ -20,11 +20,17 @@ namespace DfoServer.Game.DeathTower
         private DnfLcg _stageLcg;
         private DungeonRunIdentity _pendingStageLoadingRun;
         private int _pendingStageLoadingStage = -1;
+        private readonly ushort[] _participantUserIds;
+        private readonly object _monsterSequenceSyncRoot = new object();
+        private int _nextMonsterSequence = 1;
+        private readonly IReadOnlyList<int> _stageMapIds;
 
         public DeathTowerData.TowerConfig Config { get; }
         public int CurrentStage { get; private set; }
         public int EndStage => Config.TotalStages - 1;
-        public ushort MonsterSequence { get; private set; }
+        public int ClearedStageCount => Config.IsBossTower
+            ? CurrentStage + (State == 2 ? 1 : 0)
+            : Math.Max(1, Math.Min(Config.TotalStages, CurrentStage + 1));
         public ushort ItemSequence { get; private set; }
         public int State { get; private set; }  // 0=init, 1=fighting, 2=cleared
         public uint StageSeed { get; private set; }
@@ -34,23 +40,62 @@ namespace DfoServer.Game.DeathTower
             => _inventoryItems;
         public IReadOnlyCollection<int> SeenItemIds => _seenItemIds;
 
-        public DeathTowerSession(DeathTowerData.TowerConfig config)
+        public DeathTowerSession(
+            DeathTowerData.TowerConfig config,
+            IEnumerable<ushort> participantUserIds)
         {
             Config = config ?? throw new ArgumentNullException(nameof(config));
+            ArgumentNullException.ThrowIfNull(participantUserIds);
+            _participantUserIds = participantUserIds.Distinct().OrderBy(id => id).ToArray();
+            if (_participantUserIds.Length == 0 || _participantUserIds[0] == 0)
+                throw new ArgumentException("Tower participants must have nonzero UIDs.", nameof(participantUserIds));
+            _stageMapIds = Config.ResolveStageMaps(Infrastructure.ServerRandom.Next);
             CurrentStage = 0;
-            MonsterSequence = 1;
             ItemSequence = 1;
             State = 0;
         }
 
         public int GetCurrentMapId()
         {
-            if (CurrentStage < 0 || CurrentStage >= Config.StageMapIds.Count)
+            if (CurrentStage < 0 || CurrentStage >= _stageMapIds.Count)
                 return -1;
-            return Config.StageMapIds[CurrentStage];
+            return _stageMapIds[CurrentStage];
         }
 
-        public ushort NextMonsterSeq() => MonsterSequence++;
+        // Room actor lookup uses firstSequence + index. Skip an entire range
+        // when a player UID falls inside it, never leave holes within a floor.
+        internal void AssignMonsterSequences(List<StageMonster> monsters)
+        {
+            ArgumentNullException.ThrowIfNull(monsters);
+            if (monsters.Count > byte.MaxValue)
+                throw new ArgumentOutOfRangeException(nameof(monsters));
+            if (monsters.Count == 0)
+                return;
+
+            lock (_monsterSequenceSyncRoot)
+            {
+                var first = _nextMonsterSequence;
+                foreach (var playerUid in _participantUserIds)
+                {
+                    if (playerUid >= first && playerUid < first + monsters.Count)
+                        first = playerUid + 1;
+                }
+
+                var next = first + monsters.Count;
+                if (next > ushort.MaxValue + 1)
+                    throw new InvalidOperationException("Death tower actor UID space exhausted.");
+
+                for (var i = 0; i < monsters.Count; i++)
+                {
+                    var monster = monsters[i];
+                    monster.MonsterUniqueId = (ushort)(first + i);
+                    monsters[i] = monster;
+                }
+                // Keep a wide cursor: exhaustion must never wrap to zero or
+                // reuse a previous floor's IDs (including delayed messages).
+                _nextMonsterSequence = next;
+            }
+        }
 
         public ushort NextItemSeq()
         {
@@ -400,7 +445,7 @@ namespace DfoServer.Game.DeathTower
             return result;
         }
 
-        public void SetFighting() { State = 1; }
+        public void SetFighting() { if (State == 0) State = 1; }
 
         public void SetCleared() { State = 2; }
 
@@ -481,8 +526,11 @@ namespace DfoServer.Game.DeathTower
 
         // 允许从 state>=1 推进(state==1: 86JP可能不发0x009F(2)直接MOVE_MAP; state==2: 正常流程)
         // state==0(init, 未开始战斗)不允许推进。
+        // 领主之塔必须走权威清层(state==2)，不接受跳过的清层命令。
         public bool TryAdvanceStage()
         {
+            if (Config.IsBossTower && State != 2)
+                return false;
             if (State < 1)
                 return false;
             if (CurrentStage >= EndStage)

@@ -288,6 +288,18 @@ namespace DfoServer.Network.Handlers
                 return;
             }
 
+            if (await TryHandleDimensionDungeonEnterTicketAsync(
+                    session,
+                    header,
+                    cid,
+                    listType,
+                    slotIndex,
+                    instanceValue,
+                    itemCode))
+            {
+                return;
+            }
+
             InventoryMutationResult result = null;
             InventoryStackableUseCommitResult stackableUseResult = null;
             if (TryGetOwnedInventoryLease(session, cid, out lease))
@@ -300,9 +312,9 @@ namespace DfoServer.Network.Handlers
                 result = stackableUseResult?.Mutation;
             }
 
-            var consumed = stackableUseResult != null && stackableUseResult.Consumed;
-            var responsePlan = BuildUseStackableResponsePlan(consumed, result, listType, slotIndex, instanceValue, itemCode);
-            if (!consumed)
+            var used = stackableUseResult != null && stackableUseResult.Used;
+            var responsePlan = BuildUseStackableResponsePlan(used, result, listType, slotIndex, instanceValue, itemCode);
+            if (!used)
             {
                 await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(0x01, header.type, responsePlan.AckBody));
                 if (stackableUseResult?.SourceExpiredDeleted == true)
@@ -336,7 +348,122 @@ namespace DfoServer.Network.Handlers
             var petSatietyLog = result.PetSatietyChanged
                 ? $" petSatiety key={result.PetCreatureKey} {result.PetSatietyBefore}->{result.PetSatietyAfter}"
                 : string.Empty;
-            FileLogger.Log($"[{ProtocolName}] USE_STACKABLE: consumed 1x item 0x{itemCode:X8} from slot {slotIndex}, remaining={result.RemainingStackCount}{petSatietyLog}");
+            FileLogger.Log($"[{ProtocolName}] USE_STACKABLE: used item 0x{itemCode:X8} from slot {slotIndex}, consumed={result.AppliedCount} remaining={result.RemainingStackCount}{petSatietyLog}");
+        }
+
+        private async Task<bool> TryHandleDimensionDungeonEnterTicketAsync(
+            EnhancedClientSession session,
+            GamePacketHeader header,
+            int characterId,
+            InventoryListType listType,
+            short slotIndex,
+            int instanceValue,
+            int itemCode)
+        {
+            if (!TryGetOwnedInventoryLease(session, characterId, out var lease))
+                return false;
+
+            int resolvedItemId;
+            lock (lease.SyncRoot)
+            {
+                if (!InventoryContext.IsCurrentLease(
+                        lease,
+                        session.SessionId,
+                        characterId))
+                {
+                    return false;
+                }
+
+                var source = lease.Inventory.GetItem(listType, slotIndex);
+                if (source == null || source.ItemId <= 0)
+                    return false;
+
+                resolvedItemId = source.ItemId;
+            }
+
+            var stackable = StackableItemProvider.Load(resolvedItemId);
+            if (!DimensionDungeonEnterTicketRules.TryResolve(
+                    stackable,
+                    out var definition))
+            {
+                return false;
+            }
+
+            var config = DimensionGateEntryLimitConfigProvider.Get();
+            var entryLimits = new DungeonEntryLimitService(lease.Inventory.Database);
+            var result = DimensionDungeonEnterTicketService.TryUse(
+                lease,
+                listType,
+                slotIndex,
+                resolvedItemId,
+                session.Player != null && session.Player.CurrentRun == null,
+                stackable,
+                definition,
+                config.DailyDefaultEnterCount,
+                config.DailyDefaultExtraEnterCount,
+                entryLimits);
+            if (!result.Handled)
+                return false;
+
+            if (!result.Success)
+            {
+                await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(
+                    0x01,
+                    header.type,
+                    UseStackableAckBuilder.BuildError(
+                        (byte)listType,
+                        instanceValue,
+                        result.ItemTemplateId > 0
+                            ? result.ItemTemplateId
+                            : resolvedItemId)));
+                if (result.SourceExpiredDeleted)
+                    await _refresh.SendUpdateItemList(session, listType, slotIndex);
+                FileLogger.Log(
+                    $"[{ProtocolName}] USE_STACKABLE dimension-enter-ticket rejected: " +
+                    $"cid={characterId} item=0x{resolvedItemId:X8} packetItem=0x{itemCode:X8} " +
+                    $"instance=0x{instanceValue:X8} status={result.Status} slot={slotIndex}");
+                return true;
+            }
+
+            await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(
+                0x01,
+                header.type,
+                UseStackableAckBuilder.BuildSuccess(
+                    slotIndex,
+                    (byte)listType,
+                    instanceValue,
+                    result.ItemTemplateId)));
+            await _refresh.SendUpdateItemList(session, listType, slotIndex);
+            var refreshedMaterialSlots = new HashSet<short>();
+            foreach (var material in result.Materials)
+            {
+                if (!refreshedMaterialSlots.Add(material.SlotIndex))
+                    continue;
+                await _refresh.SendUpdateItemList(
+                    session,
+                    InventoryListType.Main,
+                    material.SlotIndex);
+            }
+
+            await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(
+                0x00,
+                (ushort)NotiPacketTypeA21.DIMENSION_GATE_ENTRANCE_INFO,
+                DimensionGateEntranceInfoBodyBuilder.Build(
+                    result.RemainingCount,
+                    result.ExtraCount)));
+            if (result.TicketMutation != null)
+            {
+                session.GameSession?.QuestManager
+                    ?.RecalibrateItemSeekingQuestProgressAfterInventoryMutationWithoutNotification(
+                        lease,
+                        result.TicketMutation);
+            }
+            FileLogger.Log(
+                $"[{ProtocolName}] USE_STACKABLE dimension-enter-ticket: " +
+                $"cid={characterId} item=0x{result.ItemTemplateId:X8} " +
+                $"added={result.AddedEnterCount} remaining={result.RemainingCount} " +
+                $"extra={result.ExtraCount}");
+            return true;
         }
 
         private async Task<bool> TryRejectExpiredStackableSourceAsync(
@@ -481,7 +608,9 @@ namespace DfoServer.Network.Handlers
                     listType,
                     slotIndex);
             }
-            await ChannelTownRestrictionSender.SendAsync(session);
+            await ChannelTownRestrictionSender.SendAsync(
+                session,
+                definition.TargetTownId);
             return true;
         }
 
@@ -1510,6 +1639,19 @@ namespace DfoServer.Network.Handlers
                 await _refresh.SendEmptyUpdateItemList(session, InventoryListType.Main, result.SourceSlotIndex);
 
             await SendBoosterMainItemUpdates(session, result, result.SourceRemainingStackCount > 0);
+            if (result.IsSeriaLuckValueSource)
+            {
+                var body = BoosterGageBodyBuilder.Build(
+                    result.SeriaLuckValueAfter);
+                await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(
+                    0x00,
+                    (ushort)NotiPacketTypeA21.BOOSTER_GAGE,
+                    body));
+                FileLogger.Log(
+                    $"[{ProtocolName}] BOOSTER_GAGE seria-luck sync " +
+                    $"cid={session?.Player?.CharacterId ?? 0} " +
+                    $"value={result.SeriaLuckValueAfter} bodyLen={body.Length}");
+            }
             if (wallet != null)
             {
                 await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(
@@ -1867,16 +2009,10 @@ namespace DfoServer.Network.Handlers
 
         private static IReadOnlyList<int> ParseBoosterSelectionItemIds(byte[] body)
         {
-            var selected = new List<int>();
-            if (body == null || body.Length < 6)
-                return selected;
-
-            AddAlignedInt32Candidates(body, 4, 4, selected);
-            if (body.Length >= 3)
-                AddRecordCandidates(body, 3, body[2], 5, selected);
-            AddAlignedInt32Candidates(body, 2, 4, selected);
-
-            return selected;
+            // 0x00A0/0x0218 自选礼盒与 0x00A0 主路径共用同一布局解析, 不再做错位模糊扫描。
+            return SelectablePackageOpenRequest.TryParse(body, out var request)
+                ? request.SelectedItemTemplateIds
+                : Array.Empty<int>();
         }
 
         private static IReadOnlyList<int> Parse0207ItemIds(byte[] body)
@@ -1896,24 +2032,6 @@ namespace DfoServer.Network.Handlers
             }
 
             return selected;
-        }
-
-        private static void AddAlignedInt32Candidates(byte[] body, int startOffset, int stride, List<int> selected)
-        {
-            for (var offset = startOffset; offset + 4 <= body.Length; offset += stride)
-                AddItemCandidate(BitConverter.ToInt32(body, offset), selected);
-        }
-
-        private static void AddRecordCandidates(byte[] body, int startOffset, int count, int recordSize, List<int> selected)
-        {
-            for (var i = 0; i < count; i++)
-            {
-                var offset = startOffset + i * recordSize;
-                if (offset + 4 > body.Length)
-                    break;
-
-                AddItemCandidate(BitConverter.ToInt32(body, offset), selected);
-            }
         }
 
         private static void AddItemCandidate(int itemTemplateId, List<int> selected)

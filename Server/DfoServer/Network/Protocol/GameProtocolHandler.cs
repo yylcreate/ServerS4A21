@@ -26,10 +26,12 @@ namespace DfoServer.Network
     {
         private readonly LoginHandler _loginHandler;
         private readonly CharacterSelectHandler _characterSelectHandler;
+        private readonly CharacterRenameHandler _characterRenameHandler;
         private readonly GrowupChangeHandler _growupChangeHandler;
         private readonly CharacterSessionLifecycleCoordinator
             _characterSessionLifecycle;
         private readonly InventoryHandler _inventoryHandler;
+        private readonly UpgradeBroadcastHandler _upgradeBroadcast;
         private readonly LotteryItemHandler _lotteryItemHandler;
         private readonly KnightShieldHandler _knightShieldHandler;
         private readonly TownHandler _townHandler;
@@ -42,6 +44,7 @@ namespace DfoServer.Network
         private readonly LuckyStarHandler _luckyStarHandler;
         private readonly RentalHandler _rentalHandler;
         private readonly MailboxHandler _mailboxHandler;
+        private readonly CharacterLevelUpRewardCoordinator _levelUpRewards;
         private readonly CollectionBoxHandler _collectionBoxHandler;
         private readonly ShopCoinEventHandler _shopCoinEventHandler;
         private readonly InventoryRefreshSender _inventoryRefreshSender;
@@ -56,6 +59,7 @@ namespace DfoServer.Network
         private readonly EventDailyAttendanceAnytimeHandler
             _eventDailyAttendanceAnytimeHandler;
         private readonly EventTotalAttendanceHandler _eventTotalAttendanceHandler;
+        private readonly NpcFavorHandler _npcFavorHandler;
         private readonly ExpertJobStoreHandler _expertJobStoreHandler;
         private readonly ExpertJobExtractionHandler _expertJobExtractionHandler;
         private readonly ExpertJobCompoundHandler _expertJobCompoundHandler;
@@ -78,6 +82,7 @@ namespace DfoServer.Network
         private readonly bool _ownsWorldDependencies;
         private readonly GameProtocolSocialHandlers _socialHandlers;
         private readonly GameCommandRegistry _cmdDispatch;
+        private readonly Handlers.Auction.AuctionHandler _auctionHandler;
 
         public override string ProtocolName => "GameProtocol";
 
@@ -118,7 +123,8 @@ namespace DfoServer.Network
             GameProtocolTownDungeonHandlers townDungeonHandlers,
             GameProtocolSocialHandlers socialHandlers,
             GameProtocolFeatureHandlers featureHandlers,
-            CharacterSessionLifecycleCoordinator characterSessionLifecycle)
+            CharacterSessionLifecycleCoordinator characterSessionLifecycle,
+            Game.Auction.AuctionRuntime auctionRuntime = null)
         {
             if (core == null)
                 throw new ArgumentNullException(nameof(core));
@@ -144,7 +150,8 @@ namespace DfoServer.Network
                     world,
                     townDungeonHandlers,
                     udpRelay,
-                    pvpUdpRelay);
+                    pvpUdpRelay,
+                    inventory.InventoryRefreshSender);
             featureHandlers ??= ServerRuntimeBuilder
                 .CreateGameProtocolFeatureHandlers(
                     core,
@@ -172,14 +179,21 @@ namespace DfoServer.Network
             var sqliteSelectCharacterDataSource = core.SelectCharacterDataSource;
 
             _characterTransitions = world.CharacterTransitions;
+            _levelUpRewards = new CharacterLevelUpRewardCoordinator(
+                inventory.LevelUpRewards, sessionDirectory, _characterTransitions);
             _loginHandler = characterInventoryHandlers.Login;
             _characterSelectHandler = characterInventoryHandlers.CharacterSelect;
+            _characterRenameHandler = new CharacterRenameHandler(database, characterRepository, sessionDirectory,
+                _characterTransitions, socialHandlers.GuildManagement.RefreshAfterRenameAsync);
+            _characterSelectHandler.ConfigureGuildContents(_socialHandlers.GuildManagement.RestoreContentEffectsAsync);
             _inventoryRefreshSender = inventory.InventoryRefreshSender;
             _growupChangeHandler = new GrowupChangeHandler(
                 new GrowupChangeApplicationService(),
                 _inventoryRefreshSender);
             _knightShieldHandler = characterInventoryHandlers.KnightShield;
             _inventoryHandler = characterInventoryHandlers.Inventory;
+            _upgradeBroadcast = new UpgradeBroadcastHandler(sessionDirectory, _characterTransitions,
+                inventory.InventoryRefreshSender, _inventoryHandler.BroadcastCommittedUpgradeNotice);
             _lotteryItemHandler = featureHandlers.LotteryItem;
             _petCreatureHandler = featureHandlers.PetCreature;
             // 组队与城镇/副本共享同一个 PartyManager 实例: 跟随退出/副本 fan-out 都要看到同一份队伍状态。
@@ -205,6 +219,7 @@ namespace DfoServer.Network
             _mercenaryHandler = featureHandlers.Mercenary;
             _partyHandler = socialHandlers.Party;
             _raidHandler = socialHandlers.Raid;
+            _townHandler.ConfigureRaidTownAreaChanged(_raidHandler.HandleRaidTownAreaChangedAsync);
             _chatHandler = socialHandlers.Chat;
             _dungeonRejoin = socialHandlers.DungeonRejoin;
             _dungeonLoading = socialHandlers.DungeonLoading;
@@ -216,13 +231,26 @@ namespace DfoServer.Network
             _eventDailyAttendanceAnytimeHandler =
                 featureHandlers.EventDailyAttendanceAnytime;
             _eventTotalAttendanceHandler = featureHandlers.EventTotalAttendance;
+            _npcFavorHandler = featureHandlers.NpcFavor;
             _pvpChannelInfoHandler = socialHandlers.PvpChannelInfo;
             _pvpRoomHandler = socialHandlers.PvpRoom;
             _characterSessionLifecycle = characterSessionLifecycle;
+            _auctionHandler = auctionRuntime == null ? null : new Handlers.Auction.AuctionHandler(auctionRuntime, _characterTransitions);
 
             _cmdDispatch = new GameCommandRegistry();
             _cmdDispatch.RegisterGroup("login", RegisterLoginHandlers);
             _cmdDispatch.RegisterGroup("character", RegisterCharacterHandlers);
+            _cmdDispatch.RegisterGroup("upgrade-broadcast", _upgradeBroadcast.Register);
+            if (_auctionHandler != null)
+                _cmdDispatch.RegisterGroup("auction", d => {
+                    foreach (var command in new[] {
+                        CmdPacketTypeA21.AUCTION_ASK_AVERAGE_PRICE, CmdPacketTypeA21.AUCTION_REGIST_ITEM,
+                        CmdPacketTypeA21.AUCTION_REGIST_CANCEL, CmdPacketTypeA21.AUCTION_BIDDING,
+                        CmdPacketTypeA21.AUCTION_SEARCH_BY_ITEMKEY, CmdPacketTypeA21.AUCTION_SEARCH_BY_NOITEMKEY,
+                        CmdPacketTypeA21.AUCTION_MY_REGISTED_ITEM_INFO, CmdPacketTypeA21.AUCTION_MY_BIDDING_INFO,
+                        CmdPacketTypeA21.AUCTION_BUY_ITEM_APIECE })
+                        d[(ushort)command] = _auctionHandler.Handle;
+                });
             _cmdDispatch.RegisterGroup("inventory", RegisterInventoryHandlers);
             _cmdDispatch.RegisterGroup("pet", RegisterPetHandlers);
             _cmdDispatch.RegisterGroup("sort-item-lock", RegisterSortItemLockHandlers);
@@ -251,14 +279,77 @@ namespace DfoServer.Network
                 "shop-coin-event",
                 d => d[0x00CF] = _shopCoinEventHandler.HandleShopCoinEvent);
             _cmdDispatch.RegisterGroup("friend", RegisterFriendHandlers);
+            _cmdDispatch.RegisterGroup("guild-members", d =>
+            {
+                d[(ushort)CmdPacketTypeA21.GUILD_MEMER_LIST] = _socialHandlers.GuildMembers.Handle;
+                d[(ushort)CmdPacketTypeA21.GUILD_ALL_MEMBER_LIST] = _socialHandlers.GuildMembers.Handle;
+            });
+            _cmdDispatch.RegisterGroup("guild-join", d =>
+            {
+                d[(ushort)CmdPacketTypeA21.REQ_GUILD_SERCH_FOR_JOIN] = _socialHandlers.GuildJoin.Handle;
+                d[(ushort)CmdPacketTypeA21.REQUEST_JOIN_GUILD] = _socialHandlers.GuildJoin.Handle;
+                d[(ushort)CmdPacketTypeA21.GUILD_JOIN_LIST] = _socialHandlers.GuildJoin.Handle;
+                d[(ushort)CmdPacketTypeA21.APPROVE_JOIN_GUILD] = _socialHandlers.GuildJoin.Handle;
+                d[(ushort)CmdPacketTypeA21.REFRESH_GUILD_INFO] = _socialHandlers.GuildJoin.Handle;
+            });
+            _cmdDispatch.RegisterGroup("guild-creation", d =>
+            {
+                d[(ushort)CmdPacketTypeA21.CHECK_GUILD_NAME_DOUBLE] = _socialHandlers.GuildCreation.Handle;
+                d[(ushort)CmdPacketTypeA21.CHECK_GUILD_CREATE_PROMOTE_MSG] = _socialHandlers.GuildCreation.Handle;
+                d[(ushort)CmdPacketTypeA21.REQUEST_GUILD_CREATE_PERMIT] = _socialHandlers.GuildCreation.Handle;
+                d[(ushort)CmdPacketTypeA21.CANCEL_GUILD_CREATE] = _socialHandlers.GuildCreation.Handle;
+                d[(ushort)CmdPacketTypeA21.CALL_GUILD_CREATE_RIGHT] = _socialHandlers.GuildCreation.Handle;
+            });
+            _cmdDispatch.RegisterGroup("guild-management", d =>
+            {
+                foreach (var command in new[] { CmdPacketTypeA21.CANCEL_JOIN_GUILD, CmdPacketTypeA21.DENY_JOIN_GUILD,
+                    CmdPacketTypeA21.JOIN_GUILD_INFO, CmdPacketTypeA21.REQ_GUILD_SECEDE, CmdPacketTypeA21.SET_SUB_GUILD_MASTER,
+                    CmdPacketTypeA21.NOTIFY_MESSAGE_TO_GUILD, CmdPacketTypeA21.MODIFY_GUILD_PROMOTE_MSG,
+                    CmdPacketTypeA21.WRITE_GUILD_MEMBER_MEMO, CmdPacketTypeA21.BREAK_GUILD,
+                    CmdPacketTypeA21.BUY_GUILD_CONTENTS })
+                    d[(ushort)command] = _socialHandlers.GuildManagement.Handle;
+            });
+            _cmdDispatch.RegisterGroup("guild-facility", d =>
+            {
+                foreach (var command in new[]
+                {
+                    CmdPacketTypeA21.DONATE_GUILD_FUND, CmdPacketTypeA21.CHECK_CREATE_GUILD_AGIT,
+                    CmdPacketTypeA21.CREATE_GUILD_AGIT, CmdPacketTypeA21.UPGRADE_GUILD_AGIT,
+                    CmdPacketTypeA21.UPGRADE_GUILD_CARGO, CmdPacketTypeA21.GUILD_CARGO,
+                    CmdPacketTypeA21.GUILD_CARGO_PUSH_ITEM, CmdPacketTypeA21.GUILD_CARGO_POP_ITEM,
+                    CmdPacketTypeA21.GUILD_CARGO_MOVE_ITEM, CmdPacketTypeA21.GUILD_CARGO_HISTORY
+                })
+                    d[(ushort)command] = _socialHandlers.GuildFacility.Handle;
+            });
+            _cmdDispatch.RegisterGroup("guild-invite", d =>
+            {
+                d[(ushort)CmdPacketTypeA21.CALL_GUILD_INVITE] = _socialHandlers.GuildInvite.Handle;
+                d[(ushort)CmdPacketTypeA21.REPLY_GUILD_INVITE] = _socialHandlers.GuildInvite.Handle;
+            });
             _cmdDispatch.RegisterGroup("event-joust", RegisterEventJoustHandlers);
+            _cmdDispatch.RegisterGroup("npc-favor", _npcFavorHandler.RegisterHandlers);
         }
 
         public void Dispose()
         {
+            _upgradeBroadcast.Dispose();
+            _levelUpRewards.Dispose();
             _socialHandlers.Dispose();
             if (_ownsWorldDependencies)
                 _worldDependencies.Dispose();
+        }
+
+        internal IDisposable StartLevelUpRewardRecovery(ClockService clock)
+        {
+            _levelUpRewards.StartRecovery(clock);
+            return _levelUpRewards;
+        }
+
+        internal async Task NotifyAuctionDeliveriesAsync(IReadOnlyList<int> characters)
+        {
+            foreach (var characterId in characters)
+                await SessionDirectory.TrySendBestEffortAsync(
+                    ct => _mailboxHandler.NotifyCommittedSystemMailAsync(characterId, ct), "auction-mail-alarm");
         }
 
         public override Task OnClientConnected(
@@ -270,8 +361,15 @@ namespace DfoServer.Network
         public override async Task OnClientDisconnected(
             EnhancedClientSession session)
         {
-            _raidHandler.ClearSession(session.SessionId);
-            await _characterSessionLifecycle.HandleDisconnectedAsync(session);
+            try
+            {
+                await _raidHandler.ClearSessionAsync(session.SessionId);
+            }
+            finally
+            {
+                _auctionHandler?.Clear(session);
+                await _characterSessionLifecycle.HandleDisconnectedAsync(session);
+            }
         }
 
         public override async Task OnPacketReceived(EnhancedClientSession session, FlexiblePacket packet)
@@ -304,10 +402,21 @@ namespace DfoServer.Network
 
             if (header.cmd == 1)
             {
-                if (_cmdDispatch.TryGetValue(header.type, out var handler))
-                    await handler(session, header, body);
-                else
-                    FileLogger.Log($"[GameProtocol] Unhandled CMD type=0x{header.type:X4} body({body?.Length ?? 0}B): {(body != null ? BitConverter.ToString(body) : "null")}");
+                try
+                {
+                    await _socialHandlers.Trade.CancelBeforeTransition(session, header.type);
+                    if (header.type == (ushort)CmdPacketTypeA21.UPGRADE_ITEM
+                        && await _upgradeBroadcast.TryHandleUpgradeCompletion(session, header, body)) return;
+                    if (_cmdDispatch.TryGetValue(header.type, out var handler))
+                        await handler(session, header, body);
+                    else
+                        FileLogger.Log($"[GameProtocol] Unhandled CMD type=0x{header.type:X4} body({body?.Length ?? 0}B): {(body != null ? BitConverter.ToString(body) : "null")}");
+                }
+                finally
+                {
+                    await _upgradeBroadcast.Reconcile(session);
+                    await _levelUpRewards.DrainAndNotifyAsync();
+                }
             }
         }
 
@@ -321,13 +430,26 @@ namespace DfoServer.Network
 
         private void RegisterCharacterHandlers(GameCommandRegistry.GameCommandRegistrationGroup d)
         {
-            d[0x0004] =
-                _characterSessionLifecycle.HandleSelectCharacterAsync;
+            d[0x0004] = async (s, h, b) =>
+            {
+                _auctionHandler?.Clear(s);
+                await _characterSessionLifecycle.HandleSelectCharacterAsync(s, h, b);
+                await _raidHandler.HandleRaidChannelWelcomeAsync(s);
+                await _raidHandler.HandleRebindResyncAsync(s);
+                if (_auctionHandler != null) await _auctionHandler.SendService(s);
+            };
             d[0x0005] = _characterSelectHandler.Handle_ENUM_CMDPACKET_CREATE_CHARACTER;
+            d[(ushort)CmdPacketTypeA21.CHANGE_CHARAC_NAME] = _characterRenameHandler.Handle;
             d[0x0006] = _characterSelectHandler.Handle_ENUM_CMDPACKET_DELETE_CHARACTER;
-            d[0x0007] = _characterSessionLifecycle
-                .HandleReturnSelectCharacterAsync;
+            d[0x0007] = async (s, h, b) => {
+                _auctionHandler?.Clear(s);
+                await _characterSessionLifecycle.HandleReturnSelectCharacterAsync(s, h, b);
+            };
             d[0x0008] = _characterSelectHandler.Handle_ENUM_CMDPACKET_GET_USERINFO;
+            d[(ushort)CmdPacketTypeA21.FAIR_PVP_SCORE] =
+                _characterSelectHandler.HandleFairPvpScore;
+            d[(ushort)CmdPacketTypeA21.INTEGRATE_MATCH_PVP_SCORE] =
+                _characterSelectHandler.HandleIntegrateMatchPvpScore;
             d[0x01A8] = _characterSelectHandler
                 .Handle_ENUM_CMDPACKET_OTHER_USER_TITLE_BOOK_LIST;
             d[(ushort)CmdPacketTypeA21.RE_GROWUP_CHANGE] =
@@ -339,25 +461,17 @@ namespace DfoServer.Network
 
         private void RegisterPartyHandlers(GameCommandRegistry.GameCommandRegistrationGroup d)
         {
-            d[(ushort)CmdPacketType.SEND_MESSAGE] =
-                _chatHandler.Handle_SEND_MESSAGE;
+            _chatHandler.RegisterHandlers(d);
             d[0x000C] = _partyHandler.Handle_SET_PARTY_INFO;        // 12 创建/更新队伍
-            d[0x000D] = async (s, h, b) =>
-            {
-                var userId = s?.Player?.UserId ?? (ushort)0;
-                var wasInParty = userId != 0
-                    && _partyManager.GetPartyByUser(userId) != null;
-                await _partyHandler.Handle_LEAVE_PARTY(s, h, b);
-                if (wasInParty && _partyManager.GetPartyByUser(userId) == null)
-                    await _raidHandler.HandleNormalPartyLeftAsync(userId);
-            };                                                      // 13 leave party
+            d[0x000D] = _partyHandler.Handle_LEAVE_PARTY;          // 13 leave party
             d[0x000E] = _partyHandler.Handle_WALKOUT_PARTY_MEMBER;  // 14 踢人
-            d[0x000A] = _partyHandler.Handle_REQUEST_PEER;          // 10 右键同屏玩家→组队/交易邀请(按uid)→给目标发 SC 0x0007 弹框
-            d[0x000B] = _partyHandler.Handle_RES_PEER;              // 11 被邀请者应答: type0 7B接受/9B拒绝；仅接受才组队
-            // 419 creates a chat/1:1 conversation; party invites use 0x000A/0x000B.
-            d[0x01A3] = _chatHandler.Handle_CREATE_GROUP;
-            d[(ushort)CmdPacketType.ONE_TO_ONE_CHAT_STATE] =
-                _chatHandler.Handle_ONE_TO_ONE_CHAT_STATE;
+            d[(ushort)CmdPacketTypeA21.REQUEST_PEER] = (s, h, b) =>
+                Network.Parsers.Inventory.ItemTradeRequest.IsTradePeer(b)
+                    ? _socialHandlers.Trade.Request(s, h, b) : _partyHandler.Handle_REQUEST_PEER(s, h, b);
+            d[(ushort)CmdPacketTypeA21.RESPONSE_PEER] = (s, h, b) =>
+                Network.Parsers.Inventory.ItemTradeRequest.IsTradePeer(b)
+                    ? _socialHandlers.Trade.Respond(s, h, b) : _partyHandler.Handle_RES_PEER(s, h, b);
+            d[(ushort)CmdPacketTypeA21.SET_ITEMTRADE_STATE] = _socialHandlers.Trade.State;
             d[0x00A6] = _partyHandler.Handle_CALL_PARTY_MEMBER_REALTIME_INFO;  // 166 请求成员实时信息(HP%)
             d[0x0079] = _partyHandler.Handle_CHANGE_HOST;           // 121 委托队长(body=1字节槽位)
             // P2P 上报类: df 只喂统计计数器, 不回包不转发。收下即忽略, 消掉 Unhandled 日志。
@@ -369,6 +483,12 @@ namespace DfoServer.Network
 
         private void RegisterRaidHandlers(GameCommandRegistry.GameCommandRegistrationGroup d)
         {
+            d[(ushort)CmdPacketTypeA21.RAID_REQUEST_RAID_MEMBERS] = _raidHandler.HandleRaidRequestMembers;
+            d[(ushort)CmdPacketTypeA21.RAID_CHECK_RAID_USER] = _raidHandler.HandleRaidJoinRequest;
+            d[(ushort)CmdPacketTypeA21.RAID_OTHER_CHANNEL_LIST] = _raidHandler.HandleRaidOtherChannelList;
+            d[(ushort)CmdPacketTypeA21.RAID_RECENT_FRIEND_LIST] = _raidHandler.HandleRaidWaitingListRequest;
+            d[(ushort)CmdPacketTypeA21.SET_RAID_WAITING] = _raidHandler.HandleSetRaidWaiting;
+            d[(ushort)CmdPacketTypeA21.REJOIN_RAID] = _raidHandler.HandleRejoinRaid;
             d[(ushort)CmdPacketType.CREATE_RAID] = _raidHandler.HandleCreateRaid;
             d[(ushort)CmdPacketType.RAID_ENTRY_COST_INFO] = _raidHandler.HandleEntryCostInfo;
             d[(ushort)CmdPacketType.RAID_BUFF_SYSTEM] = _raidHandler.HandleRaidBuffSystem;
@@ -423,6 +543,8 @@ namespace DfoServer.Network
             };                                                                    //18
             d[0x0013] = async (s, h, b) =>
             {
+                if (await _socialHandlers.Trade.TryMove(s, h, b))
+                    return;
                 if (await _dungeonHandler.TryHandleDeathTowerMoveItem(s, h, b))
                     return;
                 if (await _knightShieldHandler.TryHandleMoveItemSpace(s, h, b))
@@ -435,7 +557,14 @@ namespace DfoServer.Network
                     return;
                 await _inventoryHandler.Handle_ENUM_CMDPACKET_SORT_ITEM(s, h, b);
             };                                                                    //20
-            d[0x0015] = _inventoryHandler.Handle_ENUM_CMDPACKET_BUY_ITEM;          //21
+            d[(ushort)CmdPacketTypeA21.BUY_ITEM] = async (s, h, b) =>
+            {
+                var player = s.Player;
+                var characterId = player?.CharacterId;
+                await _inventoryHandler.Handle_ENUM_CMDPACKET_BUY_ITEM(s, h, b);
+                if (player == s.Player && player?.CharacterId == characterId)
+                    await _raidHandler.RefreshEntryCostsAsync(s);
+            };
             d[0x02CC] = _inventoryHandler.Handle_ENUM_CMDPACKET_SHOP_PURCHASE_COUNT;//716
             d[0x0016] = _inventoryHandler.Handle_ENUM_CMDPACKET_SELL_ITEM;         //22
             d[0x0017] = _inventoryHandler.Handle_ENUM_CMDPACKET_REPAIR_EQUIPMENT;  //23 装备修理
@@ -476,6 +605,8 @@ namespace DfoServer.Network
             d[0x0197] = _inventoryHandler.Handle_REGENERATION_RANDOM_OPTION;       //407 equipment compound
             d[(ushort)CmdPacketTypeA21.TITLE_BOOK_PUT] = _inventoryHandler.Handle_TITLE_BOOK;
             d[0x01B6] = _inventoryHandler.Handle_CHANGE_RANDOM_OPTION;             //438
+            d[(ushort)CmdPacketTypeA21.RESET_RANDOM_OPTION] =
+                _inventoryHandler.Handle_RESET_RANDOM_OPTION;                    //456 魔法封印装备品级调整箱
             d[(ushort)CmdPacketTypeA21.TITLE_BOOK_GET] = _inventoryHandler.Handle_TITLE_BOOK;
             d[0x019E] = _inventoryHandler.Handle_ENUM_CMDPACKET_MONSTERCARD_BIND;  //414 monster card synthesis
             d[0x025C] = _inventoryHandler.Handle_UPGRADE_CARD;                     //604 monster card upgrade
@@ -553,6 +684,7 @@ namespace DfoServer.Network
         private void RegisterEquipmentEmblemHandlers(GameCommandRegistry.GameCommandRegistrationGroup d)
         {
             d[(ushort)CmdPacketType.USE_EMBLEM_FOR_EQUIPMENT] = _inventoryHandler.Handle_EQUIPMENT_EMBLEM_ATTACH;
+            d[(ushort)CmdPacketType.EMBLEM_COLLECT_ITEM] = _inventoryHandler.Handle_EMBLEM_COLLECT_ITEM;
         }
 
         private void RegisterAvatarSocketHandlers(GameCommandRegistry.GameCommandRegistrationGroup d)
@@ -740,6 +872,8 @@ namespace DfoServer.Network
                 _eventTotalAttendanceHandler.HandleCheckThisWeekAsync;
             d[(ushort)CmdPacketType.PARTY_TELEPORT] =
                 _townHandler.Handle_ENUM_CMDPACKET_PARTY_TELEPORT;
+            d[(ushort)CmdPacketTypeA21.SOLO_TELEPOART] =
+                _townHandler.Handle_ENUM_CMDPACKET_SOLO_TELEPOART;
         }
 
         private void RegisterSettingsHandlers(GameCommandRegistry.GameCommandRegistrationGroup d)
@@ -912,12 +1046,12 @@ namespace DfoServer.Network
         private void RegisterFriendHandlers(
             GameCommandRegistry.GameCommandRegistrationGroup d)
         {
-            d[(ushort)CmdPacketTypeA21.ADD_UNITED_SERVER_FRIEND] =
-                (s, h, b) => UnitedFriendSystem.HandleAddUnitedServerFriend(
-                    s, h, b, _worldDependencies.Sessions);
-            d[(ushort)CmdPacketTypeA21.DELETE_UNITED_SERVER_FRIEND] =
-                (s, h, b) => UnitedFriendSystem.HandleDeleteUnitedServerFriend(
-                    s, h, b, _worldDependencies.Sessions);
+            UnitedFriendSystem.RegisterHandlers(d, _worldDependencies.Sessions, _characterTransitions);
+            var repository = new Game.Friends.BlacklistRepository(_database);
+            var projection = new Game.Friends.BlacklistProjection(repository, _worldDependencies.Sessions);
+            UnitedFriendSystem.ConfigureBlacklist(_worldDependencies.Sessions, projection);
+            new BlacklistHandler(repository, _characterTransitions, projection).RegisterHandlers(d);
+            new UserChannelHandler(_worldDependencies.Sessions, _characterTransitions).RegisterHandlers(d);
         }
 
         private void RegisterEventJoustHandlers(
@@ -958,6 +1092,8 @@ namespace DfoServer.Network
                 _pvpRoomHandler.HandleSetReadyState;
             d[PvpRoomHandler.SetTeamModeCommandType] =
                 _pvpRoomHandler.HandleSetTeamMode;
+            d[(ushort)CmdPacketTypeA21.SET_PVP_MAP_INDEX] =
+                _pvpRoomHandler.HandleSetMapIndex;
             d[PvpRoomHandler.DiePvpCharacterCommandType] =
                 _pvpRoomHandler.HandleDiePvpCharacter;
             d[PvpRoomHandler.PvpTimeOutCommandType] =
@@ -972,6 +1108,10 @@ namespace DfoServer.Network
                 _pvpRoomHandler.HandleConnectP2pPvp;
             d[PvpRoomHandler.PvpRequestFightCommandType] =
                 _pvpRoomHandler.HandlePvpRequestFight;
+            d[(ushort)CmdPacketTypeA21.CHECK_PVP_TOTAL_MATCH_TEAM_NAME] =
+                _pvpRoomHandler.HandleCheckTotalMatchTeamName;
+            d[(ushort)CmdPacketTypeA21.SET_PVP_TOTAL_MATCH_TEAM] =
+                _pvpRoomHandler.HandleSetTotalMatchTeam;
             d[(ushort)CmdPacketType.SECURITY_STATUS] = HandleSecurityStatus;
         }
 

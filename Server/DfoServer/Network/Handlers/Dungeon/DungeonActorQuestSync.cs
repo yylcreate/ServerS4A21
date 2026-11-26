@@ -37,31 +37,15 @@ namespace DfoServer.Network.Handlers.Dungeon
                 actorType,
                 enemyType,
                 sourceEvent);
-            if (enemyType == QuestDropProvider.EnemyTypeMonster)
-            {
-                await DungeonQuestBridge.ApplyAsync(
-                    session,
-                    DungeonQuestProgressEvent.HuntMonster(
-                        sourceEvent,
-                        run.DungeonId,
-                        run.Difficulty,
-                        actorCode,
-                        actorType));
-                if (!run.Matches(sourceEvent.RunIdentity))
-                    return;
-            }
-
-            if (!QuestData.IsServerDrivenHuntEnemyActorType(enemyType))
-                return;
-
             await DungeonQuestBridge.ApplyAsync(
                 session,
-                DungeonQuestProgressEvent.HuntEnemy(
+                DungeonQuestProgressEvent.ActorDeath(
                     sourceEvent,
                     run.DungeonId,
                     run.Difficulty,
-                        actorCode,
-                        enemyType));
+                    actorCode,
+                    actorType,
+                    enemyType));
         }
 
         private static void ApplyAnotherAradActorDeath(
@@ -100,6 +84,12 @@ namespace DfoServer.Network.Handlers.Dungeon
                             || actor.Faction == PvfLib.ApcFaction.Monster;
                     }
                 }
+            }
+            else if (!run.Matches(sourceEvent.RoomIdentity))
+            {
+                // 扇出/重放投影的事件可能已不指向当前房间：AnotherArad 写入前
+                // 复验房间，避免把进度记进旧房间的观察记录。
+                return;
             }
 
             runtime.TryRecordActorDeath(

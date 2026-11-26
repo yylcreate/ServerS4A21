@@ -418,20 +418,50 @@ namespace DfoServer.Game.Quests
                 grantedSlots.Add(grant.SlotIndex);
             }
 
-            if (grantedSlots.Count <= 0)
+            if (grantedSlots.Count <= 0
+                && committed.TriggerChanges.Count <= 0)
                 return Task.CompletedTask;
 
-            // Coalesce only client projections after online inventory and quest state settle.
-            _notificationBatcher.Queue(session, grantedSlots);
+            if (sourceName == "passive")
+            {
+                // 被动物体任务掉落逐次留痕：组队扇出后用于区分
+                // "服务端没发" 与 "客户端没显示"。
+                foreach (var entry in committed.Grants.Entries)
+                {
+                    if (entry?.Request == null)
+                        continue;
+
+                    FileLogger.Log(
+                        $"[GameProtocol] PASSIVE_QUEST_DROP cid={characterId} " +
+                        $"object={sourceCode} item={entry.Request.ItemTemplateId} " +
+                        $"count={entry.Request.Count} " +
+                        $"sourceCid={source.SourcePlayerId} " +
+                        $"event={source.SourceEventId:N}");
+                }
+            }
+
+            // Coalesce client projections only after online inventory and quest
+            // state settle.  Seeking-item progress is committed in the same
+            // transaction as the item grant, so the corresponding trigger must
+            // travel with the inventory update or the client keeps displaying
+            // its stale pre-drop objective value.
+            _notificationBatcher.Queue(
+                session,
+                grantedSlots,
+                committed.TriggerChanges);
             return Task.CompletedTask;
         }
+
+        // 显式排空某会话的待发批量通知（自测驱动 100ms 合并窗口用，
+        // 不依赖 ClockService 全局定时器）。
+        internal Task FlushPendingNotificationsAsync(EnhancedClientSession session)
+            => _notificationBatcher.FlushPendingAsync(session);
 
         internal QuestDropCommitResult CommitAutomaticDrops(
             InventoryLease lease,
             Guid sessionId,
             int characterId,
-            Guid sourceEventId,
-            QuestRunSnapshot snapshot,
+            Guid sourceEventId,            QuestRunSnapshot snapshot,
             IReadOnlyList<QuestDropCandidate> candidates,
             Func<bool> isStillCurrent,
             bool questAssistantActive = false)
@@ -583,7 +613,9 @@ namespace DfoServer.Game.Quests
                                 transaction.Commit();
                                 committed = true;
                                 inventory.ClearDirtyState();
-                                return QuestDropCommitResult.Success(grants);
+                                return QuestDropCommitResult.Success(
+                                    grants,
+                                    progress.Changes);
                             }
                         }
                     }
@@ -854,7 +886,8 @@ namespace DfoServer.Game.Quests
 
         internal static HashSet<int> FilterEligibleQuestActivations(
             QuestRunSnapshot snapshot,
-            IEnumerable<ActiveQuest> activeQuests)
+            IEnumerable<ActiveQuest> activeQuests,
+            DungeonRun run = null)
         {
             if (snapshot == null || snapshot.Count == 0 || activeQuests == null)
                 return null;
@@ -862,9 +895,15 @@ namespace DfoServer.Game.Quests
             var eligible = new HashSet<int>();
             foreach (var activeQuest in activeQuests)
             {
-                if (activeQuest == null
-                    || !snapshot.TryGet(activeQuest.QuestId, out var frozen))
+                if (activeQuest == null)
+                    continue;
+
+                if (!snapshot.TryGet(activeQuest.QuestId, out var frozen))
                 {
+                    LogQuestFilteredOut(
+                        run,
+                        activeQuest.QuestId,
+                        "not in run snapshot");
                     continue;
                 }
 
@@ -872,12 +911,37 @@ namespace DfoServer.Game.Quests
                     || !activeQuest.ActivationId.IsValid
                     || !frozen.ActivationId.Equals(activeQuest.ActivationId))
                 {
+                    LogQuestFilteredOut(
+                        run,
+                        activeQuest.QuestId,
+                        "activation mismatch");
                     continue;
                 }
 
                 eligible.Add(activeQuest.QuestId);
             }
             return eligible.Count > 0 ? eligible : null;
+        }
+
+        // 每次掉落判定都会走一遍过滤, 同一局里同一任务的同一原因只记一条,
+        // 避免刷屏淹没 server.log。run 为 null 时(单测)只做一次纯日志。
+        private static void LogQuestFilteredOut(
+            DungeonRun run,
+            int questId,
+            string reason)
+        {
+            if (questId <= 0 || questId > ushort.MaxValue)
+                return;
+
+            if (run != null
+                && !run.TryMarkQuestDropFilterLogged((ushort)questId, reason))
+            {
+                return;
+            }
+
+            FileLogger.Log(
+                $"[{ProtocolLogName}] QUEST_DROP quest={questId} " +
+                $"filtered out by run snapshot: {reason}");
         }
 
         private HashSet<int> LoadEligibleQuestIds(
@@ -911,7 +975,7 @@ namespace DfoServer.Game.Quests
                 var quests = QuestService.LoadActiveQuests(
                     connStr,
                     session.Player.CharacterId);
-                eligible = FilterEligibleQuestActivations(snapshot, quests);
+                eligible = FilterEligibleQuestActivations(snapshot, quests, run);
                 return true;
             }
             catch (Exception ex)
@@ -982,14 +1046,21 @@ namespace DfoServer.Game.Quests
         internal bool Committed { get; private set; }
         internal bool DuplicateEvent { get; private set; }
         internal DungeonItemGrantBatchResult Grants { get; private set; }
+        internal IReadOnlyList<QuestSetTriggerResult> TriggerChanges
+            { get; private set; } = Array.Empty<QuestSetTriggerResult>();
         internal string Error { get; private set; } = string.Empty;
 
         internal static QuestDropCommitResult Success(
-            DungeonItemGrantBatchResult grants)
+            DungeonItemGrantBatchResult grants,
+            IReadOnlyList<QuestSetTriggerResult> triggerChanges)
             => new QuestDropCommitResult
             {
                 Committed = true,
                 Grants = grants,
+                TriggerChanges = triggerChanges == null
+                    ? Array.Empty<QuestSetTriggerResult>()
+                    : new List<QuestSetTriggerResult>(triggerChanges)
+                        .AsReadOnly(),
             };
 
         internal static QuestDropCommitResult Fail(string error)

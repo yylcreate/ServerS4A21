@@ -38,6 +38,8 @@ namespace DfoServer.Network.Builders
             Register(new QuestListBodyBuilder());              
             Register(new UserInfoBodyBuilder());
             Register(new UserStateInitBodyBuilder());
+            Register(new Pvp.PvpRecordBodyBuilder(_database));
+            Register(new Pvp.PvpTotalMatchTeamBodyBuilder(_database));
             Register(new SimpleByteBodyBuilder(0x00CA, _ => 0));
             Register(new A21UsableCount0465BodyBuilder());
             Register(new A21UsableCount021EBodyBuilder());
@@ -62,7 +64,7 @@ namespace DfoServer.Network.Builders
             Register(new SimpleByteBodyBuilder(
                 (ushort)NotiPacketTypeA21.UPGRADE_CARRY_GOLD,
                 s => s.GoldLimitUpgradeLevel));
-            Register(new PremiumServiceInitBodyBuilder());
+            RegisterCmd(new PremiumServiceInitBodyBuilder());
 
             
             Register(new EnterGameWorldCompleteBodyBuilder());
@@ -91,6 +93,7 @@ namespace DfoServer.Network.Builders
             Register(new RentalInfoBodyBuilder());                                      
             Register(new LotteryBufferBodyBuilder(_database));                          
             Register(new CubeInfoBodyBuilder());                                        
+            Register(new BoosterGageBodyBuilder());
             Register(new FatigueAccelBodyBuilder());                                    
 
             

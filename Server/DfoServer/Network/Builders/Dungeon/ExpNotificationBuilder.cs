@@ -1,4 +1,5 @@
 using DfoServer.Game.Accounts;
+using DfoServer.Game.Dungeon;
 using DfoServer.Game.Skills;
 
 namespace DfoServer.Network.Builders

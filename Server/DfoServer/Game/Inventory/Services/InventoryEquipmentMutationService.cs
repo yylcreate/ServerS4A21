@@ -11,6 +11,7 @@ namespace DfoServer.Game.Inventory
     {
         private const byte UnidentifiedAmplifyFlag = 0x80;
         private const short GoldSlot = 0;
+        private const string EmblemCollectorActionType = "emblem collector";
 
         internal static bool TryEnchantByBead(
             InventoryService inventory,
@@ -235,6 +236,111 @@ namespace DfoServer.Game.Inventory
                 TargetEquipped = targetListType == InventoryListType.Equipment,
             };
             result.ConsumedEmblems.AddRange(consumed);
+            return true;
+        }
+
+        // 0x03B8 EMBLEM_COLLECT_ITEM: 徽章回收箱从目标装备上回收 1 个徽章并清空已开孔位, 消耗箱子 1 个。
+        // 装备镶有 2 个同级徽章时回收 EmblemId1、销毁 EmblemId2; 只有一个徽章时回收该徽章、无销毁对象。
+        // 任一校验失败即整体不变更。
+        internal static bool TryCollectEquipmentEmblems(
+            InventoryService inventory,
+            short boxSlotIndex,
+            int boxTemplateId,
+            short targetSlotIndex,
+            int targetUid,
+            out EquipmentEmblemCollectResult result)
+        {
+            result = null;
+            if (inventory == null
+                || boxTemplateId <= 0
+                || targetUid <= 0
+                || boxSlotIndex < 0
+                || targetSlotIndex < 0)
+                return false;
+
+            var box = inventory.GetItem(InventoryListType.Main, boxSlotIndex);
+            if (box == null || box.ItemId != boxTemplateId || box.Count < 1)
+                return false;
+
+            if (!TryResolveEmblemCollectorGrades(boxTemplateId, out var boxGrades))
+                return false;
+
+            if (!TryResolveEquipmentTarget(
+                    inventory,
+                    targetSlotIndex,
+                    targetUid,
+                    out var targetListType,
+                    out var target))
+                return false;
+
+            if (IsItemLocked(inventory, target))
+                return false;
+
+            if (target.EmblemSocketCount <= 0)
+                return false;
+
+            var firstEmblemTemplateId = target.EmblemId1;
+            var secondEmblemTemplateId = target.EmblemId2;
+            if (firstEmblemTemplateId <= 0 && secondEmblemTemplateId <= 0)
+                return false;
+
+            if (firstEmblemTemplateId > 0
+                && (!TryResolveEmblemGrade(firstEmblemTemplateId, out var firstEmblemGrade)
+                    || !boxGrades.Contains(firstEmblemGrade)))
+                return false;
+
+            if (secondEmblemTemplateId > 0
+                && (!TryResolveEmblemGrade(secondEmblemTemplateId, out var secondEmblemGrade)
+                    || !boxGrades.Contains(secondEmblemGrade)))
+                return false;
+
+            var updatedTarget = target.Copy();
+            var returnedEmblemTemplateId = firstEmblemTemplateId > 0
+                ? firstEmblemTemplateId
+                : secondEmblemTemplateId;
+            var destroyedEmblemTemplateId = firstEmblemTemplateId > 0 && secondEmblemTemplateId > 0
+                ? secondEmblemTemplateId
+                : 0;
+
+            // 先发放返还的徽章: 背包满时直接失败返回, 此时尚无任何内存副作用。
+            if (!InventoryRewardGrantService.TryGrant(
+                    inventory,
+                    InventoryRewardGrantRequest.Create(
+                        returnedEmblemTemplateId,
+                        1,
+                        ItemCreateReason.Unknown),
+                    out var grantResult)
+                || grantResult == null
+                || !grantResult.Success)
+                return false;
+
+            updatedTarget.EmblemId1 = 0;
+            updatedTarget.EmblemId2 = 0;
+            EnsureEquipmentSocketPlaceholders(updatedTarget, updatedTarget.EmblemSocketCount);
+            if (!inventory.SetItem(targetListType, targetSlotIndex, updatedTarget))
+                return false;
+
+            if (!InventoryDeleteService.TryDecreaseStack(
+                    inventory,
+                    InventoryListType.Main,
+                    boxSlotIndex,
+                    1,
+                    out var boxDelete))
+                return false;
+
+            result = new EquipmentEmblemCollectResult
+            {
+                TargetListType = targetListType,
+                TargetSlotIndex = targetSlotIndex,
+                TargetEquipped = targetListType == InventoryListType.Equipment,
+                ReturnedEmblemTemplateId = returnedEmblemTemplateId,
+                DestroyedEmblemTemplateId = destroyedEmblemTemplateId,
+                ReturnedEmblemListType = grantResult.ListType,
+                ReturnedEmblemSlotIndex = grantResult.SlotIndex,
+                BoxItemTemplateId = boxTemplateId,
+                BoxSlotIndex = boxSlotIndex,
+                BoxRemainingCount = boxDelete.RemainingCount,
+            };
             return true;
         }
 
@@ -526,6 +632,9 @@ namespace DfoServer.Game.Inventory
             result.SourceInstanceValue = source.Value != 0 ? source.Value : request.SourceInstanceValue;
             if (request.ExpectedSourceItemTemplateId > 0 && source.ItemId != request.ExpectedSourceItemTemplateId)
             {
+                if (!IsEquipmentEffectRuneItem(source.ItemId, out _, out _))
+                    return false;
+
                 result.Status = EquipmentEffectRuneStatus.MissingSource;
                 return true;
             }
@@ -1023,6 +1132,49 @@ namespace DfoServer.Game.Inventory
                 core.EmblemId1 = emblemItemTemplateId;
             else if (socketIndex == 1)
                 core.EmblemId2 = emblemItemTemplateId;
+        }
+
+        private static bool TryResolveEmblemCollectorGrades(int boxTemplateId, out HashSet<int> grades)
+        {
+            grades = null;
+            if (!ItemMetadataResolver.TryLoadStackableFile(boxTemplateId, out var stackable)
+                || stackable == null)
+                return false;
+
+            var actionType = NormalizeActionType(stackable.ActionTypeName);
+            if (!string.Equals(actionType, EmblemCollectorActionType, StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            if (stackable.ActionTypeParams == null)
+                return false;
+
+            grades = new HashSet<int>();
+            foreach (var value in stackable.ActionTypeParams)
+            {
+                if (value > 0)
+                    grades.Add(value);
+            }
+
+            return grades.Count > 0;
+        }
+
+        private static bool TryResolveEmblemGrade(int emblemTemplateId, out int grade)
+        {
+            grade = 0;
+            if (emblemTemplateId <= 0)
+                return false;
+
+            return ItemMetadataResolver.TryLoadStackableFile(emblemTemplateId, out var stackable)
+                && stackable != null
+                && (grade = stackable.Grade) >= 0;
+        }
+
+        private static string NormalizeActionType(string raw)
+        {
+            var value = (raw ?? string.Empty).Trim().Trim('`').Trim();
+            if (value.Length >= 2 && value[0] == '[' && value[value.Length - 1] == ']')
+                value = value.Substring(1, value.Length - 2).Trim();
+            return value;
         }
 
         private static int GetEquipmentSocketOpenCount(int itemTemplateId)
@@ -1773,6 +1925,7 @@ namespace DfoServer.Game.Inventory
 
             var updatedTarget = target.Copy();
             updatedTarget.Value = newQualitySeed;
+            RerollRandomOptionsForGradeChange(metadata, updatedTarget);
 
             if (!inventory.SetItem(InventoryListType.Main, request.TargetSlotIndex, updatedTarget))
                 return false;
@@ -1811,6 +1964,30 @@ namespace DfoServer.Game.Inventory
             if (qualitySeed == currentQualitySeed)
                 qualitySeed = qualitySeed + 1 < topQualitySeed ? qualitySeed + 1 : qualitySeed - 1;
             return qualitySeed;
+        }
+
+        // 品级调整箱: 装备品级种子重 roll 的同时, 逐条按 [postfix grade modification] 重 roll
+        // 封印属性数值; 跳过名单内或无档位表的属性保持原值。条数/类型/顺序及 RandomOptionState
+        // 等其余字段一律不动; 无封印属性的装备不触发该路径(行为与现状一致)。
+        private static void RerollRandomOptionsForGradeChange(ItemMetadata metadata, ItemCore updatedTarget)
+        {
+            var existing = updatedTarget.RandomOptions;
+            if (existing == null || existing.Count == 0)
+                return;
+
+            var entries = ToRandomOptionEntries(existing);
+            var changed = false;
+            for (var i = 0; i < entries.Count && i < 3; i++)
+            {
+                if (!RandomOptionResolver.TryRerollOptionValueForGradeChange(metadata, entries[i].Type, out var rerolled))
+                    continue;
+
+                entries[i] = rerolled;
+                changed = true;
+            }
+
+            if (changed)
+                updatedTarget.SetRandomOptions(ToRandomOptions(entries));
         }
 
         private static ResetItemQualityResult CreateResetQualityErrorResult(ResetItemQualityRequest request, byte errorCode)

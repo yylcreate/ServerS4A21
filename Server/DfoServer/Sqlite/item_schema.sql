@@ -1,4 +1,4 @@
-﻿PRAGMA foreign_keys = ON;
+PRAGMA foreign_keys = ON;
 
 CREATE TABLE IF NOT EXISTS accounts (
     account_id     INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -63,6 +63,70 @@ CREATE TABLE IF NOT EXISTS characters (
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_characters_name_unique
     ON characters(name);
+
+CREATE TABLE IF NOT EXISTS character_pvp_records (
+    character_id INTEGER PRIMARY KEY REFERENCES characters(character_id) ON DELETE CASCADE,
+    experience_in_grade INTEGER NOT NULL DEFAULT 0 CHECK(experience_in_grade BETWEEN 0 AND 2147483647),
+    win_count INTEGER NOT NULL DEFAULT 0 CHECK(win_count BETWEEN 0 AND 2147483647),
+    loss_count INTEGER NOT NULL DEFAULT 0 CHECK(loss_count BETWEEN 0 AND 2147483647),
+    rank_point INTEGER NOT NULL DEFAULT 0 CHECK(rank_point BETWEEN 0 AND 2147483647),
+    peak_rank_point INTEGER NOT NULL DEFAULT 0 CHECK(peak_rank_point BETWEEN rank_point AND 2147483647),
+    rank_warmup_games INTEGER NOT NULL DEFAULT 0 CHECK(rank_warmup_games BETWEEN 0 AND 2147483647),
+    total_match_point INTEGER NOT NULL DEFAULT 0 CHECK(total_match_point BETWEEN 0 AND 2147483647),
+    total_match_warmup_games INTEGER NOT NULL DEFAULT 0 CHECK(total_match_warmup_games BETWEEN 0 AND 2147483647)
+);
+
+CREATE TABLE IF NOT EXISTS pvp_matches (
+    room_generation TEXT NOT NULL,
+    match_generation INTEGER NOT NULL CHECK(match_generation > 0),
+    listener_port INTEGER NOT NULL,
+    battle_mode INTEGER NOT NULL CHECK(battle_mode BETWEEN 1 AND 3),
+    winner_seat INTEGER NOT NULL CHECK(winner_seat BETWEEN 0 AND 7 OR winner_seat=255),
+    season INTEGER NOT NULL CHECK(season > 0),
+    game_day INTEGER NOT NULL,
+    completed_at_utc TEXT NOT NULL,
+    PRIMARY KEY(room_generation, match_generation)
+);
+
+CREATE TABLE IF NOT EXISTS pvp_match_results (
+    result_id INTEGER PRIMARY KEY,
+    room_generation TEXT NOT NULL,
+    match_generation INTEGER NOT NULL,
+    character_id INTEGER NOT NULL REFERENCES characters(character_id) ON DELETE CASCADE,
+    seat INTEGER NOT NULL CHECK(seat BETWEEN 0 AND 7),
+    user_id INTEGER NOT NULL CHECK(user_id BETWEEN 1 AND 65534),
+    team INTEGER NOT NULL CHECK(team BETWEEN 0 AND 2),
+    outcome INTEGER NOT NULL CHECK(outcome BETWEEN 0 AND 2),
+    kills INTEGER NOT NULL CHECK(kills >= 0),
+    deaths INTEGER NOT NULL CHECK(deaths >= 0),
+    previous_grade INTEGER NOT NULL CHECK(previous_grade BETWEEN 0 AND 255),
+    grade INTEGER NOT NULL CHECK(grade BETWEEN 0 AND 255),
+    experience_change INTEGER NOT NULL,
+    experience INTEGER NOT NULL CHECK(experience >= 0),
+    win_streak INTEGER NOT NULL CHECK(win_streak >= 0),
+    peak_win_streak INTEGER NOT NULL CHECK(peak_win_streak >= win_streak),
+    opponent_job INTEGER,
+    opponent_grow_type INTEGER,
+    UNIQUE(room_generation, match_generation, character_id),
+    UNIQUE(room_generation, match_generation, seat),
+    FOREIGN KEY(room_generation, match_generation)
+        REFERENCES pvp_matches(room_generation, match_generation) ON DELETE CASCADE,
+    CHECK((opponent_job IS NULL AND opponent_grow_type IS NULL)
+        OR (opponent_job BETWEEN 0 AND 255 AND opponent_grow_type BETWEEN 0 AND 255))
+);
+
+CREATE INDEX IF NOT EXISTS idx_pvp_match_results_character
+    ON pvp_match_results(character_id, result_id DESC);
+
+CREATE TABLE IF NOT EXISTS account_pvp_total_match_teams (
+    account_id INTEGER PRIMARY KEY REFERENCES accounts(account_id) ON DELETE CASCADE,
+    name TEXT NOT NULL COLLATE NOCASE UNIQUE CHECK(length(name) > 0),
+    character_id_0 INTEGER NOT NULL REFERENCES characters(character_id) ON DELETE CASCADE,
+    character_id_1 INTEGER NOT NULL REFERENCES characters(character_id) ON DELETE CASCADE,
+    character_id_2 INTEGER NOT NULL REFERENCES characters(character_id) ON DELETE CASCADE,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CHECK(character_id_0 <> character_id_1 AND character_id_0 <> character_id_2 AND character_id_1 <> character_id_2)
+);
 
 CREATE INDEX IF NOT EXISTS idx_characters_account
     ON characters(account_id, delete_flag);
@@ -172,6 +236,7 @@ CREATE TABLE IF NOT EXISTS item_purchase_limits (
     buy_count INTEGER NOT NULL DEFAULT 0,
     limit_type INTEGER NOT NULL DEFAULT 0,
     reset_type INTEGER NOT NULL DEFAULT 0,
+    day_id INTEGER NOT NULL DEFAULT 0,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (account_id, character_id, npc_id, item_id, limit_type, reset_type),
     CHECK(limit_type IN (0, 1)),
@@ -438,6 +503,23 @@ CREATE TABLE IF NOT EXISTS character_growth_weapon_stages (
     PRIMARY KEY (character_id, sort_order),
     FOREIGN KEY (character_id) REFERENCES characters(character_id) ON DELETE CASCADE
 );
+
+-- 龙跃武器([equipment grow])每件实例的成长值。
+-- 成长值随武器实例走：跨列表移动(背包<->穿戴)时 item_uid 会变，
+-- 迁移逻辑在 InventoryPersistenceService 的同事务内完成。
+CREATE TABLE IF NOT EXISTS character_equipment_growth (
+    character_id INTEGER NOT NULL,
+    item_uid INTEGER NOT NULL,
+    item_id INTEGER NOT NULL,
+    growth_value INTEGER NOT NULL DEFAULT 0 CHECK(growth_value >= 0),
+    stage INTEGER NOT NULL DEFAULT 1 CHECK(stage >= 1),
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (character_id, item_uid),
+    FOREIGN KEY (character_id) REFERENCES characters(character_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_character_equipment_growth_item
+    ON character_equipment_growth(character_id, item_id);
 
 CREATE TABLE IF NOT EXISTS character_pvp_missions (
     character_id INTEGER NOT NULL,
@@ -963,6 +1045,34 @@ CREATE INDEX IF NOT EXISTS idx_mailbox_messages_sender_created
 CREATE INDEX IF NOT EXISTS idx_mailbox_messages_expiry
     ON mailbox_messages(mail_type, expire_at, message_id);
 
+-- 等级变更与角色进度同事务记录；基础升级邮件的消费状态不影响其他活动读取事件。
+CREATE TABLE IF NOT EXISTS character_level_up_events (
+    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    character_id INTEGER NOT NULL REFERENCES characters(character_id) ON DELETE CASCADE,
+    previous_level INTEGER NOT NULL CHECK(previous_level BETWEEN 1 AND 254),
+    new_level INTEGER NOT NULL CHECK(new_level BETWEEN 2 AND 255 AND new_level > previous_level),
+    source TEXT NOT NULL,
+    occurred_at_utc TEXT NOT NULL,
+    base_rewards_processed_at_utc TEXT,
+    retry_after_unix INTEGER NOT NULL DEFAULT 0,
+    attempts INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_character_level_up_events_pending
+    ON character_level_up_events(retry_after_unix, event_id)
+    WHERE base_rewards_processed_at_utc IS NULL;
+
+-- 发放账本独立于邮件生命周期，清理过期邮件不得恢复同等级的发奖资格。
+CREATE TABLE IF NOT EXISTS character_level_up_rewards (
+    character_id INTEGER NOT NULL REFERENCES characters(character_id) ON DELETE CASCADE,
+    reward_key TEXT NOT NULL,
+    level INTEGER NOT NULL CHECK(level BETWEEN 2 AND 255),
+    item_id INTEGER NOT NULL CHECK(item_id > 0),
+    item_count INTEGER NOT NULL CHECK(item_count > 0),
+    message_id INTEGER REFERENCES mailbox_messages(message_id) ON DELETE SET NULL,
+    delivered_at_utc TEXT NOT NULL,
+    PRIMARY KEY(character_id, reward_key, level)
+);
+
 CREATE TABLE IF NOT EXISTS mailbox_recipients (
     recipient_id INTEGER PRIMARY KEY AUTOINCREMENT,
     message_id INTEGER NOT NULL,
@@ -1166,6 +1276,22 @@ CREATE TABLE IF NOT EXISTS game_event_info_details (
     sort_order INTEGER NOT NULL DEFAULT 0,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (event_id) REFERENCES game_event_state(event_id) ON DELETE CASCADE
+);
+
+-- Event 2037 enables the client's native RandomboxBooster HUD host.
+INSERT OR IGNORE INTO game_event_state(event_id, state)
+VALUES(2037, 1);
+
+INSERT OR IGNORE INTO game_event_info_details (
+    event_id, unknown0, start_notice, end_notice, detail_flag,
+    flag_a, flag_b, title, short_name, reserved_or_icon,
+    start_unix_time, end_unix_time, link_key, description,
+    detail_enabled, sort_order, updated_at
+) VALUES (
+    2037, 0, '[S4A21]', '[S4A21]', 0,
+    0, 0, '', '', '',
+    0, 0, '', '',
+    0, 0, CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS game_event_info_extra (
@@ -1435,4 +1561,151 @@ CREATE TABLE IF NOT EXISTS schema_metadata (
     schema_version INTEGER NOT NULL,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 公会身份和申请的持久化真源。
+CREATE TABLE IF NOT EXISTS guilds (
+    guild_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+    promotion TEXT NOT NULL DEFAULT '',
+    announcement TEXT NOT NULL DEFAULT '',
+    leader_character_id INTEGER NOT NULL UNIQUE REFERENCES characters(character_id),
+    contribution INTEGER NOT NULL DEFAULT 0 CHECK(contribution >= 0),
+    agit_level INTEGER NOT NULL DEFAULT 0 CHECK(agit_level >= 0),
+    cargo_slot_count INTEGER NOT NULL DEFAULT 0 CHECK(cargo_slot_count >= 0),
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS guild_members (
+    character_id INTEGER PRIMARY KEY REFERENCES characters(character_id),
+    guild_id INTEGER NOT NULL REFERENCES guilds(guild_id) ON DELETE CASCADE,
+    rank INTEGER NOT NULL DEFAULT 4 CHECK(rank BETWEEN 2 AND 5),
+    memo TEXT NOT NULL DEFAULT '',
+    contribution INTEGER NOT NULL DEFAULT 0 CHECK(contribution >= 0),
+    joined_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS guild_cargo_items (
+    guild_id INTEGER NOT NULL REFERENCES guilds(guild_id) ON DELETE CASCADE,
+    slot_index INTEGER NOT NULL CHECK(slot_index >= 0),
+    item_core BLOB NOT NULL CHECK(length(item_core) = 99),
+    PRIMARY KEY(guild_id, slot_index)
+);
+CREATE INDEX IF NOT EXISTS idx_guild_members_guild ON guild_members(guild_id);
+CREATE TABLE IF NOT EXISTS guild_applications (
+    guild_id INTEGER NOT NULL REFERENCES guilds(guild_id) ON DELETE CASCADE,
+    character_id INTEGER NOT NULL REFERENCES characters(character_id) ON DELETE CASCADE,
+    applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    message TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY(guild_id, character_id)
+);
+CREATE TABLE IF NOT EXISTS character_blacklist (
+    owner_character_id INTEGER NOT NULL REFERENCES characters(character_id) ON DELETE CASCADE,
+    target_character_id INTEGER NOT NULL REFERENCES characters(character_id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY(owner_character_id, target_character_id),
+    CHECK(owner_character_id <> target_character_id)
+);
+
+-- NPC 好感度。好感点跨日保留；每日赠礼次数和物品数由 gift_day_id 惰性换日。
+-- 单角色跨 NPC 的每日总赠礼物品数通过 (character_id, gift_day_id) 索引求和。
+CREATE TABLE IF NOT EXISTS character_npc_favor (
+    character_id INTEGER NOT NULL REFERENCES characters(character_id) ON DELETE CASCADE,
+    npc_id INTEGER NOT NULL CHECK(npc_id >= 0),
+    favor_point INTEGER NOT NULL DEFAULT 0 CHECK(favor_point >= 0),
+    gift_day_id INTEGER NOT NULL DEFAULT 0,
+    gift_action_count INTEGER NOT NULL DEFAULT 0 CHECK(gift_action_count >= 0),
+    gift_item_count INTEGER NOT NULL DEFAULT 0 CHECK(gift_item_count >= 0),
+    last_gift_at TEXT,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY(character_id, npc_id)
+);
+CREATE INDEX IF NOT EXISTS idx_character_npc_favor_daily
+    ON character_npc_favor(character_id, gift_day_id);
+CREATE TRIGGER IF NOT EXISTS guild_member_prevent_soft_delete
+BEFORE UPDATE OF delete_flag ON characters
+WHEN NEW.delete_flag <> 0 AND EXISTS (
+    SELECT 1 FROM guild_members WHERE character_id = OLD.character_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'leave guild before deleting character');
+END;
+
+CREATE TABLE IF NOT EXISTS guild_dungeon_progress (
+    guild_id INTEGER NOT NULL REFERENCES guilds(guild_id) ON DELETE CASCADE,
+    period_start INTEGER NOT NULL,
+    style_id INTEGER NOT NULL,
+    dungeon_id INTEGER NOT NULL,
+    clear_count INTEGER NOT NULL CHECK(clear_count >= 0),
+    PRIMARY KEY(guild_id, period_start, style_id, dungeon_id)
+);
+CREATE TABLE IF NOT EXISTS guild_dungeon_clears (
+    event_id TEXT NOT NULL,
+    character_id INTEGER NOT NULL REFERENCES characters(character_id) ON DELETE CASCADE,
+    guild_id INTEGER NOT NULL REFERENCES guilds(guild_id) ON DELETE CASCADE,
+    period_start INTEGER NOT NULL,
+    dungeon_id INTEGER NOT NULL,
+    mail_id INTEGER NOT NULL,
+    clear_count INTEGER NOT NULL,
+    PRIMARY KEY(event_id, character_id)
+);
+
+CREATE TABLE IF NOT EXISTS guild_contents (
+    guild_id INTEGER NOT NULL REFERENCES guilds(guild_id) ON DELETE CASCADE,
+    content_type INTEGER NOT NULL,
+    content_id INTEGER NOT NULL,
+    content_value INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL CHECK(expires_at >= 0),
+    PRIMARY KEY(guild_id, content_type)
+);
+
+-- 角色改名历史。changed_at 为 Unix 秒；old_name 保留 180 天用于防止旧名被抢注，
+-- 同角色两次改名间隔 90 天。写入与改名事务同批提交（CharacterRenameCommitService）。
+CREATE TABLE IF NOT EXISTS character_rename_history (
+    character_id INTEGER NOT NULL,
+    changed_at INTEGER NOT NULL,
+    old_name BLOB NOT NULL,
+    new_name BLOB NOT NULL,
+    source_item INTEGER NOT NULL,
+    PRIMARY KEY(character_id, changed_at),
+    FOREIGN KEY(character_id) REFERENCES characters(character_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_character_rename_old_name
+    ON character_rename_history(old_name, changed_at);
+
+-- ---------------------------------------------------------------------------
+-- v42: gold consignment (金币寄售) — independent from the ordinary gold auction.
+-- Wire evidence: 0x00B7 28B register body == 37B item register minus the 3
+-- trailing filter tuples, with space=0/slot=0 = Main virtual slot 0 (gold).
+-- See Docs/金币寄售业务接入规范.md.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS gold_consignment_listings (
+    listing_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    seller_character_id INTEGER NOT NULL,
+    seller_account_id   INTEGER NOT NULL,
+    gold_amount     INTEGER NOT NULL,
+    unit_price_cera INTEGER NOT NULL,
+    total_price_cera INTEGER NOT NULL,
+    fee_percent     INTEGER NOT NULL DEFAULT 5,
+    duration_hours  INTEGER NOT NULL,
+    state           INTEGER NOT NULL,
+    created_at_unix INTEGER NOT NULL,
+    expires_at_unix INTEGER NOT NULL,
+    settled_at_unix INTEGER,
+    buyer_character_id INTEGER,
+    buyer_account_id   INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_gold_consignment_active
+    ON gold_consignment_listings(state, expires_at_unix);
+CREATE INDEX IF NOT EXISTS idx_gold_consignment_seller
+    ON gold_consignment_listings(seller_character_id, state);
+
+CREATE TABLE IF NOT EXISTS gold_consignment_settlements (
+    settlement_id   INTEGER PRIMARY KEY AUTOINCREMENT,
+    listing_id      INTEGER NOT NULL,
+    outcome         INTEGER NOT NULL,
+    seller_character_id INTEGER NOT NULL,
+    seller_account_id   INTEGER NOT NULL,
+    gold_amount     INTEGER NOT NULL,
+    token_cera_paid INTEGER NOT NULL,
+    created_at_unix INTEGER NOT NULL,
+    UNIQUE(listing_id, outcome)
 );

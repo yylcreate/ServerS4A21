@@ -11,6 +11,8 @@ using DfoServer.Infrastructure;
 using Microsoft.Data.Sqlite;
 using System;
 using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
 
 namespace DfoServer.Game.Inventory
 {
@@ -19,6 +21,9 @@ namespace DfoServer.Game.Inventory
         private const string LevelUpTicketActionType = "[level up ticket]";
         internal const int SkillPointBook5ItemId = 1031;
         internal const int SkillPointBook20ItemId = 1038;
+        // TP+1 / TP+5 技能书（stackable/book_fskill1.stk、book_fskill2.stk）
+        internal const int TpPointBook1ItemId = 1204;
+        internal const int TpPointBook5ItemId = 1205;
 
         private readonly string _connectionString;
         private readonly IRentalTimeProvider _timeProvider;
@@ -50,7 +55,8 @@ namespace DfoServer.Game.Inventory
             int accountId,
             InventoryListType listType,
             short slotIndex,
-            ExperienceItemUseLocation location)
+            ExperienceItemUseLocation location,
+            uint? currentExp = null)
         {
             if (listType != InventoryListType.Main || characterId <= 0 || slotIndex < 0)
                 return Reject(ExperienceItemUseStatus.NotApplicable, 0, "invalid source slot");
@@ -176,7 +182,26 @@ namespace DfoServer.Game.Inventory
                             slotIndex,
                             sourceSnapshot,
                             resolvedItemId,
-                            grantedSkillPoints);
+                            grantedSkillPoints,
+                            0,
+                            currentExp);
+                    }
+
+                    if (TryResolveTpPointBook(
+                            resolvedItemId,
+                            out var grantedTpPoints))
+                    {
+                        return UseSkillPointBook(
+                            lease,
+                            characterId,
+                            accountId,
+                            listType,
+                            slotIndex,
+                            sourceSnapshot,
+                            resolvedItemId,
+                            0,
+                            grantedTpPoints,
+                            currentExp);
                     }
 
                     var definition = ExperienceItemDataProvider.Resolve(resolvedItemId);
@@ -274,13 +299,15 @@ namespace DfoServer.Game.Inventory
                                     "character/account ownership mismatch");
                             }
 
+                            // 杀怪未升级时经验仍在会话中；不能从数据库旧值重新累加。
+                            var experience = Math.Max(character.Exp, currentExp ?? character.Exp);
                             var usePlan = ExperienceItemUsePolicy.Evaluate(
                                 new ExperienceItemUseContext
                                 {
                                     Definition = definition,
                                     Job = character.Job,
                                     Level = character.Level,
-                                    Exp = character.Exp,
+                                    Exp = experience,
                                     IsHardcore = character.IsHardcore,
                                     Location = location,
                                 });
@@ -335,7 +362,7 @@ namespace DfoServer.Game.Inventory
                                 characterId,
                                 accountId,
                                 character.Level,
-                                character.Exp,
+                                experience,
                                 usePlan.GrantedExp);
                             if (!grant.Persisted)
                             {
@@ -407,7 +434,7 @@ namespace DfoServer.Game.Inventory
                                 ConsumedItem = consumedItem,
                                 PreviousLevel = character.Level,
                                 NewLevel = grant.NewLevel,
-                                PreviousExp = character.Exp,
+                                PreviousExp = grant.PreviousExp,
                                 NewExp = grant.NewExp,
                                 GrantedExp = usePlan.GrantedExp,
                                 HonorExpGain = grant.HonorExpGain,
@@ -469,7 +496,9 @@ namespace DfoServer.Game.Inventory
             short slotIndex,
             ItemCore sourceSnapshot,
             int resolvedItemId,
-            int grantedSkillPoints)
+            int grantedSkillPoints,
+            int grantedTpPoints,
+            uint? currentExp)
         {
             var failureStatus = ExperienceItemUseStatus.PersistenceFailed;
             var failureDetail = "skill-point book transaction failed";
@@ -477,6 +506,8 @@ namespace DfoServer.Game.Inventory
             CharacterProgressSnapshot character = null;
             SkillInfoSnapshot syncedSkills = null;
             SkillPointState syncedPoints = null;
+            var updatedBonusSp = 0;
+            var updatedBonusTp = 0;
 
             var committed = OnlineInventoryMutationCommitCoordinator.TryCommit(
                 lease,
@@ -525,16 +556,32 @@ namespace DfoServer.Game.Inventory
                         return false;
                     }
 
-                    if (!_progressRepository.TryGrantBonusSp(
+                    if (grantedSkillPoints > 0
+                        && !_progressRepository.TryGrantBonusSp(
                             connection,
                             transaction,
                             characterId,
                             grantedSkillPoints,
-                            out var updatedBonusSp))
+                            out updatedBonusSp))
                     {
                         failureDetail = "bonus SP persistence failed";
                         return false;
                     }
+
+                    if (grantedTpPoints > 0
+                        && !_progressRepository.TryGrantBonusTp(
+                            connection,
+                            transaction,
+                            characterId,
+                            grantedTpPoints,
+                            out updatedBonusTp))
+                    {
+                        failureDetail = "bonus TP persistence failed";
+                        return false;
+                    }
+
+                    if (updatedBonusSp == 0) updatedBonusSp = character.BonusSp;
+                    if (updatedBonusTp == 0) updatedBonusTp = character.BonusTp;
 
                     if (!InventoryDeleteService.TryConsumeFromSlot(
                             inventory,
@@ -563,7 +610,7 @@ namespace DfoServer.Game.Inventory
                         character.Job,
                         character.Level,
                         updatedBonusSp,
-                        character.BonusTp,
+                        updatedBonusTp,
                         persist: true,
                         growType: firstGrow,
                         secondGrowType: secondGrow);
@@ -605,14 +652,16 @@ namespace DfoServer.Game.Inventory
                     deleteResult),
                 PreviousLevel = character.Level,
                 NewLevel = character.Level,
-                PreviousExp = character.Exp,
-                NewExp = character.Exp,
+                PreviousExp = Math.Max(character.Exp, currentExp ?? character.Exp),
+                NewExp = Math.Max(character.Exp, currentExp ?? character.Exp),
                 GrantedExp = 0,
                 SyncedSkills = syncedSkills,
                 SkillPoints = SkillStateService.GetProtocolState(
                     syncedSkills,
                     syncedPoints),
-                Detail = $"bonus SP +{grantedSkillPoints}",
+                Detail = grantedTpPoints > 0
+                    ? $"bonus TP +{grantedTpPoints}"
+                    : $"bonus SP +{grantedSkillPoints}",
             };
         }
 
@@ -630,6 +679,24 @@ namespace DfoServer.Game.Inventory
                     return true;
                 default:
                     grantedSkillPoints = 0;
+                    return false;
+            }
+        }
+
+        private static bool TryResolveTpPointBook(
+            int itemTemplateId,
+            out int grantedTpPoints)
+        {
+            switch (itemTemplateId)
+            {
+                case TpPointBook1ItemId:
+                    grantedTpPoints = 1;
+                    return true;
+                case TpPointBook5ItemId:
+                    grantedTpPoints = 5;
+                    return true;
+                default:
+                    grantedTpPoints = 0;
                     return false;
             }
         }
@@ -807,7 +874,7 @@ namespace DfoServer.Game.Inventory
                                 deleteResult);
 
                             var completedMainlineQuests =
-                                AutoCompleteCurrentLevelMainlineQuests(
+                                AutoCompleteMainlineQuestsThroughLevel(
                                     connection,
                                     transaction,
                                     characterId,
@@ -817,12 +884,13 @@ namespace DfoServer.Game.Inventory
                                     inventory);
 
                             var targetExp = (uint)targetThreshold;
-                            if (!Progression.CharacterProgressService.PersistLevelAndExp(
+                            if (!Progression.CharacterExperienceService.CommitProgressInTransaction(
                                     connection,
                                     transaction,
                                     characterId,
                                     targetLevel,
-                                    targetExp))
+                                    targetExp,
+                                    "level-up-ticket"))
                             {
                                 RestoreConsumedSource(
                                     inventory,
@@ -1094,7 +1162,7 @@ namespace DfoServer.Game.Inventory
             return true;
         }
 
-        private static IReadOnlyList<ushort> AutoCompleteCurrentLevelMainlineQuests(
+        private static IReadOnlyList<ushort> AutoCompleteMainlineQuestsThroughLevel(
             SqliteConnection connection,
             SqliteTransaction transaction,
             int characterId,
@@ -1127,7 +1195,7 @@ namespace DfoServer.Game.Inventory
                     clearedQuestIds,
                     clearedFlags,
                     allowedCreatureKinds);
-                var nextQuestId = ResolveNextCurrentLevelMainlineQuest(
+                var nextQuestId = ResolveNextMainlineQuestThroughLevel(
                     acceptable,
                     active,
                     currentLevel,
@@ -1154,7 +1222,7 @@ namespace DfoServer.Game.Inventory
             return completed;
         }
 
-        private static ushort ResolveNextCurrentLevelMainlineQuest(
+        private static ushort ResolveNextMainlineQuestThroughLevel(
             IReadOnlyList<ushort> acceptableQuestIds,
             IReadOnlyList<ActiveQuest> activeQuestIds,
             int currentLevel,
@@ -1165,7 +1233,7 @@ namespace DfoServer.Game.Inventory
                 foreach (var questId in acceptableQuestIds)
                 {
                     if ((clearedQuestIds == null || !clearedQuestIds.Contains(questId))
-                        && IsCurrentLevelMainlineQuest(questId, currentLevel))
+                        && IsMainlineQuestThroughLevel(questId, currentLevel))
                     {
                         return questId;
                     }
@@ -1179,7 +1247,7 @@ namespace DfoServer.Game.Inventory
                     var questId = active != null ? active.QuestId : (ushort)0;
                     if (questId != 0
                         && (clearedQuestIds == null || !clearedQuestIds.Contains(questId))
-                        && IsCurrentLevelMainlineQuest(questId, currentLevel))
+                        && IsMainlineQuestThroughLevel(questId, currentLevel))
                     {
                         return questId;
                     }
@@ -1189,16 +1257,33 @@ namespace DfoServer.Game.Inventory
             return 0;
         }
 
-        private static bool IsCurrentLevelMainlineQuest(
+        private static bool IsMainlineQuestThroughLevel(
             ushort questId,
             int currentLevel)
         {
-            if (questId == 0 || questId > 29999)
+            if (questId == 0 || questId > 29999
+                || !QuestCatalog.TryGetPath(questId, out var path))
+            {
                 return false;
+            }
+
+            // A region shares its QST minimum level; epic_<level> names identify
+            // the individual story stages. Unnamed stages are left to the player.
+            var nameParts = Path.GetFileNameWithoutExtension(path).Split('_', 3);
+            if (nameParts.Length != 3
+                || !string.Equals(nameParts[0], "epic", StringComparison.OrdinalIgnoreCase)
+                || !int.TryParse(nameParts[1], NumberStyles.None, CultureInfo.InvariantCulture, out var stageLevel)
+                || stageLevel > currentLevel)
+            {
+                return false;
+            }
 
             var quest = QuestCatalog.Get(questId);
-            if (quest == null || quest.IsEvent)
+            if (quest == null || quest.IsEvent
+                || (int.TryParse(quest.ExposedByNpc, out var exposed) && exposed == 0))
+            {
                 return false;
+            }
 
             if (!string.Equals(
                     QuestData.NormalizeQuestTag(quest.Grade),
@@ -1211,7 +1296,7 @@ namespace DfoServer.Game.Inventory
             var minimumLevel = quest.Level != null && quest.Level.Length > 0
                 ? quest.Level[0]
                 : 1;
-            return minimumLevel == currentLevel;
+            return minimumLevel <= currentLevel;
         }
 
         private static void RestoreConsumedSource(

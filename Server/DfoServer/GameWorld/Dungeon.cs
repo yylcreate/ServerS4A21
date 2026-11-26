@@ -105,6 +105,7 @@ namespace DfoServer.GameWorld
             // actor sequences, but can satisfy type-0 destroy-object clear
             // conditions after a story/NPC interaction.
             public IReadOnlyList<int> PassiveObjectCodes { get; set; }
+            internal bool HasElevatorControl { get; set; }
         }
 
         public struct DungeonRoomCoordinate
@@ -228,6 +229,8 @@ namespace DfoServer.GameWorld
         public static int GetChampionCount(int dungeonId, int difficulty, int mazeIndex, out int[] namedMonsterCodes)
         {
             namedMonsterCodes = null;
+            if (DungeonRewardPolicyData.IsAntonRaidDungeonId(dungeonId))
+                return 0;
             try
             {
                 var dngFile = GetDungeonFile(dungeonId);
@@ -269,7 +272,7 @@ namespace DfoServer.GameWorld
             int[] namedMonsterCodes = null,
             int dungeonId = 0)
         {
-            if (count <= 0) return;
+            if (count <= 0 || DungeonRewardPolicyData.IsAntonRaidDungeonId(dungeonId)) return;
 
             var namedSet = namedMonsterCodes != null && namedMonsterCodes.Length > 0
                 ? new HashSet<int>(namedMonsterCodes) : null;
@@ -315,7 +318,8 @@ namespace DfoServer.GameWorld
                     && !MonsterCaptureDefinitionCatalog.HasExclusiveItemDrop(
                         monster.Code)
                     && (namedSet == null || !namedSet.Contains(monster.Code))
-                    && !SequentialDungeonMonsterCatalog.Contains(
+                    && !SequentialDungeonDefinitionCatalog.Current
+                        .ContainsConfiguredMonster(
                         dungeonId,
                         monster.Code)
                     && !(specialDungeon
@@ -909,7 +913,7 @@ namespace DfoServer.GameWorld
                     : dungeonFile.Mazes[0];
 
                 var maplst = DungeonMapCatalog.LoadMapList();
-                var mapDirCandidates = BuildMapDirCandidates(maplst, maze, loaded.FilePath);
+                var mapDirCandidates = BuildMapDirCandidates(dungeonId, maplst, maze, loaded.FilePath);
 
                 foreach (var entry in maplst.Entries)
                 {
@@ -957,7 +961,7 @@ namespace DfoServer.GameWorld
                 }
 
                 var maplst = DungeonMapCatalog.LoadMapList();
-                var mapDirCandidates = BuildMapDirCandidates(maplst, maze, loaded.FilePath);
+                var mapDirCandidates = BuildMapDirCandidates(dungeonId, maplst, maze, loaded.FilePath);
 
                 foreach (var entry in maplst.Entries)
                 {
@@ -1336,7 +1340,7 @@ namespace DfoServer.GameWorld
         private static MapFile LoadMapFile(int mapId)
             => DungeonMapCatalog.GetMapFile(mapId);
 
-        internal static List<string> BuildMapDirCandidates(LstFile maplst, MazeInfo maze, string dungeonFilePath)
+        internal static List<string> BuildMapDirCandidates(int dungeonId, LstFile maplst, MazeInfo maze, string dungeonFilePath)
         {
             var result = new List<string>();
 
@@ -1368,6 +1372,17 @@ namespace DfoServer.GameWorld
                     if (spec.LayeredMapIds != null)
                         foreach (var id in spec.LayeredMapIds)
                             AddMapId(id);
+                }
+            }
+
+            // 显式 MAP 所在目录优先，其次按 MAP 的 [dungeon] 关联资源目录。
+            // DGN 文件名与 MAP 目录名可以不同。
+            if (maplst != null)
+            {
+                foreach (var entry in maplst.Entries)
+                {
+                    if (DungeonMapCatalog.GetDungeonOwner(entry.Id) == dungeonId)
+                        AddMapId(entry.Id);
                 }
             }
 

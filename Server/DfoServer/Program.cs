@@ -16,35 +16,81 @@ namespace DfoServer
         // 自测注册表: A21 协议自测; 单跑参数与 --selftest-all 都会覆盖到。
         private static readonly (string Arg, Func<int> Run)[] SelfTestRegistry =
         {
+            ("--selftest-auction-database", SelfTests.AuctionDatabaseSelfTest.Run),
+            ("--selftest-auction-trade-history", SelfTests.AuctionTradeHistorySelfTest.Run),
+            ("--selftest-auction-catalog", SelfTests.AuctionCatalogSelfTest.Run),
+            ("--selftest-auction-item-codec", SelfTests.AuctionItemCodecSelfTest.Run),
+            ("--selftest-auction-operation-journal", SelfTests.AuctionOperationJournalSelfTest.Run),
+            ("--selftest-auction-asset-commit", SelfTests.AuctionAssetCommitSelfTest.Run),
+            ("--selftest-auction-protocol", SelfTests.AuctionProtocolSelfTest.Run),
+            ("--selftest-auction-economy-policy", SelfTests.AuctionEconomyPolicySelfTest.Run),
+            ("--selftest-auction-order-store", SelfTests.AuctionOrderStoreSelfTest.Run),
+            ("--selftest-auction-market", SelfTests.AuctionMarketSelfTest.Run),
+            ("--selftest-auction-listing-eligibility", SelfTests.AuctionListingEligibilitySelfTest.Run),
+            ("--selftest-auction-rollback-fence", SelfTests.AuctionRollbackFenceSelfTest.Run),
+            ("--selftest-auction-detail-transfer", SelfTests.AuctionDetailTransferSelfTest.Run),
+            ("--selftest-auction-query", SelfTests.AuctionQuerySelfTest.Run),
+            ("--selftest-auction-native-display", SelfTests.AuctionNativeDisplayProjectionSelfTest.Run),
+            ("--selftest-auction-native-mutation", SelfTests.AuctionNativeMutationAdapterSelfTest.Run),
+            ("--selftest-auction-native-observations", SelfTests.AuctionNativeObservationsSelfTest.Run),
+            ("--selftest-auction-read-reply", SelfTests.AuctionReadReplySelfTest.Run),
+            ("--selftest-auction-native-category", SelfTests.AuctionNativeCategorySelfTest.Run),
+            ("--selftest-auction-runtime", SelfTests.AuctionRuntimeSelfTest.Run),
+            ("--selftest-auction-native-entry", SelfTests.AuctionNativeEntrySelfTest.Run),
+            ("--selftest-auction-indexed-catalog", SelfTests.AuctionIndexedCatalogSelfTest.Run),
+            ("--selftest-auction-runtime-catalog", SelfTests.AuctionRuntimeCatalogSelfTest.Run),
+            ("--selftest-auction-packagable", SelfTests.AuctionPackagableSelfTest.Run),
+            ("--selftest-auction-native-material", SelfTests.AuctionNativeMaterialEligibilitySelfTest.Run),
             ("--selftest-a21-startup-protocol", SelfTests.A21StartupProtocolSelfTest.Run),
+            ("--selftest-a21-raid-protocol", SelfTests.A21RaidProtocolSelfTest.Run),
+            ("--selftest-raid-persistence", SelfTests.RaidPersistenceSelfTest.Run),
             ("--selftest-packet-framing-bounds", SelfTests.PacketFramingBoundsSelfTest.Run),
+            ("--selftest-packet-capture-runtime", SelfTests.PacketCaptureRuntimeSelfTest.Run),
             ("--selftest-a21-channel-protocol", SelfTests.A21ChannelProtocolSelfTest.Run),
+            ("--selftest-a21-user-channel", SelfTests.A21UserChannelSelfTest.Run),
             ("--selftest-a21-create-character-protocol", SelfTests.A21CreateCharacterProtocolSelfTest.Run),
             ("--selftest-a21-party-protocol", SelfTests.A21PartyProtocolSelfTest.Run),
+            ("--selftest-party-death-map-move", SelfTests.PartyDeathMapMoveSelfTest.Run),
+            ("--selftest-item-trade", SelfTests.ItemTradeSelfTest.Run),
+            ("--selftest-a21-solo-teleport-protocol", SelfTests.A21SoloTeleportProtocolSelfTest.Run),
             ("--selftest-a21-knight-shield-deck", SelfTests.A21KnightShieldDeckSelfTest.Run),
             ("--selftest-a21-tutorial-protocol", SelfTests.A21TutorialProtocolSelfTest.Run),
             ("--selftest-story-book-info-replay", SelfTests.StoryBookInfoReplaySelfTest.Run),
             ("--selftest-a21-adventure-group-protocol", SelfTests.A21AdventureGroupProtocolSelfTest.Run),
             ("--selftest-other-user-info-protocol", SelfTests.OtherUserInfoProtocolSelfTest.Run),
+            ("--selftest-a21-fair-pvp-score", SelfTests.A21FairPvpScoreSelfTest.Run),
+            ("--selftest-a21-pvp-room-protocol", SelfTests.A21PvpRoomProtocolSelfTest.Run),
             ("--selftest-a21-mailbox-protocol", SelfTests.A21MailboxProtocolSelfTest.Run),
             ("--selftest-premium-contract-protocol", SelfTests.PremiumContractProtocolSelfTest.Run),
             ("--selftest-a21-guild-medal-guardian-gem", SelfTests.A21GuildMedalGuardianGemSelfTest.Run),
+            ("--selftest-guild-medal-upgrade", SelfTests.GuildMedalUpgradeSelfTest.Run),
             ("--selftest-a21-equipment-durability", SelfTests.A21EquipmentDurabilitySelfTest.Run),
             ("--selftest-a21-dungeon-drop-item", SelfTests.A21DungeonDropItemSelfTest.Run),
+            ("--selftest-a21-mouse-registration", SelfTests.A21MouseRegistrationSelfTest.Run),
             ("--selftest-enchant-by-bead-listtype", SelfTests.EnchantByBeadListTypeSelfTest.Run),
+            ("--selftest-emblem-collect-item", SelfTests.EmblemCollectItemSelfTest.Run),
             ("--selftest-buy-skill-tp-refund", SelfTests.BuySkillTpRefundSelfTest.Run),
             ("--selftest-compound-item-ack", SelfTests.CompoundItemAckSelfTest.Run),
+            ("--selftest-portable-forge-separate-upgrade", SelfTests.PortableForgeSeparateUpgradeSelfTest.Run),
             ("--selftest-daily-reset-account", SelfTests.DailyResetAccountSelfTest.Run),
+            ("--selftest-daily-quest-completion-cycle", SelfTests.DailyQuestCompletionCycleSelfTest.Run),
             ("--selftest-a21-daily-challenge", SelfTests.A21DailyChallengeSelfTest.Run),
             ("--selftest-a21-joust-event", SelfTests.A21JoustEventSelfTest.Run),
             ("--selftest-a21-pcroom-timepoint-event", SelfTests.A21PcRoomTimePointEventSelfTest.Run),
             ("--selftest-a21-daily-attendance-anytime-event", SelfTests.A21DailyAttendanceAnytimeEventSelfTest.Run),
             ("--selftest-a21-total-attendance-event", SelfTests.A21TotalAttendanceEventSelfTest.Run),
             ("--selftest-a21-death-tower-protocol", SelfTests.A21DeathTowerProtocolSelfTest.Run),
+            ("--selftest-boss-tower", SelfTests.BossTowerSelfTest.Run),
             ("--selftest-a21-special-dungeon-protocol", SelfTests.A21SpecialDungeonProtocolSelfTest.Run),
             ("--selftest-dungeon-entry-limit", SelfTests.DungeonEntryLimitServiceSelfTest.Run),
+            ("--selftest-dimension-enter-ticket", SelfTests.DimensionDungeonEnterTicketSelfTest.Run),
             ("--selftest-item-state", SelfTests.ItemStateSelfTest.Run),
+            ("--selftest-unlimited-stackable-use", SelfTests.UnlimitedStackableUseSelfTest.Run),
+            ("--selftest-item-upgrade-potion", SelfTests.ItemUpgradePotionSelfTest.Run),
+            ("--selftest-upgrade-broadcast", SelfTests.UpgradeBroadcastSelfTest.Run),
             ("--selftest-inventory-sort-condition", SelfTests.InventorySortConditionSelfTest.Run),
+            ("--selftest-avatar-expansion", SelfTests.AvatarExpansionSelfTest.Run),
+            ("--selftest-sort-lock-equip-swap", SelfTests.SortLockEquipSwapSelfTest.Run),
             ("--selftest-dungeon-experience", SelfTests.DungeonExperienceSelfTest.Run),
             ("--selftest-pet-creature-runtime", SelfTests.PetCreatureRuntimeSelfTest.Run),
             ("--selftest-titlebook-use-item", SelfTests.TitleBookUseItemAchievementSelfTest.Run),
@@ -52,18 +98,49 @@ namespace DfoServer
             ("--selftest-fixed-daily-ticket", SelfTests.FixedDailyTicketSelfTest.Run),
             ("--selftest-stacked-orb-conversion", SelfTests.StackedOrbConversionSelfTest.Run),
             ("--selftest-quest-completion-ticket", SelfTests.QuestCompletionTicketSelfTest.Run),
+            ("--selftest-anton-raid-phase-quest", SelfTests.AntonRaidPhaseQuestSelfTest.Run),
+            ("--selftest-quest-progress-batch", SelfTests.QuestProgressBatchSelfTest.Run),
+            ("--selftest-passive-object-quest-drop-fanout", SelfTests.PassiveObjectQuestDropFanoutSelfTest.Run),
+            ("--selftest-quest-run-snapshot-accept", SelfTests.QuestRunSnapshotAcceptSelfTest.Run),
+            ("--selftest-quest-chain-availability", SelfTests.QuestChainAvailabilitySelfTest.Run),
+            ("--selftest-quest-question-branch", SelfTests.QuestQuestionBranchSelfTest.Run),
+            ("--selftest-level-up-ticket", SelfTests.LevelUpTicketSelfTest.Run),
+            ("--selftest-character-level-up-reward", SelfTests.CharacterLevelUpRewardSelfTest.Run),
             ("--selftest-growup-change", SelfTests.GrowupChangeSelfTest.Run),
             ("--selftest-cargo-transport-stone", SelfTests.CargoTransportStoneSelfTest.Run),
             ("--selftest-dye-item", SelfTests.DyeItemSelfTest.Run),
             ("--selftest-item-purchase-limit", SelfTests.ItemPurchaseLimitSelfTest.Run),
             ("--selftest-lottery-item", SelfTests.LotteryItemSelfTest.Run),
+            ("--selftest-lottery-overflow", SelfTests.LotteryOpenOverflowSelfTest.Run),
             ("--selftest-magic-box-protocol", SelfTests.MagicBoxProtocolSelfTest.Run),
             ("--selftest-gold-limit", SelfTests.GoldLimitSelfTest.Run),
+            ("--selftest-gold-consign", SelfTests.GoldConsignmentSelfTest.Run),
             ("--selftest-friends", SelfTests.UnitedFriendSystemSelfTest.Run),
+            ("--selftest-a21-one-to-one-chat", SelfTests.A21OneToOneChatSelfTest.Run),
+            ("--selftest-a21-item-hyperlink-chat", SelfTests.A21ItemHyperlinkChatSelfTest.Run),
+            ("--selftest-a21-server-megaphone", SelfTests.A21ServerMegaphoneSelfTest.Run),
+            ("--selftest-a21-character-rename", SelfTests.A21CharacterRenameSelfTest.Run),
+            ("--selftest-a21-blacklist", SelfTests.A21BlacklistSelfTest.Run),
+            ("--selftest-a21-guild-creation", SelfTests.A21GuildCreationSelfTest.Run),
+            ("--selftest-guild-dungeon", SelfTests.GuildDungeonSelfTest.Run),
             ("--selftest-pvf-map-monster-parsing", SelfTests.PvfMapMonsterParsingSelfTest.Run),
+            ("--selftest-sequential-dungeon-definition", SelfTests.SequentialDungeonDefinitionCatalogSelfTest.Run),
+            ("--selftest-sequential-dungeon-daily-loot", SelfTests.SequentialDungeonDailyLootSelfTest.Run),
             ("--selftest-sequential-dungeon-info-protocol", SelfTests.SequentialDungeonInfoProtocolSelfTest.Run),
             ("--selftest-licensed-dungeon", SelfTests.LicensedDungeonSelfTest.Run),
+            ("--selftest-anton-awakening-daily-reset", SelfTests.AntonAwakeningDailyResetSelfTest.Run),
+            ("--selftest-anton-awakening-daily-progress", SelfTests.AntonAwakeningDailyProgressSelfTest.Run),
+            ("--selftest-anton-awakening-reward-packet", SelfTests.AntonAwakeningRewardPacketBuilderSelfTest.Run),
+            ("--selftest-anton-awakening-auto-reward", SelfTests.AntonAwakeningAutoRewardSelfTest.Run),
             ("--selftest-experience-item-definition", SelfTests.ExperienceItemDefinitionSelfTest.Run),
+            ("--selftest-die-monster-request", SelfTests.DieMonsterRequestSelfTest.Run),
+            ("--selftest-secret-shop-offer", SelfTests.SecretShopOfferSelfTest.Run),
+            ("--selftest-npc-favor", SelfTests.NpcFavorSystemSelfTest.Run),
+            ("--selftest-random-option-value-roll", SelfTests.RandomOptionValueRollSelfTest.Run),
+            ("--selftest-random-option-grade-reroll", SelfTests.RandomOptionGradeRerollSelfTest.Run),
+            ("--selftest-booster-selection-num", SelfTests.BoosterSelectionNumSelfTest.Run),
+            ("--selftest-account-experience-buffer", SelfTests.AccountExperienceBufferSelfTest.Run),
+            ("--selftest-equipment-growth", SelfTests.EquipmentGrowthSelfTest.Run),
         };
 
         // 顺序跑全部自测, 输出汇总表; 任一失败(或抛异常)退出码为 1。
@@ -185,7 +262,7 @@ namespace DfoServer
             if (File.Exists(channelInfoPath))
             {
                 GameNetworkConfig.ConfigureChannelCatalog(
-                    ChannelProtocolHandler.ParseScriptChannelIds(
+                    ChannelProtocolHandler.ParseScriptChannels(
                         File.ReadAllText(channelInfoPath)));
             }
 
@@ -240,7 +317,7 @@ namespace DfoServer
             using var runtimeBuilder = Infrastructure.ServerRuntimeBuilder.CreateDefault();
             var database = runtimeBuilder.Database;
 
-            // 启动时一次性按当前等级重算所有角色战斗属性, 修复历史"升级未重算属性"的存量数据。
+            // 启动时按当前等级和资源重算角色战斗属性。
             // 必须在 PVF 加载后: 属性表来自 Script.pvf。幂等, 重复执行结果一致, 正常时静默, 仅出错时提示。
             try
             {
@@ -268,6 +345,7 @@ namespace DfoServer
 
             using var udpRelay = CreatePartyUdpRelay("party");
             using var pvpUdpRelay = CreatePartyUdpRelay("pvp");
+            runtimeBuilder.ConfigureAuctionRuntime();
             using var gameProtocolHandler = runtimeBuilder.BuildGameProtocolHandler(
                 sessionDirectory,
                 packet => Task.WhenAll(
@@ -292,6 +370,8 @@ namespace DfoServer
             server.Start(portConfigs);
 
             Game.Inventory.InventoryPersistenceService.RegisterClock(Infrastructure.ClockService.Instance);
+            Game.Accounts.AccountExperienceBuffer.Instance
+                .RegisterClock(Infrastructure.ClockService.Instance);
             Infrastructure.ClockService.Instance.Start();
 
             if (GameNetworkConfig.ProxyMode)
@@ -355,6 +435,12 @@ namespace DfoServer
 
             server.Stop();
             Game.Inventory.InventoryPersistenceService.SaveAllDirty();
+            // 账号级荣誉/成长胶囊经验只累计内存, 停机前有界地落库一次;
+            // FlushAll 是同步逐账号写, 失败仅记日志(内存 pending 不再有机会重试)。
+            if (!Game.Accounts.AccountExperienceBuffer.Instance.FlushAll())
+                FileLogger.Log(
+                    "[Shutdown] account experience flush incomplete");
+            PacketFileLogger.Shutdown(TimeSpan.FromSeconds(5));
             // 服务停止后不再产生常规业务日志，此时完成队列并等待后台写入结束，避免退出时丢失尾部日志。
             FileLogger.Shutdown(TimeSpan.FromSeconds(5));
             Console.WriteLine("Server stopped.");

@@ -427,6 +427,27 @@ WHERE claimed_flag = 0
             entry.FirstAttachmentPetSerialOrHandle = first.PetSerialOrHandle;
         }
 
+        /// <summary>
+        /// 这封邮件是否带过账户货币凭证附件（代币券 / 欢乐代币券），**不区分是否已领取**。
+        ///
+        /// 客户端「全部接收」会把附件和邮件 gold 分成两次 claim：先按附件 claimObjectId
+        /// 领附件，再按 messageId 领金币。第二次时附件已标记领取，按待领列表判断会失效，
+        /// 导致 gold 被当金币再发一次，所以这里按整封邮件的附件历史判断。
+        /// </summary>
+        private static bool MailCarriesAccountCurrencyVoucher(
+            SqliteConnection connection, SqliteTransaction transaction, long messageId)
+        {
+            using var cmd = connection.CreateCommand();
+            cmd.Transaction = transaction;
+            cmd.CommandText = @"
+SELECT COUNT(*) FROM mailbox_attachments
+WHERE message_id = @id AND item_template_id IN (@cera, @happy);";
+            cmd.Parameters.AddWithValue("@id", messageId);
+            cmd.Parameters.AddWithValue("@cera", SpecialRewardRouter.TokenCeraVoucherItemId);
+            cmd.Parameters.AddWithValue("@happy", SpecialRewardRouter.HappyTokenCeraVoucherItemId);
+            return Convert.ToInt64(cmd.ExecuteScalar()) > 0;
+        }
+
         private static List<MailboxAttachmentEntry> LoadMailboxAttachments(SqliteConnection connection, long messageId, SqliteTransaction transaction = null)
         {
             var attachments = new List<MailboxAttachmentEntry>();
@@ -841,7 +862,7 @@ LIMIT 1;";
             {
                 command.Transaction = transaction;
                 command.CommandText = @"
-SELECT m.gold, r.received_gold_flag
+SELECT m.gold, r.received_gold_flag, m.mail_type, m.idempotency_key
 FROM mailbox_recipients r
 JOIN mailbox_messages m ON m.message_id = r.message_id
 WHERE r.character_id = @cid
@@ -861,7 +882,9 @@ LIMIT 1;";
                     return new ClaimMailState
                     {
                         Gold = reader.GetInt32(0),
-                        ReceivedGold = reader.GetInt32(1) != 0
+                        ReceivedGold = reader.GetInt32(1) != 0,
+                        RequireStrictInstanceTransfer = reader.GetInt32(2) != 0 && !reader.IsDBNull(3)
+                            && reader.GetString(3).StartsWith("auction:", StringComparison.Ordinal)
                     };
                 }
             }
@@ -900,8 +923,25 @@ LIMIT 1;";
             var attachments = target?.Attachment != null
                 ? new List<MailboxAttachmentEntry> { target.Attachment }
                 : LoadMailboxAttachments(connection, messageId, transaction);
-            var claimsGold = mailState.Gold > 0 && !mailState.ReceivedGold;
-            if (attachments.Count == 0 && !claimsGold)
+            // 凭证类邮件（代币券 / 欢乐代币券）把金额写进 gold 只是为了邮件窗口底部
+            // 显示「代币券 N」；真正入账是附件凭证转换成账户货币。
+            //
+            // 必须按「这封邮件是否带过凭证附件」判断，而不是看本次待领的附件列表：
+            // 客户端「全部接收」会先按附件 claimObjectId 领一次附件，再按 messageId
+            // 领一次邮件金币；第二次进来时附件已标记领取、查不到，若此时判断失效就会
+            // 把 gold 当金币再发一遍（同值双发）。
+            var goldIsDisplayOnly = MailCarriesAccountCurrencyVoucher(
+                connection, transaction, messageId);
+
+            var claimsGold = !goldIsDisplayOnly
+                && mailState.Gold > 0
+                && !mailState.ReceivedGold;
+            // 显示用 gold 也要走「预留 → 标记已领」两步，否则邮件永远停在
+            // received_gold_flag = 0，客户端会认为还有金币可领、邮件也删不掉。
+            var markGoldReceived = mailState.Gold > 0
+                && !mailState.ReceivedGold
+                && (claimsGold || goldIsDisplayOnly);
+            if (attachments.Count == 0 && !claimsGold && !markGoldReceived)
                 return MailboxClaimResult.Fail(MailboxSendError.MailNotFound);
 
             var requests = new List<InventoryRewardGrantRequest>(attachments.Count);
@@ -909,7 +949,30 @@ LIMIT 1;";
             var nowUnixSeconds = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
             foreach (var attachment in attachments)
             {
-                var core = MailboxItemCoreCodec.Decode(attachment);
+                ItemCore core;
+                InventoryCreateOptions strictOptions = null;
+                try
+                {
+                    if (mailState.RequireStrictInstanceTransfer
+                        && attachment.ItemCoreData?.Length != ItemCore.Size)
+                        return MailboxClaimResult.Fail(MailboxSendError.InvalidAttachment);
+                    core = MailboxItemCoreCodec.Decode(attachment);
+                    if (mailState.RequireStrictInstanceTransfer)
+                    {
+                        if (core == null || core.ItemId != attachment.ItemTemplateId
+                            || (InventoryStackRuleService.IsStackable(core) ? core.Count != attachment.ItemCount : attachment.ItemCount != 1)
+                            || (core.ItemKind == ItemCore.KindAvatar && core.AvatarUid != 0)
+                            || (core.ItemKind == ItemCore.KindCreature && core.CreatureUid != 0))
+                            return MailboxClaimResult.Fail(MailboxSendError.InvalidAttachment);
+                        // The durable system-mail origin selects strict decoding.
+                        // Removing/damaging a JSON marker cannot select legacy defaults.
+                        strictOptions = MailboxItemDetailCodec.BuildCreateOptionsStrict(core, attachment.DetailJson);
+                    }
+                }
+                catch (Exception ex) when (mailState.RequireStrictInstanceTransfer
+                    && (ex is InvalidOperationException || ex is ArgumentException || ex is System.Text.Json.JsonException
+                        || ex is FormatException || ex is OverflowException))
+                { return MailboxClaimResult.Fail(MailboxSendError.InvalidAttachment); }
                 if (core == null || core.ItemId <= 0 || attachment.ItemCount <= 0)
                     return MailboxClaimResult.Fail(MailboxSendError.InvalidAttachment);
                 if (core.ExpireTime > 0 && core.ExpireTime <= nowUnixSeconds)
@@ -944,7 +1007,7 @@ LIMIT 1;";
                     core,
                     count,
                     ItemCreateReason.MailAttachment,
-                    BuildClaimCreateOptions(attachment, core)));
+                    mailState.RequireStrictInstanceTransfer ? strictOptions : BuildClaimCreateOptions(attachment, core)));
             }
 
             var capacity = LoadClaimCapacity(connection, transaction, inventory);
@@ -968,7 +1031,7 @@ LIMIT 1;";
             if (!AllocateDetailUidsInTransaction(connection, transaction, plan))
                 return MailboxClaimResult.Fail(MailboxSendError.ServerBusy);
 
-            if (!ReserveClaimState(connection, transaction, characterId, messageId, claimsGold, attachments))
+            if (!ReserveClaimState(connection, transaction, characterId, messageId, markGoldReceived, attachments))
                 return MailboxClaimResult.Fail(MailboxSendError.MailNotFound);
 
             if (!InventoryRewardGrantService.TryApplyPreparedBatch(inventory, plan, out var grantResult))
@@ -992,13 +1055,17 @@ LIMIT 1;";
             if (!InventoryPersistenceService.SaveDirtyInTransaction(connection, transaction, lease))
                 return MailboxClaimResult.Fail(MailboxSendError.ServerBusy);
 
-            MarkMailClaimed(connection, transaction, characterId, messageId, claimsGold, attachments);
+            // 显示用 gold 也必须标记成「已领」，否则客户端一直认为邮件里还有金币可领，
+            // 领完附件后邮件仍留在邮箱、看起来像又多了一封金币邮件。
+            MarkMailClaimed(connection, transaction, characterId, messageId,
+                markGoldReceived, attachments);
 
             var updatedMainSlots = new List<short>();
             var updatedAvatarSlots = new List<short>();
             var updatedPetSlots = new List<short>();
+            var updatedGuildMedalSlots = new List<short>();
             foreach (var change in grantResult.Changes.Slots)
-                AddUpdatedSlot(change.ListType, change.SlotIndex, updatedMainSlots, updatedAvatarSlots, updatedPetSlots);
+                AddUpdatedSlot(change.ListType, change.SlotIndex, updatedMainSlots, updatedAvatarSlots, updatedPetSlots, updatedGuildMedalSlots);
 
             return new MailboxClaimResult
             {
@@ -1011,6 +1078,7 @@ LIMIT 1;";
                 UpdatedMainSlots = updatedMainSlots,
                 UpdatedAvatarSlots = updatedAvatarSlots,
                 UpdatedPetSlots = updatedPetSlots,
+                UpdatedGuildMedalSlots = updatedGuildMedalSlots,
                 InventoryMutations = BuildClaimInventoryMutations(inventory, grantResult),
             };
         }
@@ -1137,15 +1205,14 @@ LIMIT 1;";
 
         private static InventoryListType ResolveCoreTargetList(ItemCore core)
         {
-            if (core == null)
-                return InventoryListType.Main;
-            if (core.ItemKind == ItemCore.KindAvatar)
-                return InventoryListType.Avatar;
-            if (core.ItemKind == ItemCore.KindCreature
-                || core.ItemKind == ItemCore.KindCreatureEquipment
-                || core.ItemKind == ItemCore.KindCreatureConsumable)
-                return InventoryListType.Pet;
-            return InventoryListType.Main;
+            return core != null
+                && ItemSlotBoundService.TryGetSlotRange(
+                    core.ItemKind,
+                    ItemSlotBoundService.MainExpandStageNone,
+                    out var listType,
+                    out _)
+                ? listType
+                : InventoryListType.Main;
         }
 
         private static int CountInventoryItem(
@@ -1660,7 +1727,8 @@ WHERE message_id = @messageId
             short slot,
             List<short> updatedMainSlots,
             List<short> updatedAvatarSlots,
-            List<short> updatedPetSlots)
+            List<short> updatedPetSlots,
+            List<short> updatedGuildMedalSlots)
         {
             if (listType == InventoryListType.Avatar)
             {
@@ -1671,6 +1739,12 @@ WHERE message_id = @messageId
             if (listType == InventoryListType.Pet)
             {
                 AddUniqueSlot(updatedPetSlots, slot);
+                return;
+            }
+
+            if (listType == InventoryListType.GuildMedal)
+            {
+                AddUniqueSlot(updatedGuildMedalSlots, slot);
                 return;
             }
 
@@ -1780,6 +1854,10 @@ WHERE message_id = @messageId
             var deferredPolicyError = MailboxSendPolicy.ValidateDeferredPolicies(request);
             if (deferredPolicyError != MailboxSendError.None)
                 return MailboxSendResult.Fail(deferredPolicyError);
+
+            if (Game.Friends.BlacklistRepository.IsBlocked(connection, transaction,
+                    request.ReceiverCharacterId, request.SenderCharacterId))
+                return MailboxSendResult.Fail(MailboxSendError.Blacklisted);
 
             var goldPolicyError = ApplyPlayerGoldSendPolicies(connection, transaction, request);
             if (goldPolicyError != MailboxSendError.None)
@@ -2608,6 +2686,7 @@ INSERT INTO mailbox_attachments (
         {
             public int Gold { get; set; }
             public bool ReceivedGold { get; set; }
+            public bool RequireStrictInstanceTransfer { get; set; }
         }
 
         private sealed class ClaimCapacity

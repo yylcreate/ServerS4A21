@@ -2,12 +2,15 @@ using DfoServer.Game.Dungeon;
 using DfoServer.Game.Inventory;
 using DfoServer.Game.Party;
 using DfoServer.Game.Session;
+using DfoServer.GameWorld;
 using DfoServer.Network;
 using DfoServer.Network.Builders;
 using DfoServer.Network.Builders.Party;
 using DfoServer.Network.Handlers;
 using DfoServer.Network.Handlers.Dungeon;
+using DfoServer.Network.Parsers.Dungeon;
 using DfoServer.Network.Parsers.Party;
+using DfoServer.Network.Parsers.Town;
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -1263,6 +1266,160 @@ namespace DfoServer.SelfTests
                     CardRewardSide.Free,
                     cardIndex: 3),
                 ref failures);
+            // 0x0023 CLEAR_DUNGEON_REWARD: the free-card seat block is an
+            // 8-seat array indexed by party slot and carries every party
+            // member's frozen free card, so each client renders the whole
+            // team's clear cards. Seats are count-prefixed and variable
+            // length: an occupied seat with an item is 17B, with gold only
+            // 9B, without content the 9B empty placeholder. With no
+            // object-experience entries the block starts right after the
+            // reserved byte at ObjectExperienceEntriesOffset.
+            const int FreeCardLeaderGold = 3431;
+            const int FreeCardFollowerItem = 100140106;
+            const int FreeCardFollowerGold = 777;
+            var soloClearReward = DungeonNotificationBuilder.BuildClearDungeonReward(
+                clearBaseExp: 1786,
+                freeCardGold: FreeCardLeaderGold,
+                freeCardItemId: FreeCardFollowerItem,
+                freeCardItemCount: 1,
+                paidCardCost: 580);
+            const int CardSeatBlockOffset =
+                DungeonNotificationBuilder.ObjectExperienceEntriesOffset + 1;
+            var paidCardCostOffset = CardSeatBlockOffset + 17 + 9 + 6 * 9;
+            Check(
+                "solo 0x0023 keeps the free card in seat 0 with the pre-fix wire bytes",
+                soloClearReward.Length == 282
+                && BitConverter.ToString(soloClearReward) ==
+                    "FA-06-00-00-00-00-00-00-00-00-00-00-00-00-00-00-00-00-00-00-"
+                    + "00-00-00-00-00-00-00-00-00-00-00-00-00-00-00-00-00-00-00-00-"
+                    + "00-00-00-00-00-00-00-00-00-00-00-00-00-00-00-00-00-00-00-00-"
+                    + "00-00-00-00-00-00-00-00-00-00-00-00-00-00-00-00-00-00-00-00-"
+                    + "00-00-00-00-00-00-00-00-00-00-00-00-00-00-00-00-00-00-00-00-"
+                    + "00-00-00-00-00-00-00-00-00-00-00-00-00-00-00-00-00-00-00-00-"
+                    + "00-00-00-00-00-00-00-00-00-00-00-00-00-00-00-00-00-00-00-00-"
+                    + "00-00-00-00-00-00-00-00-00-00-00-00-00-00-00-00-00-00-00-00-"
+                    + "02-00-00-00-00-67-0D-00-00-4A-04-F8-05-01-00-00-00-01-00-00-"
+                    + "00-00-00-00-00-00-01-00-00-00-00-00-00-00-00-01-00-00-00-00-"
+                    + "00-00-00-00-01-00-00-00-00-00-00-00-00-01-00-00-00-00-00-00-"
+                    + "00-00-01-00-00-00-00-00-00-00-00-01-00-00-00-00-00-00-00-00-"
+                    + "44-02-00-00-00-00-00-00-00-00-00-00-00-00-00-00-00-00-00-00-"
+                    + "00-00-00-00-00-00-00-00-00-00-00-00-00-00-00-00-00-00-00-00-"
+                    + "00-00",
+                ref failures);
+            // cardLeaderRun/cardFollowerRun come from the card layout block
+            // above; freeze a free card into each settlement runtime like
+            // BuildSettlementRuntime would, then project the party-wide
+            // seats through the settlement handler.
+            cardLeaderRun.SettlementRuntime.FreeGold =
+                new ClearRewardGenerator.CardReward
+                {
+                    IsGold = true,
+                    GoldAmount = FreeCardLeaderGold,
+                };
+            cardLeaderRun.SettlementRuntime.FreeItem =
+                new ClearRewardGenerator.CardReward
+                {
+                    ItemId = FreeCardFollowerItem,
+                    StackCount = 1,
+                };
+            cardFollowerRun.SettlementRuntime.FreeGold =
+                new ClearRewardGenerator.CardReward
+                {
+                    IsGold = true,
+                    GoldAmount = FreeCardFollowerGold,
+                };
+            var leaderViewSeats =
+                DungeonSettlementHandler.BuildClearRewardFreeCardSeats(
+                    cardLeaderRun,
+                    cardLeaderRun.SettlementRuntime,
+                    cardRoster);
+            var followerViewSeats =
+                DungeonSettlementHandler.BuildClearRewardFreeCardSeats(
+                    cardFollowerRun,
+                    cardFollowerRun.SettlementRuntime,
+                    cardRoster);
+            var partyClearReward = DungeonNotificationBuilder.BuildClearDungeonReward(
+                clearBaseExp: 1786,
+                freeCardSeats: leaderViewSeats,
+                paidCardCost: 580);
+            Check(
+                "party 0x0023 projects every teammate free card into its party-slot seat",
+                leaderViewSeats.Count == DungeonNotificationBuilder.CardSeatCount
+                && leaderViewSeats[0].Gold == FreeCardLeaderGold
+                && leaderViewSeats[0].ItemId == FreeCardFollowerItem
+                && leaderViewSeats[0].ItemCount == 1
+                && leaderViewSeats[1].Gold == FreeCardFollowerGold
+                && leaderViewSeats[1].ItemId == 0
+                && leaderViewSeats[1].ItemCount == 0
+                && leaderViewSeats[2].Gold == 0
+                && leaderViewSeats[2].ItemId == 0
+                && partyClearReward.Length == 282
+                && partyClearReward[CardSeatBlockOffset] == 2
+                && BitConverter.ToInt32(partyClearReward, CardSeatBlockOffset + 5)
+                    == FreeCardLeaderGold
+                && BitConverter.ToInt32(partyClearReward, CardSeatBlockOffset + 9)
+                    == FreeCardFollowerItem
+                && partyClearReward[CardSeatBlockOffset + 17] == 1
+                && BitConverter.ToInt32(
+                    partyClearReward,
+                    CardSeatBlockOffset + 17 + 5) == FreeCardFollowerGold
+                && BitConverter.ToInt32(partyClearReward, paidCardCostOffset) == 580,
+                ref failures);
+            Check(
+                "party 0x0023 free-card seats stay identical across receivers",
+                followerViewSeats.Count == leaderViewSeats.Count
+                && followerViewSeats[0].Gold == leaderViewSeats[0].Gold
+                && followerViewSeats[0].ItemId == leaderViewSeats[0].ItemId
+                && followerViewSeats[0].ItemCount == leaderViewSeats[0].ItemCount
+                && followerViewSeats[1].Gold == leaderViewSeats[1].Gold
+                && followerViewSeats[1].ItemId == leaderViewSeats[1].ItemId
+                && followerViewSeats[1].ItemCount == leaderViewSeats[1].ItemCount
+                && DungeonNotificationBuilder.BuildClearDungeonReward(
+                    clearBaseExp: 1786,
+                    freeCardSeats: followerViewSeats,
+                    paidCardCost: 580).AsSpan().SequenceEqual(partyClearReward),
+                ref failures);
+            var cardMissingRun = new DungeonRun(
+                cardInstance,
+                runId: 803,
+                runGeneration: 1,
+                DungeonRunState.Active)
+            {
+                EntryPartySlotIndex = 2,
+            };
+            var degradedRoster = new List<DungeonParticipantRosterEntry>(cardRoster)
+            {
+                new DungeonParticipantRosterEntry(
+                    characterId: 10040,
+                    participantUserId: 10040,
+                    run: cardMissingRun,
+                    runIdentity: cardMissingRun.CaptureIdentity(),
+                    roomIdentity: cardRoom,
+                    attachmentGeneration: 1),
+            };
+            var degradedSeats =
+                DungeonSettlementHandler.BuildClearRewardFreeCardSeats(
+                    cardLeaderRun,
+                    cardLeaderRun.SettlementRuntime,
+                    degradedRoster);
+            var degradedClearReward = DungeonNotificationBuilder.BuildClearDungeonReward(
+                clearBaseExp: 1786,
+                freeCardSeats: degradedSeats,
+                paidCardCost: 580);
+            Check(
+                "party 0x0023 leaves the seat empty when a teammate settlement is not ready",
+                degradedSeats[2].Gold == 0
+                && degradedSeats[2].ItemId == 0
+                && degradedSeats[2].ItemCount == 0
+                && degradedSeats[3].Gold == 0
+                && degradedSeats[3].ItemId == 0
+                && degradedClearReward.Length == partyClearReward.Length
+                && BitConverter.ToInt32(degradedClearReward, CardSeatBlockOffset + 5)
+                    == FreeCardLeaderGold
+                && BitConverter.ToInt32(
+                    degradedClearReward,
+                    CardSeatBlockOffset + 17 + 5) == FreeCardFollowerGold,
+                ref failures);
             var dungeonUserState = EnterSelectDungeonStateBuilder.BuildUserState(
                 new ushort[] { 10038, 10039 },
                 0x01);
@@ -1548,6 +1705,152 @@ namespace DfoServer.SelfTests
                         unboundSelection,
                         party: null),
                 ref failures);
+            var antonLeaderSession = Guid.NewGuid();
+            var antonFollowerSession = Guid.NewGuid();
+            var antonSettlementParty = new Party(24700)
+            {
+                LeaderUserId = 24701,
+            };
+            antonSettlementParty.TryAddMember(new PartyMember
+            {
+                UserId = 24701,
+                CharacterId = 24701,
+                SessionId = antonLeaderSession,
+                Name = "anton-leader",
+            });
+            antonSettlementParty.TryAddMember(new PartyMember
+            {
+                UserId = 24702,
+                CharacterId = 24702,
+                SessionId = antonFollowerSession,
+                Name = "anton-follower",
+            });
+            var clearedAntonRun = new DungeonRun(247, 2)
+            {
+                Phase = DungeonRunPhase.Cleared,
+            };
+            var clearedAnton243Run = new DungeonRun(243, 2)
+            {
+                Phase = DungeonRunPhase.Cleared,
+            };
+            var committingAnton243Run = new DungeonRun(243, 2);
+            var committingAnton243Fact =
+                committingAnton243Run.Instance.GetOrCreateClearedFact(
+                    new DungeonClearIntent(
+                        DungeonEventEnvelope.Create(
+                            committingAnton243Run,
+                            24702,
+                            "anton-follower-duplicate-test"),
+                        "anton-follower-duplicate-test",
+                        bossCode: 0),
+                    out _);
+            Check(
+                "Anton 243 test run enters ClearCommitting",
+                committingAnton243Run.TryBeginClearCommit(
+                    committingAnton243Fact),
+                ref failures);
+            var activeAntonRun = new DungeonRun(247, 2);
+            var clearedOtherRun = new DungeonRun(192, 2)
+            {
+                Phase = DungeonRunPhase.Cleared,
+            };
+            var antonDuplicateSelect = SelectDungeonRequest.Parse(new byte[]
+            {
+                0xF7, 0x00, 0x00, 0x00,
+                0x02, 0x00, 0x00, 0xFF, 0xFF,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            });
+            var anton243DuplicateSelect = SelectDungeonRequest.Parse(new byte[]
+            {
+                0xF3, 0x00, 0x00, 0x00,
+                0x02, 0x00, 0x00, 0xFF, 0xFF,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            });
+            var antonDifferentDifficulty = SelectDungeonRequest.Parse(new byte[]
+            {
+                0xF7, 0x00, 0x00, 0x00,
+                0x01, 0x00, 0x00, 0xFF, 0xFF,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            });
+            var antonNonCanonicalSelect = SelectDungeonRequest.Parse(new byte[]
+            {
+                0xF7, 0x00, 0x00, 0x00,
+                0x02, 0x00, 0x00, 0xFF, 0xFF,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+            });
+            Check(
+                "settling Anton follower duplicate SELECT_DUNGEON is ignored only for the captured A21 15-byte shape",
+                DungeonEntryHandler
+                    .ShouldIgnoreClearedAntonFollowerDuplicateSelect(
+                        clearedAnton243Run,
+                        antonSettlementParty,
+                        24702,
+                        antonFollowerSession,
+                        anton243DuplicateSelect)
+                && DungeonEntryHandler
+                    .ShouldIgnoreClearedAntonFollowerDuplicateSelect(
+                        committingAnton243Run,
+                        antonSettlementParty,
+                        24702,
+                        antonFollowerSession,
+                        anton243DuplicateSelect)
+                && DungeonEntryHandler
+                    .ShouldIgnoreClearedAntonFollowerDuplicateSelect(
+                        clearedAntonRun,
+                        antonSettlementParty,
+                        24702,
+                        antonFollowerSession,
+                        antonDuplicateSelect)
+                && !DungeonEntryHandler
+                    .ShouldIgnoreClearedAntonFollowerDuplicateSelect(
+                        clearedAntonRun,
+                        antonSettlementParty,
+                        24701,
+                        antonLeaderSession,
+                        antonDuplicateSelect)
+                && !DungeonEntryHandler
+                    .ShouldIgnoreClearedAntonFollowerDuplicateSelect(
+                        activeAntonRun,
+                        antonSettlementParty,
+                        24702,
+                        antonFollowerSession,
+                        antonDuplicateSelect)
+                && !DungeonEntryHandler
+                    .ShouldIgnoreClearedAntonFollowerDuplicateSelect(
+                        clearedOtherRun,
+                        antonSettlementParty,
+                        24702,
+                        antonFollowerSession,
+                        antonDuplicateSelect)
+                && !DungeonEntryHandler
+                    .ShouldIgnoreClearedAntonFollowerDuplicateSelect(
+                        clearedAntonRun,
+                        antonSettlementParty,
+                        24702,
+                        antonFollowerSession,
+                        antonDifferentDifficulty)
+                && !DungeonEntryHandler
+                    .ShouldIgnoreClearedAntonFollowerDuplicateSelect(
+                        clearedAntonRun,
+                        antonSettlementParty,
+                        24702,
+                        antonFollowerSession,
+                        antonNonCanonicalSelect)
+                && !DungeonEntryHandler
+                    .ShouldIgnoreClearedAntonFollowerDuplicateSelect(
+                        clearedAntonRun,
+                        party: null,
+                        userId: 24702,
+                        sessionId: antonFollowerSession,
+                        antonDuplicateSelect)
+                && !DungeonEntryHandler
+                    .ShouldIgnoreClearedAntonFollowerDuplicateSelect(
+                        clearedAntonRun,
+                        antonSettlementParty,
+                        24702,
+                        Guid.NewGuid(),
+                        antonDuplicateSelect),
+                ref failures);
             var transferToFollowerAgain = transferManager.TransferLeader(
                 transferPartyId,
                 11001,
@@ -1606,23 +1909,21 @@ namespace DfoServer.SelfTests
                 leaderSession,
                 originalGiveupPartyId);
             var survivorParty = giveupManager.GetPartyByUser(10039);
-            var staleFollowerGiveup = giveupManager.LeaveForDungeonReturn(
-                10039,
-                followerSession,
-                originalGiveupPartyId);
             var followerGiveup = giveupManager.LeaveForDungeonReturn(
                 10039,
                 followerSession,
-                survivorParty.PartyId);
+                originalGiveupPartyId);
             Check(
-                "successive dungeon giveups detach earlier members and preserve the final survivor as leader",
+                "dungeon leader giveup preserves party generation and survivor slot until the final member returns",
                 giveupJoin.Ok
                 && leaderGiveup.Ok
                 && leaderGiveup.LeaderChanged
                 && leaderGiveup.NewLeaderUserId == 10039
                 && leaderGiveup.RemainingMembers.Count == 1
-                && !staleFollowerGiveup.Ok
-                && staleFollowerGiveup.Reason == "party_generation_mismatch"
+                && leaderGiveup.Party.PartyId == originalGiveupPartyId
+                && leaderGiveup.RetiredParty == null
+                && survivorParty.PartyId == originalGiveupPartyId
+                && survivorParty.GetMember(10039)?.SlotIndex == 1
                 && followerGiveup.Ok
                 && followerGiveup.SoleMemberPreserved
                 && !followerGiveup.Disbanded
@@ -1630,6 +1931,45 @@ namespace DfoServer.SelfTests
                 && giveupManager.GetPartyByUser(10039)?.LeaderUserId == 10039
                 && giveupManager.GetPartyByUser(10039)?.Count == 1,
                 ref failures);
+
+            var staleGiveupManager = new PartyManager();
+            var staleLeaderSession = Guid.NewGuid();
+            var staleFollowerSession = Guid.NewGuid();
+            var staleGiveupParty = staleGiveupManager.CreateParty(
+                new PartyMember
+                {
+                    UserId = 10040,
+                    CharacterId = 10040,
+                    SessionId = staleLeaderSession,
+                    Name = "stale-leader",
+                });
+            var staleGiveupJoin = staleGiveupManager.Join(
+                staleGiveupParty.Party.PartyId,
+                new PartyMember
+                {
+                    UserId = 10041,
+                    CharacterId = 10041,
+                    SessionId = staleFollowerSession,
+                    Name = "stale-follower",
+                });
+            var staleGiveupPartyId = staleGiveupParty.Party.PartyId;
+            var staleLeaderGiveup = staleGiveupManager.LeaveExpectedParty(
+                10040,
+                staleLeaderSession,
+                staleGiveupPartyId);
+            var staleSurvivorParty = staleGiveupManager.GetPartyByUser(10041);
+            Check(
+                "stale dungeon leader cleanup preserves the frozen party generation and survivor slot",
+                staleGiveupJoin.Ok
+                && staleLeaderGiveup.Ok
+                && staleLeaderGiveup.LeaderChanged
+                && staleLeaderGiveup.NewLeaderUserId == 10041
+                && staleLeaderGiveup.RetiredParty == null
+                && staleSurvivorParty.PartyId == staleGiveupPartyId
+                && staleSurvivorParty.LeaderUserId == 10041
+                && staleSurvivorParty.GetMember(10041)?.SlotIndex == 1,
+                ref failures);
+
             var explicitFinalLeave = giveupManager.Leave(
                 10039,
                 followerSession);
@@ -1862,6 +2202,33 @@ namespace DfoServer.SelfTests
                     characterId: 10038)
                 && sharedRoomLcg.Seed == sharedRoomSeed,
                 ref failures);
+            var leaderCardSeed = DropService.DeriveParticipantCardSeed(
+                sharedRoomSeed,
+                partyDungeonInstanceId: 7,
+                roomInstanceId: 11,
+                characterId: 10038);
+            var followerCardSeed = DropService.DeriveParticipantCardSeed(
+                sharedRoomSeed,
+                partyDungeonInstanceId: 7,
+                roomInstanceId: 11,
+                characterId: 10039);
+            Check(
+                "party members receive stable independent card-reward streams",
+                leaderCardSeed
+                    == DropService.DeriveParticipantCardSeed(
+                        sharedRoomSeed,
+                        partyDungeonInstanceId: 7,
+                        roomInstanceId: 11,
+                        characterId: 10038)
+                && leaderCardSeed != followerCardSeed
+                && leaderCardSeed != DropService.DeriveParticipantCardSeed(
+                    sharedRoomSeed,
+                    partyDungeonInstanceId: 7,
+                    roomInstanceId: 12,
+                    characterId: 10038)
+                && leaderCardSeed != leaderDropSeed
+                && followerCardSeed != followerDropSeed,
+                ref failures);
 
             var lifeInstance = new DungeonInstance(2, 0);
             var lifeLeader = new DungeonRunIdentity(
@@ -1983,6 +2350,303 @@ namespace DfoServer.SelfTests
                     exitTriggeredWipe.Generation,
                     new[] { remainingDead },
                     exitTriggeredWipe.DeadlineUtc),
+                ref failures);
+
+var teleportBody = new byte[]
+            {
+                0x02, 0x02, 0x3E, 0x08, 0x40, 0x01, 0x05, 0x01,
+            };
+            Check(
+                "party teleport accepts the captured 8-byte A21 body",
+                PartyTeleportRequest.TryParse(teleportBody, out var teleportRequest)
+                && teleportRequest.TownId == 2
+                && teleportRequest.AreaId == 2
+                && teleportRequest.X == 0x083E
+                && teleportRequest.Y == 0x0140
+                && teleportRequest.Direction == 0x05,
+                ref failures);
+            Check(
+                "party teleport still accepts the bare 7-byte body",
+                PartyTeleportRequest.TryParse(
+                    teleportBody.Take(7).ToArray(), out _),
+                ref failures);
+            Check(
+                "party teleport rejects truncated bodies",
+                !PartyTeleportRequest.TryParse(
+                    teleportBody.Take(6).ToArray(), out _),
+                ref failures);
+
+            var teleportLeaderPlayer = new Game.Session.PlayerContext
+            {
+                CurTownId = 1,
+                CurAreaId = 2,
+            };
+            Check(
+                "party teleport accepts a member in the same town and area",
+                TownHandler.IsPartyTeleportSameRoom(
+                    teleportLeaderPlayer,
+                    new Game.Session.PlayerContext
+                    {
+                        CurTownId = 1,
+                        CurAreaId = 2,
+                    })
+                && !TownHandler.IsPartyTeleportSameRoom(
+                    teleportLeaderPlayer,
+                    new Game.Session.PlayerContext
+                    {
+                        CurTownId = 1,
+                        CurAreaId = 3,
+                    })
+                && !TownHandler.IsPartyTeleportSameRoom(
+                    teleportLeaderPlayer,
+                    new Game.Session.PlayerContext
+                    {
+                        CurTownId = 2,
+                        CurAreaId = 2,
+                    })
+                && !TownHandler.IsPartyTeleportSameRoom(
+                    teleportLeaderPlayer,
+                    null),
+                ref failures);
+
+            Check(
+                "town area permission gates below-level members",
+                !TownAreaPermissionPolicy.IsSatisfied(
+                    new PvfLib.TownPermission { NeedLevel = 46 },
+                    17,
+                    null)
+                && TownAreaPermissionPolicy.IsSatisfied(
+                    new PvfLib.TownPermission { NeedLevel = 46 },
+                    86,
+                    null)
+                && TownAreaPermissionPolicy.IsSatisfied(
+                    new PvfLib.TownPermission(),
+                    1,
+                    null)
+                && TownAreaPermissionPolicy.IsSatisfied(null, 1, null),
+                ref failures);
+            Check(
+                "town area permission requires the gated quest to be cleared",
+                !TownAreaPermissionPolicy.IsSatisfied(
+                    new PvfLib.TownPermission { NeedQuest = 2116 },
+                    86,
+                    questId => questId == 9999)
+                && TownAreaPermissionPolicy.IsSatisfied(
+                    new PvfLib.TownPermission { NeedQuest = 2116 },
+                    86,
+                    questId => questId == 2116),
+                ref failures);
+            // 线上实测场景: lv17 队员被带进需 46 级的北方避难所(town 5)。
+            Check(
+                "PVF town 5 (ShelterOfNorth) area 1 requires level 46",
+                Town.TryGetAreaPermission(5, 1, out var shelterPermission)
+                && shelterPermission != null
+                && shelterPermission.NeedLevel == 46,
+                ref failures);
+
+            var missingAntonPrerequisite = new EntryCostResult()
+                .FailMissingPrerequisites(
+                    targetDungeonId: 244,
+                    new[] { 245, 243, 245, 0, -1 });
+            Check(
+                "missing prerequisite keeps normalized typed context",
+                missingAntonPrerequisite.FailureKind
+                    == EntryCostFailureKind.MissingPrerequisite
+                && missingAntonPrerequisite.TargetDungeonId == 244
+                && missingAntonPrerequisite.MissingPrerequisiteDungeonIds
+                    .SequenceEqual(new[] { 243, 245 }),
+                ref failures);
+            var untypedMissingPrerequisite = new EntryCostResult().Fail(
+                "anton awakening prerequisites missing=243",
+                EntryCostFailureKind.MissingPrerequisite);
+            Check(
+                "diagnostic text does not synthesize typed prerequisite context",
+                untypedMissingPrerequisite.TargetDungeonId == 0
+                && untypedMissingPrerequisite
+                    .MissingPrerequisiteDungeonIds.Count == 0,
+                ref failures);
+            var ordinaryMissing = new EntryCostResult()
+                .FailMissingPrerequisites(244, new[] { 243 });
+            var ordinaryPresentation =
+                SequentialDungeonAdmissionRejectPolicy.Resolve(
+                    ordinaryMissing,
+                    "平常的一天",
+                    memberSlot: 1,
+                    SequentialDungeonDefinitionCatalog.Current,
+                    targetDungeonName: "暴走：震颤的大地",
+                    missingPrerequisiteDungeonNames:
+                        new[] { "暴走：黑雾之源" });
+            var finalMissing = new EntryCostResult()
+                .FailMissingPrerequisites(247, new[] { 243 });
+            var finalPresentation =
+                SequentialDungeonAdmissionRejectPolicy.Resolve(
+                    finalMissing,
+                    "平常的一天",
+                    memberSlot: 1,
+                    SequentialDungeonDefinitionCatalog.Current,
+                    targetDungeonName: string.Empty,
+                    missingPrerequisiteDungeonNames:
+                        Array.Empty<string>());
+            var untypedPresentation =
+                SequentialDungeonAdmissionRejectPolicy.Resolve(
+                    untypedMissingPrerequisite,
+                    "平常的一天",
+                    memberSlot: 1,
+                    SequentialDungeonDefinitionCatalog.Current,
+                    targetDungeonName: string.Empty,
+                    missingPrerequisiteDungeonNames:
+                        Array.Empty<string>());
+            var unknownTargetPresentation =
+                SequentialDungeonAdmissionRejectPolicy.Resolve(
+                    new EntryCostResult().FailMissingPrerequisites(
+                        999,
+                        new[] { 243 }),
+                    "平常的一天",
+                    memberSlot: 1,
+                    SequentialDungeonDefinitionCatalog.Current,
+                    targetDungeonName: string.Empty,
+                    missingPrerequisiteDungeonNames:
+                        Array.Empty<string>());
+            var multipleMissingPresentation =
+                SequentialDungeonAdmissionRejectPolicy.Resolve(
+                    new EntryCostResult().FailMissingPrerequisites(
+                        246,
+                        new[] { 245, 243, 244, 243 }),
+                    string.Empty,
+                    memberSlot: 1,
+                    SequentialDungeonDefinitionCatalog.Current,
+                    targetDungeonName: "目标地下城",
+                    missingPrerequisiteDungeonNames:
+                        new[] { "前置A", "前置B", "前置C" });
+            var missingTargetNamePresentation =
+                SequentialDungeonAdmissionRejectPolicy.Resolve(
+                    ordinaryMissing,
+                    "平常的一天",
+                    memberSlot: 1,
+                    SequentialDungeonDefinitionCatalog.Current,
+                    targetDungeonName: string.Empty,
+                    missingPrerequisiteDungeonNames:
+                        new[] { "暴走：黑雾之源" });
+            var missingPrerequisiteNamePresentation =
+                SequentialDungeonAdmissionRejectPolicy.Resolve(
+                    ordinaryMissing,
+                    "平常的一天",
+                    memberSlot: 1,
+                    SequentialDungeonDefinitionCatalog.Current,
+                    targetDungeonName: "暴走：震颤的大地",
+                    missingPrerequisiteDungeonNames:
+                        new[] { string.Empty });
+            var mismatchedPrerequisiteNamesPresentation =
+                SequentialDungeonAdmissionRejectPolicy.Resolve(
+                    ordinaryMissing,
+                    "平常的一天",
+                    memberSlot: 1,
+                    SequentialDungeonDefinitionCatalog.Current,
+                    targetDungeonName: "暴走：震颤的大地",
+                    missingPrerequisiteDungeonNames:
+                        Array.Empty<string>());
+            const string genericPrerequisiteNotice =
+                "队员[平常的一天]未满足前置地下城条件，无法进入该地下城。";
+            var pvfDungeonName =
+                DungeonEntryHandler.ResolveDungeonDisplayName(243);
+            var ordinaryPermissionReject =
+                DungeonAdmissionRejectBuilder.Build(
+                    DungeonEntryHandler.ResolveEntryAdmissionReject(
+                        new EntryCostResult().Fail(
+                            "ordinary permission missing",
+                            EntryCostFailureKind.MissingPermission),
+                        memberSlot: 1));
+            var invalidReject = DungeonAdmissionRejectBuilder.Build(
+                DungeonEntryHandler.ResolveEntryAdmissionReject(
+                    new EntryCostResult().Fail(
+                        "anton awakening progress unavailable",
+                        EntryCostFailureKind.InvalidState),
+                    memberSlot: 1));
+            Check(
+                "ordinary sequential prerequisite uses silent rejection and exact notice",
+                ordinaryPresentation.Projection
+                    == DungeonAdmissionRejectProjection.Silent
+                && ordinaryPresentation.HasNotice
+                && ordinaryPresentation.NoticeMessage
+                    == "队员[平常的一天]未通关【暴走：黑雾之源】，" +
+                       "无法进入【暴走：震颤的大地】。"
+                && DungeonAdmissionRejectBuilder.Build(
+                        DungeonAdmissionReject.MissingPrerequisite(1),
+                        ordinaryPresentation.Projection)
+                    .SequenceEqual(new byte[] { 0x00, 0x09, 0x00 }),
+                ref failures);
+            Check(
+                "rewardable sequential prerequisite keeps native rejection",
+                finalPresentation.Projection
+                    == DungeonAdmissionRejectProjection.Native
+                && !finalPresentation.HasNotice
+                && DungeonAdmissionRejectBuilder.Build(
+                        DungeonAdmissionReject.MissingPrerequisite(1),
+                        finalPresentation.Projection)
+                    .SequenceEqual(new byte[] { 0x00, 0x07, 0x00 }),
+                ref failures);
+            Check(
+                "missing typed context fails safe to native rejection",
+                untypedPresentation.Projection
+                    == DungeonAdmissionRejectProjection.Native
+                && !untypedPresentation.HasNotice,
+                ref failures);
+            Check(
+                "unknown sequential target fails safe to native rejection",
+                unknownTargetPresentation.Projection
+                    == DungeonAdmissionRejectProjection.Native
+                && !unknownTargetPresentation.HasNotice,
+                ref failures);
+            Check(
+                "multiple prerequisite names keep stable order and slot fallback",
+                multipleMissingPresentation.Projection
+                    == DungeonAdmissionRejectProjection.Silent
+                && multipleMissingPresentation.NoticeMessage
+                    == "队员[槽位1]未通关【前置A】、【前置B】、【前置C】，" +
+                       "无法进入【目标地下城】。",
+                ref failures);
+            Check(
+                "missing dungeon display names use generic notice without IDs",
+                missingTargetNamePresentation.Projection
+                    == DungeonAdmissionRejectProjection.Silent
+                && missingTargetNamePresentation.NoticeMessage
+                    == genericPrerequisiteNotice
+                && missingPrerequisiteNamePresentation.Projection
+                    == DungeonAdmissionRejectProjection.Silent
+                && missingPrerequisiteNamePresentation.NoticeMessage
+                    == genericPrerequisiteNotice
+                && mismatchedPrerequisiteNamesPresentation.Projection
+                    == DungeonAdmissionRejectProjection.Silent
+                && mismatchedPrerequisiteNamesPresentation.NoticeMessage
+                    == genericPrerequisiteNotice
+                && !genericPrerequisiteNotice.Any(char.IsDigit),
+                ref failures);
+            Check(
+                "sequential prerequisite notice name resolves from current PVF",
+                !string.IsNullOrWhiteSpace(pvfDungeonName)
+                && pvfDungeonName
+                    == Dungeon.GetDungeonFile(243)?.Name?.Trim(),
+                ref failures);
+            Check(
+                "unknown dungeon display name resolves empty",
+                DungeonEntryHandler.ResolveDungeonDisplayName(int.MaxValue)
+                    == string.Empty,
+                ref failures);
+            Check(
+                "default missing-prerequisite builder remains native",
+                DungeonAdmissionRejectBuilder.Build(
+                        DungeonAdmissionReject.MissingPrerequisite(1))
+                    .SequenceEqual(new byte[] { 0x00, 0x07, 0x00 }),
+                ref failures);
+            Check(
+                "ordinary member permission keeps the member-level permission code",
+                ordinaryPermissionReject.SequenceEqual(
+                    new byte[] { 0x00, 0xAD, 0x01 }),
+                ref failures);
+            Check(
+                "Anton progress database failure is not mislabeled as missing permission",
+                invalidReject.SequenceEqual(
+                    new byte[] { 0x00, 0x13, 0x00 }),
                 ref failures);
 
             Console.WriteLine($"A21_PARTY_PROTOCOL failures={failures}");

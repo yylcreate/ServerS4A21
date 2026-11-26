@@ -12,7 +12,13 @@ namespace DfoServer.Network.Builders
 {
     public static class UserInfoSubtype0Builder
     {
+        internal const int A21FixedHeaderLength = 38;
+        internal const int SingleRecordUserIdOffset = 3 + A21FixedHeaderLength;
+
         public static byte[] BuildNotificationBody(CharacterRecord record)
+            => BuildNotificationBody(record, (ushort)(record?.CharacterId ?? 0));
+
+        internal static byte[] BuildNotificationBody(CharacterRecord record, ushort userId)
         {
             if (record == null)
                 throw new ArgumentNullException(nameof(record));
@@ -20,9 +26,9 @@ namespace DfoServer.Network.Builders
             var writer = new GamePacketWriter();
             writer.WriteByte(0);
             writer.WriteUInt16(1);
-            // A21 USERINFO0 在 subtype/版本字段后保留 38B 固定头。
-            writer.WriteZeroBytes(38);
-            writer.WriteUInt16((ushort)record.CharacterId);
+            // A21 USERINFO0 的每条记录在 UID 前包含 38B 固定头。
+            writer.WriteZeroBytes(A21FixedHeaderLength);
+            writer.WriteUInt16(userId);
             writer.WriteDstr(record.Name);
             writer.WriteBytes(BuildRemainingBytes(record));
             return writer.ToArray();
@@ -65,7 +71,8 @@ namespace DfoServer.Network.Builders
             writer.WriteUInt32(t.NameTagItemId); // 名称装饰卡ID
             writer.WriteUInt32(t.NameTagExpireTime); // 名称装饰卡到期时间戳
             writer.WriteByte(t.Stamina);                    
-            writer.WriteUInt32(t.FatiguePenalty);           
+            // Current client 013E758E -> 013E2BF0 stores this u32 at user+2C8 (guild ID).
+            writer.WriteUInt32(t.GuildId);
             writer.WriteByte(t.IsEventCharacter);           
             if (t.EquippedCreatureItemId == 0)
             {
@@ -81,8 +88,7 @@ namespace DfoServer.Network.Builders
                 writer.WriteByte(t.EquippedCreatureAliveState); // 宠物存活状态
             }
 
-            // A21 无工会路径使用固定 64B 尾，避免客户端把旧 ProgressB 当作 dstr 长度。
-            writer.WriteBytes(BuildA21AfterAliveNoGuild(t));
+            writer.WriteBytes(BuildA21AfterAlive(t));
         }
 
         private static void ApplyOnlineInventoryTailFields(int characterId, UserInfoMinimumTailSnapshot tail)
@@ -118,7 +124,7 @@ namespace DfoServer.Network.Builders
             0x00, 0x00, 0x00, 0x00, 0x64, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00,
         };
 
-        private static byte[] BuildA21AfterAliveNoGuild(UserInfoMinimumTailSnapshot tail)
+        internal static byte[] BuildA21AfterAlive(UserInfoMinimumTailSnapshot tail)
         {
             var body = (byte[])A21AfterAliveNoGuild.Clone();
             if (tail == null)
@@ -153,7 +159,18 @@ namespace DfoServer.Network.Builders
                 A21AfterAliveMoodValueOffset,
                 sizeof(ushort));
             body[A21AfterAliveSkillTreeIndexOffset] = tail.SkillTreeIndex;
-            return body;
+            if (tail.GuildId == 0)
+                return body;
+
+            // 013E75CB/75D7 consume two bytes, 75E9 consumes u32; 013E2E60
+            // then consumes guild-name DSTR and u32 level. Preserve the rest of
+            // the verified no-guild tail after replacing these variable fields.
+            var writer = new GamePacketWriter();
+            writer.WriteBytes(body[..6]);
+            writer.WriteDstr(tail.GuildNameBytes);
+            writer.WriteUInt32(tail.GuildLevel);
+            writer.WriteBytes(body[16..]);
+            return writer.ToArray();
         }
 
         // A21 无副职业时经验为 0，不发历史 -1 / uint.MaxValue。

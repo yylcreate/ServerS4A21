@@ -204,7 +204,7 @@ namespace DfoServer.Network.Handlers
                 return;
             }
 
-            FileLogger.Log($"[{ProtocolName}] UPGRADE_ITEM raw({body?.Length ?? 0}B): {(body != null ? BitConverter.ToString(body) : "null")} method={request.Method} mode={request.Mode} target=({request.TargetSlotIndex},0x{request.TargetItemTemplateId:X8}) materialSlot={request.MaterialSlotIndex} optSlot={request.OptionalTicketSlotIndex} name={request.TargetItemName}");
+            FileLogger.Log($"[{ProtocolName}] UPGRADE_ITEM raw({body?.Length ?? 0}B): {(body != null ? BitConverter.ToString(body) : "null")} method={request.Method} mode={request.Mode} target=({request.TargetListType},{request.TargetSlotIndex},0x{request.TargetItemTemplateId:X8}) materialSlot={request.MaterialSlotIndex} optSlot={request.OptionalTicketSlotIndex} name={request.TargetItemName}");
 
             var (cid, _) = ResolveOwner(session);
             var command = request.ToCommand();
@@ -255,6 +255,9 @@ namespace DfoServer.Network.Handlers
 
             await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(0x01, 0x0050, ItemUpgradeAckBuilder.BuildSuccess(result)));
 
+            if (result.TargetListType == InventoryListType.GuildMedal)
+                await _refresh.SendUpdateItemList(session, result.TargetListType, result.TargetSlotIndex);
+
             if (result.MainRefreshSlots.Count > 0)
             {
                 await _refresh.SendUpdateItemList(session, InventoryListType.Main, result.MainRefreshSlots);
@@ -284,6 +287,9 @@ namespace DfoServer.Network.Handlers
                 userUniqueId => ItemUpgradeNoticeBuilder.Build(result, userUniqueId),
                 $"item=0x{result.TargetItemTemplateId:X8} level={result.NewLevel} mode={result.Mode}");
         }
+
+        internal Task BroadcastCommittedUpgradeNotice(EnhancedClientSession session, ItemUpgradeResult result)
+            => BroadcastItemUpgradeNotice(session, result);
 
         public async Task Handle_EQUIPMENT_SOCKET_OPEN(EnhancedClientSession session, GamePacketHeader header, byte[] body)
         {

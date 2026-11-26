@@ -240,6 +240,7 @@ namespace DfoServer.Network.Handlers
 
             var (cid, _) = ResolveOwner(session);
             InventoryMutationResult result = null;
+            var failureReason = ShopBuyFailureReason.InternalError;
             bool ok;
             if (TryGetOwnedInventoryLease(session, cid, out var lease))
             {
@@ -254,7 +255,8 @@ namespace DfoServer.Network.Handlers
                             npcId,
                             connection,
                             transaction,
-                            out result));
+                            out result,
+                            out failureReason));
             }
             else
             {
@@ -264,21 +266,33 @@ namespace DfoServer.Network.Handlers
 
             if (!ok)
             {
-                FileLogger.Log($"[{ProtocolName}] BUY_ITEM: FAILED itemTemplateId=0x{itemTemplateId:X8}");
-                await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(0x01, 0x0015, BuyItemAckBuilder.BuildError(0x00)));
+                // 业务失败分支已在业务层带出原因；提交失败(如协调器 SaveDirty 失败)没有原因时按内部错误处理。
+                var reason = failureReason == ShopBuyFailureReason.None
+                    ? ShopBuyFailureReason.InternalError
+                    : failureReason;
+
+                FileLogger.Log(
+                    $"[{ProtocolName}] BUY_ITEM: FAILED itemTemplateId=0x{itemTemplateId:X8} "
+                    + $"count={buyCount} shopId={shopId} npcId={npcId} reason={reason}");
+                await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(
+                    0x01,
+                    0x0015,
+                    BuyItemAckBuilder.BuildError(BuyItemAckBuilder.ResolveErrorCode(reason))));
                 return;
             }
 
             FileLogger.Log($"[{ProtocolName}] BUY_ITEM: OK slot={result.SlotIndex} gold={result.UpdatedGold} sp={result.UpdatedSp} coin={result.UpdatedCoin} expire={result.ExpireTime} costId={result.CostItemTemplateId} costRemain={result.CostItemRemainingCount}");
-            if (result.CostItemTemplateId > 0)
+            // 多材料兑换（如双材料礼盒）每个被扣槽都要刷新；第一对材料映射在
+            // result.CostItem*，其余对以 cost mutation 形式挂 ExtraResults。
+            foreach (var cost in EnumerateCostEntries(result))
             {
-                if (result.CostItemRemainingCount <= 0
+                if (cost.CostItemRemainingCount <= 0
                     && result.ListType == InventoryListType.Main
-                    && result.SlotIndex == result.CostItemSlotIndex)
-                    await _refresh.SendEmptyUpdateItemList(session, InventoryListType.Main, result.CostItemSlotIndex);
+                    && result.SlotIndex == cost.CostItemSlotIndex)
+                    await _refresh.SendEmptyUpdateItemList(session, InventoryListType.Main, cost.CostItemSlotIndex);
                 else
-                    await _refresh.SendUpdateItemList(session, InventoryListType.Main, result.CostItemSlotIndex);
-                FileLogger.Log($"[{ProtocolName}] BUY_ITEM: ACK cost item slot={result.CostItemSlotIndex} id=0x{result.CostItemTemplateId:X8} remain={result.CostItemRemainingCount}");
+                    await _refresh.SendUpdateItemList(session, InventoryListType.Main, cost.CostItemSlotIndex);
+                FileLogger.Log($"[{ProtocolName}] BUY_ITEM: ACK cost item slot={cost.CostItemSlotIndex} id=0x{cost.CostItemTemplateId:X8} remain={cost.CostItemRemainingCount}");
             }
 
             var purchaseCountUpdates = new List<PurchaseCountUpdate>
@@ -339,6 +353,8 @@ namespace DfoServer.Network.Handlers
             FileLogger.Log(
                 $"[{ProtocolName}] SHOP_PURCHASE_COUNT: npcId={npcId} items={counts.Count}");
 
+            // 已购计数按请求回显约定下发(CMD 0x02CC 回包, 与 BUY_ITEM 回显 0x0015 同款)。
+            // 2026-10-11 实测: 改成 NOTI 0x02A0 下发客户端不认, 商店 UI 已购计数会归零, 勿改。
             await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(
                 0x01,
                 0x02CC,
@@ -865,6 +881,23 @@ namespace DfoServer.Network.Handlers
             await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(0x01, header.type, new byte[] { 0x01 }));
             await _refresh.SendItemListRefresh(session, InventoryListType.PersonalCargo);
             FileLogger.Log($"[{ProtocolName}] UPGRADE_CARGO: cid={cid} aid={aid} personalCargoListParam16={newListParam16} rawBody({body?.Length ?? 0}B)={(body != null ? BitConverter.ToString(body) : "null")}");
+        }
+
+        // 本次购买扣除的全部材料槽：第一对在主 result 的 CostItem* 字段，
+        // 第二对起以 cost mutation 形式挂 ExtraResults（多材料兑换）。
+        private static IEnumerable<InventoryMutationResult> EnumerateCostEntries(InventoryMutationResult result)
+        {
+            if (result == null)
+                yield break;
+
+            if (result.CostItemTemplateId > 0)
+                yield return result;
+
+            foreach (var extra in result.ExtraResults)
+            {
+                if (extra != null && extra.CostItemTemplateId > 0)
+                    yield return extra;
+            }
         }
     }
 }

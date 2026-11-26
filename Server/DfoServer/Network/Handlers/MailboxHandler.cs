@@ -297,7 +297,6 @@ namespace DfoServer.Network.Handlers
             {
                 await _inventoryRefreshSender.SendUpdateItemList(session, pair.Key, pair.Value).ConfigureAwait(false);
             }
-            await _inventoryRefreshSender.SendAllSortItemLockRefresh(session).ConfigureAwait(false);
             await _inventoryRefreshSender.SendAllEquipmentItemLockListRefresh(session).ConfigureAwait(false);
             FileLogger.Log(
                 $"[Mailbox] SEND failure restored attachment slots={FormatClaimRefreshSlots(slotsByList)} " +
@@ -362,6 +361,12 @@ namespace DfoServer.Network.Handlers
             await SendClaimMailboxResult(session, header.type, claimObjectId);
             await SendClaimInventoryRefresh(session, updatedSlots);
 
+            // Vouchers inside the mail (代币券 / 欢乐代币券) are converted into account
+            // currency by SpecialRewardRouter. Those balances are NOT inventory slots, so
+            // the item-list refresh above cannot carry them: without this packet the
+            // client keeps the old 代币券 value and reports "获得0代币券".
+            await SendAckCeraRefresh(session, characterId);
+
             if (result.RemovedFromInbox)
             {
                 await SendChangeLetterStatResult(session, MailboxChangeLetterStatType, (int)result.MessageId, 0);
@@ -389,12 +394,58 @@ namespace DfoServer.Network.Handlers
                 await _inventoryRefreshSender.SendUpdateItemList(session, pair.Key, pair.Value).ConfigureAwait(false);
         }
 
-        private static Dictionary<InventoryListType, List<short>> BuildClaimRefreshSlots(MailboxClaimResult result)
+        /// <summary>
+        /// Pushes NOTIPACKET_CERA (0x0035) with the account's current
+        /// (cera, tokenCera, happyTokenCera).
+        ///
+        /// Claiming a voucher mail converts the attachment into account currency, and the
+        /// client reports that gain from its own currency object: the item-list refresh
+        /// cannot update it, so without this the client shows a stale balance and a bogus
+        /// "获得0代币券" prompt.
+        /// </summary>
+        private static async Task SendAckCeraRefresh(EnhancedClientSession session, int characterId)
+        {
+            if (session == null) return;
+            if (!InventoryContext.TryGetLease(characterId, out var lease)
+                || lease?.Inventory?.Database == null)
+            {
+                return;
+            }
+
+            int cera, token, happy;
+            try
+            {
+                (cera, token, happy) = lease.Inventory.Database.Read(connection =>
+                {
+                    using var cmd = connection.CreateCommand();
+                    cmd.CommandText =
+                        "SELECT cera, token_cera, happy_token_cera FROM accounts "
+                        + "WHERE account_id = @aid;";
+                    cmd.Parameters.AddWithValue("@aid", lease.AccountId);
+                    using var reader = cmd.ExecuteReader();
+                    if (!reader.Read()) return (0, 0, 0);
+                    return (reader.GetInt32(0), reader.GetInt32(1), reader.GetInt32(2));
+                });
+            }
+            catch (Exception ex)
+            {
+                FileLogger.Log($"[Mailbox] CLAIM cera refresh read failed cid={characterId}: {ex.Message}");
+                return;
+            }
+
+            await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(
+                0x00,
+                (ushort)NotiPacketTypeA21.CERA,
+                CeraUpdateBuilder.Build(cera, token, happy)));
+        }
+
+        internal static Dictionary<InventoryListType, List<short>> BuildClaimRefreshSlots(MailboxClaimResult result)
         {
             var slots = new Dictionary<InventoryListType, List<short>>();
             AddClaimRefreshSlots(slots, InventoryListType.Main, result?.UpdatedMainSlots);
             AddClaimRefreshSlots(slots, InventoryListType.Avatar, result?.UpdatedAvatarSlots);
             AddClaimRefreshSlots(slots, InventoryListType.Pet, result?.UpdatedPetSlots);
+            AddClaimRefreshSlots(slots, InventoryListType.GuildMedal, result?.UpdatedGuildMedalSlots);
             return slots;
         }
 
@@ -572,7 +623,14 @@ namespace DfoServer.Network.Handlers
             await SendMailboxAlarmIfNeeded(receiverCharacterId, receiverSession);
         }
 
-        private async Task SendMailboxAlarmIfNeeded(int receiverCharacterId, EnhancedClientSession receiverSession)
+        internal Task NotifyCommittedSystemMailAsync(int characterId, CancellationToken cancellationToken = default)
+        {
+            return _sessionDirectory.TryGet(characterId, out var current)
+                ? SendMailboxAlarmIfNeeded(characterId, current, cancellationToken) : Task.CompletedTask;
+        }
+
+        private async Task SendMailboxAlarmIfNeeded(int receiverCharacterId, EnhancedClientSession receiverSession,
+            CancellationToken cancellationToken = default)
         {
             var state = _mailboxAlarmStates.GetValue(receiverSession, _ => new MailboxAlarmState());
             ushort count;
@@ -587,11 +645,16 @@ namespace DfoServer.Network.Handlers
 
             try
             {
-                await receiverSession.SendPacketAsync(
+                bool sent = await receiverSession.TrySendPacketAsync(
                     GamePacketEnvelopeBuilder.Build(
                         0x00,
                         MailboxAlarmNotificationType,
-                        BuildMailboxAlarmNotification(count))).ConfigureAwait(false);
+                        BuildMailboxAlarmNotification(count)), cancellationToken,
+                    () => receiverSession.Player.CharacterId == receiverCharacterId
+                        && _sessionDirectory.TryGet(receiverCharacterId, out var current)
+                        && ReferenceEquals(current, receiverSession)
+                        && InventoryContext.TryGetOwnedLease(receiverSession.SessionId, receiverCharacterId, out _)).ConfigureAwait(false);
+                if (!sent) _mailboxAlarmStates.Remove(receiverSession);
             }
             catch (Exception ex)
             {
@@ -780,13 +843,16 @@ namespace DfoServer.Network.Handlers
             return SendSimpleResult(session, ackType, false, errorCode);
         }
 
-        private static byte[] BuildQueryCharacterInfoAck(CharacterRecord character, string fallbackName)
+        internal static byte[] BuildQueryCharacterInfoAck(CharacterRecord character, string fallbackName)
         {
             var nameBytes = GetResponseNameBytes(character, fallbackName);
             var writer = new GamePacketWriter();
             writer.WriteByte(0x01);
             writer.WriteInt32(nameBytes.Length);
             writer.WriteBytes(nameBytes);
+            // 名字后必须保留一个 0 字节，客户端从这里之后读取等级。
+            // 缺少该字节会让 level/job/grow 整体左移一字节（等级变成 job << 8）。
+            writer.WriteByte(0x00);
             writer.WriteUInt16(character.Level);
             // Client sub_CD2A00 unconditionally reads three bytes after level.
             // The first is passed to sub_1195CF0's 0..12 base-job table. Keep
@@ -794,6 +860,7 @@ namespace DfoServer.Network.Handlers
             // two fields; this client UI path reads but does not consume them.
             writer.WriteByte(character.Job);
             writer.WriteByte(character.GrowType);
+            writer.WriteByte(0x00);
             writer.WriteByte(0x00);
             return writer.ToArray();
         }
@@ -975,7 +1042,15 @@ namespace DfoServer.Network.Handlers
             writer.WriteInt32(hasItemAttachment ? attachment.ItemTemplateId : 0);
             writer.WriteByte(hasItemAttachment ? (byte)1 : (byte)0);
 
-            var itemCount = hasItemAttachment ? Math.Max(1, attachment.ItemCount) : 0;
+            // 账户货币凭证（代币券 / 欢乐代币券）在邮件里的「数量」由邮件的 gold 字段承载，
+            // 附件只用来标识物品类型，所以下发给客户端的数量写 0。
+            // 数据库里仍保存真实数量：领取时的换算读的是 attachment.ItemCount，不受这里影响。
+            var isCurrencyVoucher = hasItemAttachment
+                && SpecialRewardRouter.TryResolveAccountCurrencyReward(
+                    attachment.ItemTemplateId, 1, out _);
+            var itemCount = !hasItemAttachment ? 0
+                : isCurrencyVoucher ? 0
+                : Math.Max(1, attachment.ItemCount);
             var itemCore = hasItemAttachment ? MailboxItemCoreCodec.Decode(attachment) : null;
             var isStackableAttachment = hasItemAttachment
                 && itemCore != null
@@ -1014,8 +1089,13 @@ namespace DfoServer.Network.Handlers
                     : (hasItemAttachment ? ClampUInt16(attachment.Durability) : (ushort)0));
             var itemAttr = structuredItem?.Attr
                 ?? (hasItemAttachment ? ClampByte(attachment.SealFlag) : (byte)0);
-            // 附魔卡、强化次数、增幅类型与增幅值；堆叠附件数量走 instance 字段。
-            var enchantOrCount = structuredItem != null ? structuredItem.EnchantCardId : itemCount;
+            // 堆叠附件必须把数量同时写进 instance 与 enchant-or-count 两处：
+            // 客户端对不同物品类型会从不同位置取「获得数量」，早期只在 stackable 且无
+            // 结构化核心时才把数量写进 enchant-or-count，带核心的代币券凭证因此被读成 0，
+            // 弹窗显示「获得0代币券」。堆叠物品本身没有附魔卡，写数量不会污染语义。
+            var enchantOrCount = isStackableAttachment
+                ? itemCount
+                : (structuredItem != null ? structuredItem.EnchantCardId : itemCount);
             var enchantUpgradeCount = structuredItem != null ? structuredItem.EnchantUpgradeCount : (byte)0;
             var amplifyValue = structuredItem != null
                 ? structuredItem.AmplifyValue

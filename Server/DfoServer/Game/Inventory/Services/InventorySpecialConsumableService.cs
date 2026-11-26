@@ -178,8 +178,14 @@ namespace DfoServer.Game.Inventory
                 if (validRewards.Count == 0)
                     return false;
 
-                var triggeredDouble = isSeriaLuckValueSource
-                    && seriaLuckValue >= SqliteAccountRepository.SeriaLuckValueMax;
+                var nextSeriaLuckValue = seriaLuckValue;
+                var triggeredDouble = false;
+                if (isSeriaLuckValueSource)
+                {
+                    nextSeriaLuckValue = AdvanceSeriaLuckValue(
+                        seriaLuckValue,
+                        out triggeredDouble);
+                }
                 if (isSeriaLuckValueSource)
                 {
                     FileLogger.Log(
@@ -191,20 +197,17 @@ namespace DfoServer.Game.Inventory
 
                 AddRewardEntries(displayRewardEntries, validRewards);
                 if (triggeredDouble)
-                {
                     AddRewardEntries(doubleRewardEntries, validRewards);
-                    seriaLuckValue = 0;
-                }
 
                 if (!isSeriaLuckValueSource)
                     continue;
 
-                seriaLuckValue = Math.Min(SqliteAccountRepository.SeriaLuckValueMax, seriaLuckValue + 1);
+                seriaLuckValue = nextSeriaLuckValue;
             }
 
-            var rewardsToGrant = new List<PvfLib.BoosterRewardEntry>();
-            AddRewardEntries(rewardsToGrant, displayRewardEntries);
-            AddRewardEntries(rewardsToGrant, doubleRewardEntries, countMultiplier: 2);
+            var rewardsToGrant = BuildSeriaLuckRewardsToGrant(
+                displayRewardEntries,
+                doubleRewardEntries);
             var rewardRequests = BuildRewardRequests(rewardsToGrant);
             if (isSeriaLuckValueSource)
             {
@@ -452,6 +455,54 @@ namespace DfoServer.Game.Inventory
                         Math.Max(1, avatarReward.Count),
                         avatarReward.ExpireTime,
                         choice.OptionValue);
+                }
+            }
+            else if (definition.Categories.Count > 0)
+            {
+                // 自选礼盒: selnum=0 发所选分类全集, selnum=K>0 只发校验后的选中集。
+                var stackable = StackableItemProvider.Load(packageItemTemplateId);
+                if (stackable == null || request.SelectionContext < 0)
+                    return false;
+
+                var categories = new List<IReadOnlyList<int>>(definition.Categories.Count);
+                foreach (var category in definition.Categories)
+                {
+                    var categoryItemIds = new List<int>(category.Count);
+                    foreach (var entry in category)
+                        categoryItemIds.Add(entry.ItemTemplateId);
+
+                    categories.Add(categoryItemIds);
+                }
+
+                if (!BoosterSelectionGrantResolver.TryResolveGrantedItemIds(
+                        stackable.BoosterSelectionNum,
+                        categories,
+                        request.SelectionContext,
+                        request.SelectedItemTemplateIds,
+                        out var grantedItemIds))
+                    return false;
+
+                foreach (var itemId in grantedItemIds)
+                {
+                    if (!definition.TryGetReward(itemId, out var grantedReward))
+                        return false;
+
+                    if (grantedReward.ExpireTime > 0
+                        && grantedReward.ExpireTime <= DateTimeOffset.Now.ToUnixTimeSeconds())
+                        return false;
+
+                    var grantedMetadata = ItemMetadataResolver.Resolve(grantedReward.ItemTemplateId);
+                    if (grantedMetadata.ItemKind == "special"
+                        && !EpicPieceCatalogService.IsEpicPieceId(grantedReward.ItemTemplateId))
+                        return false;
+
+                    rewardForResult = rewardForResult ?? grantedReward;
+                    AddRewardRequest(
+                        rewardRequests,
+                        grantedReward.ItemTemplateId,
+                        grantedReward.Count,
+                        grantedReward.ExpireTime,
+                        request.SelectionFlag);
                 }
             }
             else
@@ -1436,6 +1487,33 @@ namespace DfoServer.Game.Inventory
                     UsablePeriodDays = reward.UsablePeriodDays,
                 });
             }
+        }
+
+        internal static List<PvfLib.BoosterRewardEntry> BuildSeriaLuckRewardsToGrant(
+            IEnumerable<PvfLib.BoosterRewardEntry> displayRewards,
+            IEnumerable<PvfLib.BoosterRewardEntry> doubleRewards)
+        {
+            var rewardsToGrant = new List<PvfLib.BoosterRewardEntry>();
+            AddRewardEntries(rewardsToGrant, displayRewards);
+            // The double list is the one additional copy. The original roll is
+            // already present in displayRewards.
+            AddRewardEntries(rewardsToGrant, doubleRewards);
+            return rewardsToGrant;
+        }
+
+        internal static int AdvanceSeriaLuckValue(
+            int currentValue,
+            out bool triggeredDouble)
+        {
+            var normalized = SqliteAccountRepository.NormalizeSeriaLuckValue(
+                currentValue);
+            triggeredDouble = normalized >= SqliteAccountRepository.SeriaLuckValueMax;
+            if (triggeredDouble)
+                return 0;
+
+            return Math.Min(
+                SqliteAccountRepository.SeriaLuckValueMax,
+                normalized + 1);
         }
 
         private static string FormatRewardEntryList(IEnumerable<PvfLib.BoosterRewardEntry> rewards)

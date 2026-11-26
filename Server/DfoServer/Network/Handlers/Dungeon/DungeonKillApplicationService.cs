@@ -1,6 +1,7 @@
 using DfoServer.Game.Dungeon;
 using DfoServer.Game.Inventory;
 using DfoServer.Game.Progression;
+using DfoServer.GameWorld;
 using DfoServer.Infrastructure;
 using DfoServer.Network.Builders;
 using DfoServer.Network.Handlers.Pets;
@@ -101,6 +102,7 @@ namespace DfoServer.Network.Handlers.Dungeon
                 }
 
                 await ProcessCoreAsync(context, run);
+                await _services.DeathTower.TryCompleteBossStageAsync(session, run);
                 return;
             }
 
@@ -169,7 +171,8 @@ namespace DfoServer.Network.Handlers.Dungeon
                     context,
                     run,
                     canonicalWorldDeath,
-                    canonicalDynamicActor);
+                    canonicalDynamicActor,
+                    reservation);
                 if (!completed)
                 {
                     run.Instance.ParticipantEffects.TryFail(reservation);
@@ -304,7 +307,8 @@ namespace DfoServer.Network.Handlers.Dungeon
             KillContext context,
             DungeonRun run,
             DungeonRoomActorDeathApplication? recordedWorldDeath = null,
-            DungeonDynamicActorDefinition dynamicActor = null)
+            DungeonDynamicActorDefinition dynamicActor = null,
+            DungeonParticipantEffectReservation participantEffect = default)
         {
             var session = context.Session;
 
@@ -368,6 +372,8 @@ namespace DfoServer.Network.Handlers.Dungeon
                     session,
                     run,
                     identity,
+                    context.Envelope.SourceEventId,
+                    participantEffect,
                     context.SequenceId,
                     monster.Value);
                 if (!session.Player.IsCurrentDungeonRun(identity))
@@ -392,6 +398,8 @@ namespace DfoServer.Network.Handlers.Dungeon
                         session,
                         run,
                         identity,
+                        context.Envelope.SourceEventId,
+                        participantEffect,
                         context.SequenceId,
                         new DungeonData.MonsterSumInfo
                         {
@@ -745,11 +753,13 @@ namespace DfoServer.Network.Handlers.Dungeon
             EnhancedClientSession session,
             DungeonRun run,
             DungeonRunIdentity identity,
+            Guid sourceEventId,
+            DungeonParticipantEffectReservation participantEffect,
             ushort sequenceId,
             DungeonData.MonsterSumInfo monster,
             DungeonDynamicActorPolicy dynamicPolicy = null)
         {
-            var isDeathTowerRun = run.Tower != null;
+            var isDeathTowerRun = run.Tower != null && !run.Tower.Config.IsBossTower;
             IReadOnlyList<DropInfo> towerDrops = null;
             if (isDeathTowerRun)
                 _services.DeathTower.TryGenerateDropsForMonster(
@@ -859,11 +869,27 @@ namespace DfoServer.Network.Handlers.Dungeon
                         equipmentBonusPercent);
                 }
             }
-            var awardedExp = CharacterExperienceService.AddSaturating(
-                CharacterExperienceService.AddSaturating(
+            // 公会经验加成每局首次有效杀怪读取一次，并冻结在本 participant 的
+            // run 台账里；本局后续杀怪以及本局内的购买/离会/到期都不再查询。
+            uint guildBonus;
+            lock (run.SyncRoot)
+            {
+                int guildPercent = run.Combat.Experience
+                    .ResolveGuildMonsterExperiencePercent(
+                        allowsExperience,
+                        monsterAwardBaseExp,
+                        () => ReadGuildMonsterBonusPercent(session));
+                guildBonus = run.Combat.Experience.ApplyGuildBonusRate(
                     monsterAwardBaseExp,
-                    growthContractBonus),
-                equipmentBonus);
+                    guildPercent);
+            }
+            var awardedExp = CharacterExperienceService.AddSaturating(
+                guildBonus,
+                CharacterExperienceService.AddSaturating(
+                    CharacterExperienceService.AddSaturating(
+                        monsterAwardBaseExp,
+                        growthContractBonus),
+                    equipmentBonus));
 
             var dungeonBasisLevel = (int)monster.Level;
             var dungeonMinimumLevel = (int)monster.Level;
@@ -895,6 +921,10 @@ namespace DfoServer.Network.Handlers.Dungeon
 
             IReadOnlyList<DropInfo> generatedDrops;
             int goldGained;
+            var monsterDropIdentity = new DungeonMonsterDropIdentity(
+                sequenceId,
+                monster.Code);
+            var reusesFrozenSequentialOutcome = false;
             if (!allowsDrops)
             {
                 generatedDrops = Array.Empty<DropInfo>();
@@ -924,15 +954,87 @@ namespace DfoServer.Network.Handlers.Dungeon
                 var dropRateLevel = run.HellMode
                     ? dungeonBasisLevel
                     : monster.Level;
-                var dropResult = _services.Drops.GenerateAndRegister(
-                    run,
-                    new MonsterDropRequest
+                var isLimitedSequentialMonster =
+                    run.Instance.SequentialDefinitionResolution
+                        == SequentialDungeonCapabilityResolution.Resolved
+                    && run.Instance.SequentialDefinition != null
+                    && run.Instance.SequentialDefinition.ContainsMonster(
+                        monster.Code);
+                var dropResult = default(MonsterDropResult);
+                if (isLimitedSequentialMonster)
+                {
+                    DungeonMonsterDropOutcomeResolution outcomeResolution;
+                    outcomeResolution = run.Instance.ParticipantEffects
+                        .ResolveMonsterDropOutcome(
+                            participantEffect,
+                            monsterDropIdentity,
+                            out dropResult);
+
+                    if (outcomeResolution
+                        == DungeonMonsterDropOutcomeResolution.IdentityMismatch)
                     {
-                        DropRateLevel = dropRateLevel,
-                        MonsterType = rewardMonsterType,
-                        MonsterCode = monster.Code,
-                        DungeonBasisLevel = dungeonBasisLevel,
-                    });
+                        throw new InvalidOperationException(
+                            "Sequential monster drop event was replayed with a different monster identity.");
+                    }
+                    reusesFrozenSequentialOutcome = outcomeResolution
+                        == DungeonMonsterDropOutcomeResolution.Resolved;
+                }
+
+                if (!reusesFrozenSequentialOutcome)
+                {
+                    dropResult = _services.SequentialLoot.GenerateAndMark(
+                        session.Player.CharacterId,
+                        run.Instance.SequentialDefinitionResolution,
+                        run.Instance.SequentialDefinition,
+                        monster.Code,
+                        () => _services.Drops.GenerateAndRegister(
+                            run,
+                            new MonsterDropRequest
+                            {
+                                DropRateLevel = dropRateLevel,
+                                MonsterType = rewardMonsterType,
+                                MonsterCode = monster.Code,
+                                DungeonBasisLevel = dungeonBasisLevel,
+                            }),
+                        drops => _services.Drops.RollbackRegistered(run, drops),
+                        run.DungeonId,
+                        identity,
+                        sourceEventId);
+
+                    if (isLimitedSequentialMonster)
+                    {
+                        if (!run.Instance.ParticipantEffects
+                                .TryFreezeMonsterDropOutcome(
+                                    participantEffect,
+                                    monsterDropIdentity,
+                                    dropResult,
+                                    out dropResult))
+                        {
+                            throw new InvalidOperationException(
+                                "Sequential monster drop result could not be frozen after resolution.");
+                        }
+                        reusesFrozenSequentialOutcome = true;
+                        LogSequentialDropOutcome(
+                            "frozen",
+                            session.Player.CharacterId,
+                            run,
+                            identity,
+                            sourceEventId,
+                            monsterDropIdentity,
+                            dropResult);
+                    }
+                }
+                else
+                {
+                    LogSequentialDropOutcome(
+                        "reused",
+                        session.Player.CharacterId,
+                        run,
+                        identity,
+                        sourceEventId,
+                        monsterDropIdentity,
+                        dropResult);
+                }
                 generatedDrops = dropResult.Drops;
                 goldGained = dropResult.GoldAmount;
             }
@@ -940,26 +1042,90 @@ namespace DfoServer.Network.Handlers.Dungeon
             ExperienceGrantResult grant = null;
             if (allowsExperience && awardedExp > 0)
             {
-                grant = _services.CharacterExperience.Grant(
+                ExperienceGrantResult ApplyExperience() => _services.CharacterExperience.Grant(
                     session.Player,
                     session.Account?.AccountId ?? 0,
                     awardedExp,
                     ExperiencePersistMode.OnLevelUpOnly,
                     "dungeon-kill");
+                if (participantEffect.IsValid)
+                {
+                    if (!run.Instance.ParticipantEffects.TryApplyMonsterExperienceOnce(
+                            participantEffect, ApplyExperience, out grant))
+                        throw new InvalidOperationException("Participant monster experience checkpoint is unavailable.");
+                }
+                else
+                    grant = ApplyExperience();
+            }
+
+            // 龙跃武器成长值：击杀普通/稀有/精英/领主怪时为角色身上的龙跃武器
+            // 累积成长值（副本难度越高增量越大）。与经验一样走一次性检查，
+            // 避免同一只怪在重放/组队转发时被重复累积。
+            if (allowsExperience)
+            {
+                var growthGain = EquipmentGrowthService.CalculateGrowthGain(
+                    monster.Level,
+                    run.Difficulty,
+                    rewardMonsterType,
+                    run.DungeonId);
+                if (growthGain > 0)
+                {
+                    void ApplyGrowth() => ApplyEquipmentGrowth(session, growthGain);
+
+                    if (participantEffect.IsValid)
+                    {
+                        if (!run.Instance.ParticipantEffects.TryApplyMonsterGrowthOnce(
+                                participantEffect, ApplyGrowth))
+                        {
+                            throw new InvalidOperationException(
+                                "Participant monster growth checkpoint is unavailable.");
+                        }
+                    }
+                    else
+                    {
+                        ApplyGrowth();
+                    }
+                }
             }
 
             lock (run.SyncRoot)
             {
-                run.Combat.Experience.RecordMonster(
-                    monsterAwardBaseExp,
-                    growthContractBonus,
-                    isBoss,
-                    isChampion,
-                    isSuperChampion,
-                    isNamed,
-                    actorSequenceId: sequenceId,
-                    equipmentBonusExperience: equipmentBonus);
-                run.TotalGold = checked(run.TotalGold + goldGained);
+                void ApplyStatistics()
+                {
+                    if (reusesFrozenSequentialOutcome)
+                    {
+                        if (!run.Instance.ParticipantEffects.TryApplyMonsterDropGold(
+                                participantEffect,
+                                monsterDropIdentity,
+                                amount => run.TotalGold = checked(
+                                    run.TotalGold + amount)))
+                        {
+                            throw new InvalidOperationException(
+                                "Sequential monster drop gold checkpoint lost its frozen outcome.");
+                        }
+                    }
+                    else
+                    {
+                        run.TotalGold = checked(run.TotalGold + goldGained);
+                    }
+                    run.Combat.Experience.RecordMonster(
+                        monsterAwardBaseExp,
+                        growthContractBonus,
+                        isBoss,
+                        isChampion,
+                        isSuperChampion,
+                        isNamed,
+                        actorSequenceId: sequenceId,
+                        equipmentBonusExperience: equipmentBonus,
+                        guildBonusExperience: guildBonus);
+                }
+                if (participantEffect.IsValid)
+                {
+                    if (!run.Instance.ParticipantEffects.TryApplyMonsterStatisticsOnce(participantEffect, ApplyStatistics))
+                        throw new InvalidOperationException("Participant monster statistics checkpoint is unavailable.");
+                }
+                else
+                    ApplyStatistics();
             }
 
             if (allowsExperience)
@@ -1004,6 +1170,27 @@ namespace DfoServer.Network.Handlers.Dungeon
             return generatedDrops;
         }
 
+        private static void LogSequentialDropOutcome(
+            string stage,
+            int characterId,
+            DungeonRun run,
+            DungeonRunIdentity identity,
+            Guid sourceEventId,
+            DungeonMonsterDropIdentity monsterIdentity,
+            MonsterDropResult result)
+        {
+            FileLogger.Log(
+                "[SequentialDungeonDailyLoot] "
+                + $"stage={stage} character={characterId} "
+                + $"group={run.Instance.SequentialDefinition?.GroupKey ?? 0} "
+                + $"dungeon={run.DungeonId} monster={monsterIdentity.MonsterCode} "
+                + $"actor={monsterIdentity.ActorSequenceId} "
+                + $"instance={identity.PartyDungeonInstanceId} "
+                + $"run={identity.RunId} generation={identity.RunGeneration} "
+                + $"event={sourceEventId:N} drops={result.Drops?.Count ?? 0} "
+                + $"gold={result.GoldAmount}");
+        }
+
         private async Task ApplyRoomClearedAsync(
             EnhancedClientSession session,
             DungeonRun run,
@@ -1022,6 +1209,11 @@ namespace DfoServer.Network.Handlers.Dungeon
                     DungeonEncounterDirectiveKind.Succeed,
                     cause: "tracked room actors cleared"));
             roomState?.TryClear();
+
+            await SpecialDungeonNotifier.ObserveRoomClearedAsync(
+                session, run, clearSource, roomState);
+            if (!IsCurrent(run, context.Envelope))
+                return;
 
             var endPoint = roomState != null
                 && run.BossMapPos != null
@@ -1430,10 +1622,118 @@ namespace DfoServer.Network.Handlers.Dungeon
                         context.SourceUserId)));
         }
 
+        // 为当前角色身上的龙跃武器累积成长值。
+        // 拿不到 owned lease 时静默跳过：成长值是附加收益，不能因为它阻断杀怪主流程。
+        private void ApplyEquipmentGrowth(
+            EnhancedClientSession session,
+            int growthGain)
+        {
+            var characterId = session?.Player?.CharacterId ?? 0;
+            if (characterId <= 0
+                || !InventoryContext.TryGetLease(characterId, out var lease)
+                || !lease.IsOwnedBy(session.SessionId))
+            {
+                return;
+            }
+
+            if (!EquipmentGrowthCommitService.TryAccumulate(lease, growthGain, out var stageUpgraded))
+                return;
+
+            // 成长值改的是 ItemCore 的线上字段（星级进度/模板），客户端不会自己知道。
+            // 装备栏的权威来源是 USERINFO(0x0002) 的 readUserInfoMinimum，
+            // ITEM_LIST(0x000D/0x000E) 只作用于背包列表，改不动装备栏 tooltip。
+            SendEquipmentGrowthRefresh(session, lease, stageUpgraded);
+        }
+
+        // 升星换了模板时重发 USERINFO1，让客户端重建装备栏条目（名称与星级）；
+        // 普通累积只推单槽 ITEM_LIST，足够更新进度。
+        private void SendEquipmentGrowthRefresh(
+            EnhancedClientSession session,
+            InventoryLease lease,
+            bool stageUpgraded)
+        {
+            if (session == null || lease?.Inventory == null)
+                return;
+
+            try
+            {
+                var weaponSlot = (short)DfoServer.Game.ItemUpgrade.EquipmentType.Weapon;
+                var weaponCore = lease.Inventory.GetItem(InventoryListType.Equipment, weaponSlot);
+                if (weaponCore == null)
+                    return;
+
+                if (stageUpgraded)
+                {
+                    FileLogger.Log(
+                        $"[EquipmentGrowth] refresh=USERINFO1 cid={lease.CharacterId} item={weaponCore.ItemId}");
+                    _ = SendUserInfo1RefreshAsync(session);
+                }
+                else
+                {
+                    _ = InventoryRefreshSender.SendOnlineUpdateItemList(
+                        session,
+                        InventoryListType.Equipment,
+                        weaponSlot);
+                }
+            }
+            catch (Exception ex)
+            {
+                FileLogger.Log(
+                    $"[EquipmentGrowth] equipment refresh failed cid={lease.CharacterId}: {ex.Message}");
+            }
+        }
+
+        // 重发 USERINFO subtype1：客户端 readUserInfoMinimum 会按它重建装备栏。
+        private async Task SendUserInfo1RefreshAsync(EnhancedClientSession session)
+        {
+            try
+            {
+                var cid = session?.Player?.CharacterId ?? 0;
+                if (cid <= 0)
+                    return;
+
+                var record = _services.CharacterRepository.GetById(cid);
+                if (record == null)
+                    return;
+
+                var addition = _services.Subtype1Repository.Load(cid);
+                if (addition == null)
+                {
+                    FileLogger.Log($"[EquipmentGrowth] USERINFO1 refresh skipped: addition null cid={cid}");
+                    return;
+                }
+
+                var accountId = session.Account?.AccountId ?? record.AccountId;
+                var accountCharacters = _services.CharacterRepository.ListByAccount(accountId);
+                var skills = _services.ProgressNotifications
+                    .LoadSyncedSkillState(cid, record.Level).Skills;
+
+                var body = UserInfoBroadcastService.BuildSubtype1Body(
+                    record,
+                    addition,
+                    accountCharacters,
+                    _services.HonorLevel.LoadSummary(accountId, accountCharacters),
+                    skills);
+
+                if (body == null || body.Length == 0)
+                    return;
+
+                await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(
+                    0x00,
+                    (ushort)NotiPacketTypeA21.USERINFO,
+                    body));
+                FileLogger.Log($"[EquipmentGrowth] USERINFO1 refresh sent cid={cid} len={body.Length}");
+            }
+            catch (Exception ex)
+            {
+                FileLogger.Log(
+                    $"[EquipmentGrowth] USERINFO1 refresh failed cid={session?.Player?.CharacterId}: {ex.Message}");
+            }
+        }
+
         private static bool IsCurrent(
             DungeonRun run,
-            DungeonEventEnvelope envelope)
-        {
+            DungeonEventEnvelope envelope)        {
             if (run == null
                 || envelope == null
                 || !run.Matches(envelope.RunIdentity))
@@ -1582,6 +1882,16 @@ namespace DfoServer.Network.Handlers.Dungeon
                 IsAbyssMonsterScript = monster.IsHellMonsterScript,
                 CharacterId = characterId,
             };
+        }
+
+        // 每局首次有效杀怪结算时调用一次，结果冻结局内；数据库仍是公会成员
+        // 关系和期限的真源。读取异常照常上抛，由现有杀怪路径处理。
+        private int ReadGuildMonsterBonusPercent(EnhancedClientSession session)
+        {
+            long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            var contents = new Game.Guilds.GuildRepository(_services.Database)
+                .GetContents(session.Player.CharacterId, now);
+            return Game.Guilds.GuildContentRules.ExperiencePercent(contents, now);
         }
 
         private uint CalculateGrowthContractMonsterBonus(

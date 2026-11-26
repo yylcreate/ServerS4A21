@@ -162,6 +162,9 @@ namespace DfoServer.Game.Quests
             var result = QuestCommandParser.TryParseAccept(qBody, out var command)
                 ? _service.HandleAcceptQuest(owner, command, _sender.AccountId)
                 : QuestAcceptResult.Fail(23);
+            // 先并入快照再回包: 回包之后客户端就可能马上杀怪, 不能留窗口。
+            if (result.Success)
+                MergeAcceptedQuestIntoCurrentRun(result.QuestId, result.ActivationId);
             await _sender.SendCmdAckAsync(wireType, QuestAckBuilder.BuildAccept(result));
             if (result.Success && result.PostAcceptTriggerProjection != null)
             {
@@ -170,6 +173,57 @@ namespace DfoServer.Game.Quests
             }
             if (result.Success)
                 await _notifications.SendAcceptableQuestListAsync();
+        }
+
+        // 进本后接取: 掉落/击杀/清图都以当前局 QuestRunSnapshot 为白名单,
+        // 不并入就会在整局内被过滤掉。只补这一条, 不重建整份快照。
+        private void MergeAcceptedQuestIntoCurrentRun(
+            ushort questId,
+            QuestActivationId activationId)
+        {
+            var run = _sender.Player?.CurrentRun;
+            if (run == null || questId == 0 || !activationId.IsValid)
+                return;
+
+            try
+            {
+                var accepted = QuestService.LoadActiveQuests(
+                    _connStr,
+                    _sender.CharacterId);
+                ActiveQuest match = null;
+                foreach (var quest in accepted)
+                {
+                    // 必须取接取后重新读出的 activation, 接取前的对象会校验失败。
+                    if (quest != null
+                        && quest.QuestId == questId
+                        && quest.ActivationId.Equals(activationId))
+                    {
+                        match = quest;
+                        break;
+                    }
+                }
+                if (match == null)
+                {
+                    FileLogger.Log(
+                        $"[QuestManager] ACCEPT snapshot merge skipped: " +
+                        $"quest={questId} cid={_sender.CharacterId} " +
+                        "accepted row not reloaded");
+                    return;
+                }
+
+                run.MergeAcceptedQuestIntoSnapshot(match);
+                FileLogger.Log(
+                    $"[QuestManager] ACCEPT merged into run snapshot: " +
+                    $"quest={questId} cid={_sender.CharacterId} " +
+                    $"run={run.RunId}/{run.RunGeneration}");
+            }
+            catch (Exception ex)
+            {
+                FileLogger.Log(
+                    $"[QuestManager] ACCEPT snapshot merge failed: " +
+                    $"quest={questId} cid={_sender.CharacterId} " +
+                    $"error={ex.Message}");
+            }
         }
 
         public async Task HandleImageCommunicationEquipmentUseAsync(
@@ -489,6 +543,12 @@ namespace DfoServer.Game.Quests
             await _notifications.SendActiveQuestListAsync(cid);
         }
 
+        internal Task SendTriggerChangesAsync(
+            IEnumerable<QuestSetTriggerResult> changes)
+        {
+            return _notifications.SendTriggerChangesAsync(changes);
+        }
+
         internal async Task SyncItemSeekingQuestProgressAfterInventoryMutationAsync(
             InventoryLease expectedLease,
             InventoryMutationResult mutation)
@@ -708,6 +768,39 @@ namespace DfoServer.Game.Quests
                 dungeonId,
                 difficulty,
                 enemyCode,
+                enemyType,
+                sourceEventId,
+                eligibleQuestIds,
+                eligibleQuestActivations);
+            TrackServerDrivenTriggerChanges(
+                cid,
+                changes,
+                sourceRunIdentity);
+            return Task.CompletedTask;
+        }
+
+        public Task SyncActorDeathQuestProgressAsync(
+            int dungeonId,
+            int difficulty,
+            int actorCode,
+            byte actorType,
+            int enemyType,
+            Guid sourceEventId = default,
+            IReadOnlyCollection<ushort> eligibleQuestIds = null,
+            DungeonRunIdentity sourceRunIdentity = default,
+            IReadOnlyDictionary<ushort, QuestActivationId>
+                eligibleQuestActivations = null)
+        {
+            var cid = _sender.CharacterId;
+            if (cid <= 0 || dungeonId <= 0 || actorCode <= 0)
+                return Task.CompletedTask;
+
+            var changes = _service.SyncActorDeathQuestProgress(
+                cid,
+                dungeonId,
+                difficulty,
+                actorCode,
+                actorType,
                 enemyType,
                 sourceEventId,
                 eligibleQuestIds,

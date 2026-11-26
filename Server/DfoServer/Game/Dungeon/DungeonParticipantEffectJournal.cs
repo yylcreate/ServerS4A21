@@ -1,8 +1,42 @@
 using System;
 using System.Collections.Generic;
+using DfoServer.Game.Progression;
 
 namespace DfoServer.Game.Dungeon
 {
+    internal readonly struct DungeonMonsterDropIdentity
+        : IEquatable<DungeonMonsterDropIdentity>
+    {
+        internal DungeonMonsterDropIdentity(
+            ushort actorSequenceId,
+            int monsterCode)
+        {
+            ActorSequenceId = actorSequenceId;
+            MonsterCode = monsterCode;
+        }
+
+        internal ushort ActorSequenceId { get; }
+        internal int MonsterCode { get; }
+        internal bool IsValid => ActorSequenceId > 0 && MonsterCode > 0;
+
+        public bool Equals(DungeonMonsterDropIdentity other) =>
+            ActorSequenceId == other.ActorSequenceId
+            && MonsterCode == other.MonsterCode;
+
+        public override bool Equals(object obj) =>
+            obj is DungeonMonsterDropIdentity other && Equals(other);
+
+        public override int GetHashCode() =>
+            HashCode.Combine(ActorSequenceId, MonsterCode);
+    }
+
+    internal enum DungeonMonsterDropOutcomeResolution
+    {
+        Absent = 0,
+        Resolved = 1,
+        IdentityMismatch = 2,
+    }
+
     internal enum DungeonParticipantEffectState
     {
         Pending = 0,
@@ -21,6 +55,10 @@ namespace DfoServer.Game.Dungeon
     {
         internal const string MonsterKill = "monster-kill-participant";
         internal const string DungeonClear = "dungeon-clear-participant";
+        internal const string AntonAwakeningAutoReward =
+            "anton-awakening-auto-reward";
+        internal const string AntonAwakeningRewardProjection =
+            "anton-awakening-reward-projection";
     }
 
     // A roster entry is a frozen participant identity, not a live party lookup.
@@ -35,6 +73,25 @@ namespace DfoServer.Game.Dungeon
             DungeonRunIdentity runIdentity,
             DungeonRoomIdentity roomIdentity,
             long attachmentGeneration)
+            : this(
+                characterId,
+                participantUserId,
+                run,
+                runIdentity,
+                roomIdentity,
+                attachmentGeneration,
+                byte.MaxValue)
+        {
+        }
+
+        internal DungeonParticipantRosterEntry(
+            int characterId,
+            ushort participantUserId,
+            DungeonRun run,
+            DungeonRunIdentity runIdentity,
+            DungeonRoomIdentity roomIdentity,
+            long attachmentGeneration,
+            byte partySlot)
         {
             if (characterId <= 0)
                 throw new ArgumentOutOfRangeException(nameof(characterId));
@@ -53,6 +110,7 @@ namespace DfoServer.Game.Dungeon
             RunIdentity = runIdentity;
             RoomIdentity = roomIdentity;
             AttachmentGeneration = attachmentGeneration;
+            PartySlot = partySlot;
         }
 
         internal int CharacterId { get; }
@@ -61,6 +119,7 @@ namespace DfoServer.Game.Dungeon
         internal DungeonRunIdentity RunIdentity { get; }
         internal DungeonRoomIdentity RoomIdentity { get; }
         internal long AttachmentGeneration { get; }
+        internal byte PartySlot { get; }
     }
 
     internal readonly struct DungeonParticipantEffectReservation
@@ -163,6 +222,19 @@ namespace DfoServer.Game.Dungeon
         {
             internal DungeonParticipantEffectState State;
             internal Guid LeaseId;
+            internal DungeonMonsterDropOutcome MonsterDropOutcome;
+            internal bool MonsterExperienceApplying;
+            internal bool MonsterExperienceApplied;
+            internal bool MonsterStatisticsApplied;
+            internal bool MonsterGrowthApplying;
+            internal bool MonsterGrowthApplied;
+        }
+
+        private sealed class DungeonMonsterDropOutcome
+        {
+            internal DungeonMonsterDropIdentity MonsterIdentity;
+            internal MonsterDropResult Result;
+            internal bool GoldApplied;
         }
 
         private sealed class EventEntry
@@ -283,11 +355,13 @@ namespace DfoServer.Game.Dungeon
                 }
 
                 var leaseId = Guid.NewGuid();
-                eventEntry.Effects[key] = new EffectEntry
+                if (existing == null)
                 {
-                    State = DungeonParticipantEffectState.InFlight,
-                    LeaseId = leaseId,
-                };
+                    existing = new EffectEntry();
+                    eventEntry.Effects.Add(key, existing);
+                }
+                existing.State = DungeonParticipantEffectState.InFlight;
+                existing.LeaseId = leaseId;
                 reservation = new DungeonParticipantEffectReservation(
                     sourceEventId,
                     audience,
@@ -295,6 +369,173 @@ namespace DfoServer.Game.Dungeon
                     effectKind,
                     leaseId);
                 state = DungeonParticipantEffectState.InFlight;
+                return true;
+            }
+        }
+
+        // A completed drop decision may outlive the network attempt which
+        // created it. Keep its immutable result, including an empty result, on
+        // the existing participant kill effect so Failed -> TryBegin recovery
+        // can replay the same decision without rerunning the guard or generator.
+        internal DungeonMonsterDropOutcomeResolution ResolveMonsterDropOutcome(
+            DungeonParticipantEffectReservation reservation,
+            DungeonMonsterDropIdentity monsterIdentity,
+            out MonsterDropResult result)
+        {
+            result = default;
+            lock (_syncRoot)
+            {
+                if (!monsterIdentity.IsValid
+                    || !TryGetEntry(reservation, out var entry))
+                {
+                    return DungeonMonsterDropOutcomeResolution.IdentityMismatch;
+                }
+                if (entry.MonsterDropOutcome == null)
+                    return DungeonMonsterDropOutcomeResolution.Absent;
+                if (!entry.MonsterDropOutcome.MonsterIdentity.Equals(
+                        monsterIdentity))
+                {
+                    return DungeonMonsterDropOutcomeResolution.IdentityMismatch;
+                }
+
+                result = CopyMonsterDropResult(
+                    entry.MonsterDropOutcome.Result);
+                return DungeonMonsterDropOutcomeResolution.Resolved;
+            }
+        }
+
+        internal bool TryFreezeMonsterDropOutcome(
+            DungeonParticipantEffectReservation reservation,
+            DungeonMonsterDropIdentity monsterIdentity,
+            MonsterDropResult result,
+            out MonsterDropResult frozen)
+        {
+            frozen = default;
+            if (!monsterIdentity.IsValid)
+                return false;
+
+            lock (_syncRoot)
+            {
+                if (!TryGetEntry(reservation, out var entry))
+                    return false;
+                if (entry.MonsterDropOutcome != null)
+                {
+                    if (!entry.MonsterDropOutcome.MonsterIdentity.Equals(
+                            monsterIdentity))
+                    {
+                        return false;
+                    }
+                    frozen = CopyMonsterDropResult(
+                        entry.MonsterDropOutcome.Result);
+                    return true;
+                }
+
+                frozen = CopyMonsterDropResult(result);
+                entry.MonsterDropOutcome = new DungeonMonsterDropOutcome
+                {
+                    MonsterIdentity = monsterIdentity,
+                    Result = CopyMonsterDropResult(frozen),
+                };
+                return true;
+            }
+        }
+
+        internal bool TryApplyMonsterDropGold(
+            DungeonParticipantEffectReservation reservation,
+            DungeonMonsterDropIdentity monsterIdentity,
+            Action<int> apply)
+        {
+            if (apply == null)
+                throw new ArgumentNullException(nameof(apply));
+
+            lock (_syncRoot)
+            {
+                if (!TryGetEntry(reservation, out var entry)
+                    || entry.MonsterDropOutcome == null
+                    || !entry.MonsterDropOutcome.MonsterIdentity.Equals(
+                        monsterIdentity))
+                {
+                    return false;
+                }
+                if (entry.MonsterDropOutcome.GoldApplied)
+                    return true;
+
+                // Mark only after the checked caller mutation succeeds. An
+                // overflow or other exception leaves the checkpoint retryable.
+                apply(entry.MonsterDropOutcome.Result.GoldAmount);
+                entry.MonsterDropOutcome.GoldApplied = true;
+                return true;
+            }
+        }
+
+        // 经验成功后，后续通知/任务处理失败不能使它再次可领取。
+        // 写库回调在 journal 锁外执行，阶段状态沿用同一个 participant effect。
+        internal bool TryApplyMonsterExperienceOnce(
+            DungeonParticipantEffectReservation reservation,
+            Func<ExperienceGrantResult> apply,
+            out ExperienceGrantResult result)
+        {
+            if (apply == null) throw new ArgumentNullException(nameof(apply));
+            result = null;
+            EffectEntry entry;
+            lock (_syncRoot)
+            {
+                if (!TryGetEntry(reservation, out entry)) return false;
+                if (entry.MonsterExperienceApplied) return true;
+                if (entry.MonsterExperienceApplying) return false;
+                entry.MonsterExperienceApplying = true;
+            }
+            try
+            {
+                result = apply() ?? throw new InvalidOperationException("Monster experience grant returned no result.");
+                lock (_syncRoot) entry.MonsterExperienceApplied = true;
+                return true;
+            }
+            finally
+            {
+                lock (_syncRoot) entry.MonsterExperienceApplying = false;
+            }
+        }
+
+        // 龙跃武器成长值：与经验一样对同一只怪只累积一次。
+        // 与经验不同，成长值要写库，所以回调在 journal 锁外执行，
+        // 阶段状态沿用同一个 participant effect。
+        internal bool TryApplyMonsterGrowthOnce(
+            DungeonParticipantEffectReservation reservation,
+            Action apply)
+        {
+            if (apply == null) throw new ArgumentNullException(nameof(apply));
+            EffectEntry entry;
+            lock (_syncRoot)
+            {
+                if (!TryGetEntry(reservation, out entry)) return false;
+                if (entry.MonsterGrowthApplied) return true;
+                if (entry.MonsterGrowthApplying) return false;
+                entry.MonsterGrowthApplying = true;
+            }
+            try
+            {
+                apply();
+                lock (_syncRoot) entry.MonsterGrowthApplied = true;
+                return true;
+            }
+            finally
+            {
+                lock (_syncRoot) entry.MonsterGrowthApplying = false;
+            }
+        }
+
+        // 此回调只更新 run 内存，不能写库或发包。
+        internal bool TryApplyMonsterStatisticsOnce(
+            DungeonParticipantEffectReservation reservation, Action apply)
+        {
+            if (apply == null) throw new ArgumentNullException(nameof(apply));
+            lock (_syncRoot)
+            {
+                if (!TryGetEntry(reservation, out var entry)) return false;
+                if (entry.MonsterStatisticsApplied) return true;
+                apply();
+                entry.MonsterStatisticsApplied = true;
                 return true;
             }
         }
@@ -448,6 +689,28 @@ namespace DfoServer.Game.Dungeon
                        out entry)
                 && entry.State == DungeonParticipantEffectState.InFlight
                 && entry.LeaseId == reservation.LeaseId;
+        }
+
+        private static MonsterDropResult CopyMonsterDropResult(
+            MonsterDropResult source)
+        {
+            var drops = new List<DropInfo>(source.Drops?.Count ?? 0);
+            if (source.Drops != null)
+            {
+                foreach (var sourceDrop in source.Drops)
+                {
+                    var copy = sourceDrop;
+                    if (sourceDrop.Core != null)
+                        copy.Core = sourceDrop.Core.Copy();
+                    drops.Add(copy);
+                }
+            }
+
+            return new MonsterDropResult
+            {
+                GoldAmount = source.GoldAmount,
+                Drops = drops,
+            };
         }
 
         private static IReadOnlyList<DungeonParticipantRosterEntry> NormalizeRoster(

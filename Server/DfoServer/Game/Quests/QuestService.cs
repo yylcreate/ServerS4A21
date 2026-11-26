@@ -149,7 +149,18 @@ namespace DfoServer.Game.Quests
             var characterId = owner.CharacterId;
             var questId = BitConverter.ToUInt16(body, 0);
             var triggerType = body[2];
-            var increment = body.Length >= 4 && body[3] != 0;
+            byte? questionAnswerIndex = null;
+            if (GameWorld.QuestData.IsQuestionQuest(questId))
+            {
+                // A21 question selection sends an answer index in this byte,
+                // not the increment flag used by ordinary trigger mutations.
+                if (body.Length < 4 || triggerType != 0
+                    || body[3] >= GameWorld.QuestData.GetQuestionAnswerCount(questId))
+                    return QuestSetTriggerResult.Fail(22);
+                questionAnswerIndex = body[3];
+            }
+            var increment = !questionAnswerIndex.HasValue
+                && body.Length >= 4 && body[3] != 0;
             if (GameWorld.QuestData.IsWorldMapHuntMonsterQuest(questId))
             {
                 try
@@ -203,6 +214,7 @@ namespace DfoServer.Game.Quests
                 QuestId = questId,
                 TriggerType = triggerType,
                 Increment = increment,
+                QuestionAnswerIndex = questionAnswerIndex,
                 EligibleQuestActivations =
                     new Dictionary<ushort, QuestActivationId>
                     {
@@ -403,6 +415,36 @@ namespace DfoServer.Game.Quests
         }
 
         internal IReadOnlyList<QuestSetTriggerResult>
+            SyncRaidPhaseClearQuestProgress(
+                int characterId,
+                int phaseIndex,
+                Guid sourceEventId)
+        {
+            if (characterId <= 0
+                || (phaseIndex != 0 && phaseIndex != 1)
+                || sourceEventId == Guid.Empty)
+            {
+                return Array.Empty<QuestSetTriggerResult>();
+            }
+
+            var applied = _progress.Apply(new QuestProgressApplicationRequest
+            {
+                CharacterId = characterId,
+                Operation = QuestProgressOperation.RaidPhaseClear,
+                RaidPhaseIndex = phaseIndex,
+                SourceEventId = sourceEventId,
+            });
+            if (!applied.Success)
+            {
+                throw new InvalidOperationException(
+                    $"raid phase quest progress failed: cid={characterId} " +
+                    $"phase={phaseIndex} event={sourceEventId:N} " +
+                    $"error={applied.Error}");
+            }
+            return applied.Changes;
+        }
+
+        internal IReadOnlyList<QuestSetTriggerResult>
             SyncHuntMonsterQuestProgress(
                 int characterId,
                 int dungeonId,
@@ -487,6 +529,79 @@ namespace DfoServer.Game.Quests
                 return Array.Empty<QuestSetTriggerResult>();
             }
             return applied.Changes;
+        }
+
+        internal IReadOnlyList<QuestSetTriggerResult>
+            SyncActorDeathQuestProgress(
+                int characterId,
+                int dungeonId,
+                int difficulty,
+                int actorCode,
+                byte actorType,
+                int enemyType,
+                Guid sourceEventId = default,
+                IReadOnlyCollection<ushort> eligibleQuestIds = null,
+                IReadOnlyDictionary<ushort, QuestActivationId>
+                    eligibleQuestActivations = null)
+        {
+            if (characterId <= 0
+                || dungeonId <= 0
+                || actorCode <= 0)
+            {
+                return Array.Empty<QuestSetTriggerResult>();
+            }
+
+            var requests = new List<QuestProgressApplicationRequest>(2);
+            if (actorType <= 3)
+            {
+                requests.Add(new QuestProgressApplicationRequest
+                {
+                    CharacterId = characterId,
+                    Operation = QuestProgressOperation.HuntMonster,
+                    SourceEventId = sourceEventId,
+                    DungeonId = dungeonId,
+                    Difficulty = difficulty,
+                    MonsterCode = actorCode,
+                    MonsterType = actorType,
+                    EligibleQuestIds = eligibleQuestIds,
+                    EligibleQuestActivations = eligibleQuestActivations,
+                });
+            }
+
+            if (GameWorld.QuestData.IsServerDrivenHuntEnemyActorType(enemyType))
+            {
+                requests.Add(new QuestProgressApplicationRequest
+                {
+                    CharacterId = characterId,
+                    Operation = QuestProgressOperation.HuntEnemy,
+                    SourceEventId = sourceEventId,
+                    DungeonId = dungeonId,
+                    Difficulty = difficulty,
+                    MonsterCode = actorCode,
+                    EnemyType = enemyType,
+                    EligibleQuestIds = eligibleQuestIds,
+                    EligibleQuestActivations = eligibleQuestActivations,
+                });
+            }
+
+            if (requests.Count == 0)
+                return Array.Empty<QuestSetTriggerResult>();
+
+            var applied = _progress.ApplyBatch(requests);
+            if (!applied.Success)
+            {
+                FileLogger.Log(
+                    $"[QuestService] ACTOR_DEATH progress failed: "
+                    + $"cid={characterId} dungeon={dungeonId} "
+                    + $"actor={actorCode}/{actorType}/{enemyType} "
+                    + $"event={sourceEventId:N} error={applied.Error}");
+                return Array.Empty<QuestSetTriggerResult>();
+            }
+
+            var changes = new List<QuestSetTriggerResult>();
+            foreach (var result in applied.Results)
+                changes.AddRange(result.Changes);
+            return changes;
         }
 
         internal static int SyncClearMapQuestProgressCore(

@@ -5,7 +5,9 @@ using DfoServer.Game.Characters;
 using DfoServer.Game.Dungeon;
 using DfoServer.Game.Friends;
 using DfoServer.Game.Inventory;
+using DfoServer.Game.Raid;
 using DfoServer.Game.Session;
+using DfoServer.Game.Skills;
 using DfoServer.GameWorld;
 using DfoServer.Infrastructure;
 using DfoServer.Network;
@@ -20,20 +22,31 @@ namespace DfoServer.Network.Handlers
 {
     public sealed class TownHandler
     {
+        private const string PartyTeleportMemberLockedMessage =
+            "存在无法前往该地区的队员。";
+        private const string PartyTeleportRemoteMemberMessage =
+            "存在与队长不在同一房间的队员。";
+
         private static readonly TimeSpan PositionPersistThrottle = TimeSpan.FromSeconds(5);
 
         private readonly struct TownProjectionGuard
         {
             private TownProjectionGuard(
                 DungeonRunIdentity endedRun,
-                DungeonSelectionContext selection)
+                DungeonSelectionContext selection,
+                Func<bool> raidReturnCurrent = null)
             {
                 EndedRun = endedRun;
                 Selection = selection;
+                RaidReturnCurrent = raidReturnCurrent;
             }
 
             internal DungeonRunIdentity EndedRun { get; }
             internal DungeonSelectionContext Selection { get; }
+            internal Func<bool> RaidReturnCurrent { get; }
+
+            internal static TownProjectionGuard ForRaidReturn(Func<bool> current) =>
+                new TownProjectionGuard(default(DungeonRunIdentity), null, current);
 
             internal static TownProjectionGuard ForEndedRun(
                 DungeonRunIdentity identity) =>
@@ -49,6 +62,7 @@ namespace DfoServer.Network.Handlers
         private readonly GrowthCapsuleSyncService _growthCapsule;
         private readonly SqliteSubtype0FieldsRepository _subtype0Repository;
         private readonly Game.SelectCharacter.SqliteSelectCharacterDataSource _selectDataSource;
+        private readonly SqlitePvpSkillRepository _pvpSkillRepository;
         private readonly Game.Party.PartyManager _partyManager;   // 可空: 副本退出/回城时把队员一起拉回城(跟随退出)
         // 可空: 会话目录(charId→session)。同屏区域查询与队员定位共用这一份注册表, 不另设区域广播器。
         private readonly Game.Session.ISessionDirectory _sessions;
@@ -58,6 +72,7 @@ namespace DfoServer.Network.Handlers
         private Func<EnhancedClientSession, ushort, Guid, int, Task>
             _dungeonGiveupPartyDeparture;
         private Func<Task> _publishTownPartyLists;
+        private Func<EnhancedClientSession, byte, byte, Task> _raidTownAreaChanged;
 
         private readonly InventoryRefreshSender _refresh;
 
@@ -102,6 +117,7 @@ namespace DfoServer.Network.Handlers
             _subtype0Repository = new SqliteSubtype0FieldsRepository(_database);
             _refresh = refresh;
             _selectDataSource = selectDataSource;  // 可空: PVP 房间仍需构建完整 USERINFO subtype1。
+            _pvpSkillRepository = new SqlitePvpSkillRepository(_database);
             _partyManager = partyManager;          // 可空: 组队副本收尾 fan-out(跟随退出); 与副本共享同一 PartyManager
             _sessions = sessions;                  // 可空: 未注入时退化为单人(不广播)
             _dungeonInstances = dungeonInstances;
@@ -119,9 +135,15 @@ namespace DfoServer.Network.Handlers
             _publishTownPartyLists = publisher;
         }
 
-        // 构建某在线会话玩家的【完整 USERINFO subtype1】(0x0002 occ1, ~1458B: 属性/装备/技能)。
+        internal void ConfigureRaidTownAreaChanged(
+            Func<EnhancedClientSession, byte, byte, Task> handler)
+        {
+            _raidTownAreaChanged = handler;
+        }
+
+        // 构建某在线会话玩家的完整 USERINFO subtype1（属性/装备/当前频道技能）。
         // 同屏时仅推 subtype0(精简外观)客户端能渲染但判定"对方不在城镇/不可邀请"; self 进游戏收的是 subtype0+subtype1
-        // 两份, 故给同屏他人补 subtype1。id 头(bytes 3-4)由 CharacterId 改写为 UserId 以对齐城镇名册。
+        // 两份, 故给同屏他人补 subtype1。A21 单条记录的 UID 位于 body +18。
         internal byte[] BuildFullUserInfoPacket(EnhancedClientSession s)
         {
             if (_selectDataSource == null || s?.Player == null || s.Player.CharacterId <= 0)
@@ -131,9 +153,16 @@ namespace DfoServer.Network.Handlers
                 var snap = _selectDataSource.Load(s.Player.CharacterId, s.Account?.AccountId ?? 1);
                 if (snap?.CharacterRecord == null || snap.InitializationSnapshot?.UserInfoAddition == null)
                     return null;
-                if (!new Network.Builders.UserInfoBodyBuilder().TryBuild(snap, 1, out var fullBody) || fullBody == null || fullBody.Length < 5)
+                if (GameNetworkConfig.IsPvpListener(s.ListenerPort))
+                {
+                    snap.InitializationSnapshot.SkillInfo = SkillStateService.LoadPvpAndSync(
+                        _pvpSkillRepository, snap.CharacterRecord, s.Player.Level).Skills;
+                }
+                if (s.Player.Subtype0Tail != null)
+                    snap.InitializationSnapshot.UserInfoAddition.SkillTreeIndex = s.Player.Subtype0Tail.SkillTreeIndex;
+                if (!new Network.Builders.UserInfoBodyBuilder().TryBuild(snap, 1, out var fullBody) || fullBody == null || fullBody.Length < 20)
                     return null;
-                BitConverter.GetBytes(s.Player.UserId).CopyTo(fullBody, 3);
+                BitConverter.GetBytes(s.Player.UserId).CopyTo(fullBody, 18);
                 return GamePacketEnvelopeBuilder.Build(0x00, 0x0002, fullBody);
             }
             catch (Exception ex)
@@ -150,7 +179,8 @@ namespace DfoServer.Network.Handlers
                 if (session?.Player == null || session.Player.CharacterId <= 0)
                     return;
                 if (!GameChannelSpawnPolicy.ShouldPersistPosition(
-                        session.ListenerPort))
+                        session.ListenerPort,
+                        session.Player.CurTownId))
                     return;
 
                 var now = DateTime.UtcNow;
@@ -291,7 +321,7 @@ namespace DfoServer.Network.Handlers
                     $"cid={session.Player.CharacterId} listener={session.ListenerPort} " +
                     $"current={session.Player.CurTownId}:{session.Player.CurAreaId} " +
                     $"target={gotoTownId}:{gotoAreaId}");
-                await ChannelTownRestrictionSender.SendAsync(session);
+                await ChannelTownRestrictionSender.SendAsync(session, gotoTownId);
                 return;
             }
 
@@ -343,7 +373,20 @@ namespace DfoServer.Network.Handlers
             await BroadcastAreaRosterAsync(
                 session,
                 selfSnapshot,
-                projectionGuard);
+                projectionGuard,
+                async () =>
+                {
+                    if (CanContinueTownProjection(session, projectionGuard)
+                        && ShouldNotifyRaidTownLoaded(session.ListenerPort, session.Player))
+                    {
+                        await session.SendPacketAsync(BuildRaidUserFinishLoadPacket());
+                        if (CanContinueTownProjection(session, projectionGuard)
+                            && _raidTownAreaChanged != null)
+                        {
+                            await _raidTownAreaChanged(session, previousTownId, previousAreaId);
+                        }
+                    }
+                });
             if (!CanContinueTownProjection(session, projectionGuard))
                 return;
 
@@ -394,10 +437,29 @@ namespace DfoServer.Network.Handlers
         /// 已在场他人：只发到达者 USERINFO0 + USER_AREA，不得发 0x18。
         /// _sessions 为空(单人/未注入)时退化为只发自己 —— 与既有单机行为等价。
         /// </summary>
+        internal async Task<bool> AnnouncePvpTownArrivalWithinTransitionAsync(
+            EnhancedClientSession session)
+        {
+            bool IsCurrentArrival() =>
+                session?.Player != null
+                && GameNetworkConfig.IsPvpListener(session.ListenerPort)
+                && IsTownArrivalStateEligible(session.Player)
+                && _sessions != null
+                && _sessions.TryGet(session.Player.CharacterId, out var current)
+                && ReferenceEquals(current, session);
+
+            if (!IsCurrentArrival())
+                return false;
+            await BroadcastAreaRosterAsync(
+                session, TownAreaNotificationBuilder.CreateCurrentSnapshot(session.Player));
+            return IsCurrentArrival();
+        }
+
         private async Task BroadcastAreaRosterAsync(
             EnhancedClientSession session,
             TownUserSnapshot selfSnapshot,
-            TownProjectionGuard projectionGuard = default(TownProjectionGuard))
+            TownProjectionGuard projectionGuard = default(TownProjectionGuard),
+            Func<Task> onRecipientReady = null)
         {
             if (!CanContinueTownProjection(session, projectionGuard))
                 return;
@@ -451,6 +513,12 @@ namespace DfoServer.Network.Handlers
                         TownAreaNotificationBuilder.CreateCurrentSnapshot(o.Player)));
                 if (!CanContinueTownProjection(session, projectionGuard))
                     return;
+            }
+
+            if (onRecipientReady != null
+                && CanContinueTownProjection(session, projectionGuard))
+            {
+                await onRecipientReady();
             }
 
             var selfArea = BuildCoPresenceInsert(selfSnapshot);
@@ -604,7 +672,7 @@ namespace DfoServer.Network.Handlers
                     $"current={session.Player.CurTownId}:{session.Player.CurAreaId} " +
                     $"targetTown={request.TargetTownId} " +
                     $"item=0x{request.ItemTemplateId:X8}");
-                await ChannelTownRestrictionSender.SendAsync(session);
+                await ChannelTownRestrictionSender.SendAsync(session, targetTownId);
                 return;
             }
 
@@ -630,8 +698,12 @@ namespace DfoServer.Network.Handlers
                 return;
             }
 
+            var player = session.Player;
+            var previousTownId = player.CurTownId;
+            var previousAreaId = player.CurAreaId;
             var persistPosition = GameChannelSpawnPolicy.ShouldPersistPosition(
-                session.ListenerPort);
+                session.ListenerPort,
+                ceraRoomInfo.Town);
             if (!TeleportConsumableCommitService.TryCommit(
                     lease,
                     request.ItemTemplateId,
@@ -660,6 +732,23 @@ namespace DfoServer.Network.Handlers
             if (persistPosition)
                 session.Player.LastPositionPersistAt = DateTime.UtcNow;
 
+            // A later SET_USER_AREA can no longer recover the source area after
+            // this commit. Reuse normal town departure; USER_LEAVE clears party slots.
+            var selfSnapshot = TownAreaNotificationBuilder.CreateCurrentSnapshot(
+                session.Player);
+            if (_sessions != null)
+            {
+                await _sessions.BroadcastToAreaAsync(
+                    previousTownId,
+                    previousAreaId,
+                    cid,
+                    BuildAreaTransitionDeparturePacket(selfSnapshot),
+                    session.ListenerPort);
+                if (!ReferenceEquals(session.Player, player)
+                    || !InventoryContext.IsCurrentLease(lease, session.SessionId, cid))
+                    return;
+            }
+
             FileLogger.Log(
                 $"[{ProtocolName}] TELEPORT: consumed item=" +
                 $"0x{request.ItemTemplateId:X8} slot={consumeResult.SlotIndex} " +
@@ -674,8 +763,6 @@ namespace DfoServer.Network.Handlers
                     session,
                     InventoryListType.Main,
                     consumeResult.SlotIndex);
-            var selfSnapshot = TownAreaNotificationBuilder.CreateCurrentSnapshot(
-                session.Player);
             await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(
                 0x00,
                 0x0017,
@@ -716,7 +803,7 @@ namespace DfoServer.Network.Handlers
                     $"cid={session?.Player?.CharacterId ?? 0} " +
                     $"listener={session?.ListenerPort ?? 0} " +
                     $"target={request.TownId}:{request.AreaId}");
-                await ChannelTownRestrictionSender.SendAsync(session);
+                await ChannelTownRestrictionSender.SendAsync(session, request.TownId);
                 return;
             }
 
@@ -748,7 +835,7 @@ namespace DfoServer.Network.Handlers
 
             var areaBody = new byte[6];
             Buffer.BlockCopy(body, 0, areaBody, 0, areaBody.Length);
-            var moved = 0;
+            var eligible = new List<EnhancedClientSession>();
             foreach (var member in snapshot.MembersBySlot())
             {
                 EnhancedClientSession memberSession;
@@ -776,6 +863,65 @@ namespace DfoServer.Network.Handlers
                     continue;
                 }
 
+                eligible.Add(memberSession);
+            }
+
+            // 全有或全无: 任一可传送队员与队长不在同一房间则整队不传送。
+            // 此时队长尚未移动, CurTownId/CurAreaId 即发起时的房间。
+            foreach (var memberSession in eligible)
+            {
+                if (IsPartyTeleportSameRoom(
+                        session.Player,
+                        memberSession.Player))
+                {
+                    continue;
+                }
+
+                FileLogger.Log(
+                    $"[{ProtocolName}] PARTY_TELEPORT blocked by remote member: " +
+                    $"leaderCid={session.Player.CharacterId} " +
+                    $"memberCid={memberSession.Player.CharacterId} " +
+                    $"leader={session.Player.CurTownId}:{session.Player.CurAreaId} " +
+                    $"member={memberSession.Player.CurTownId}:{memberSession.Player.CurAreaId}");
+                await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(
+                    0x00,
+                    (ushort)NotiPacketType.SERVER_NOTICE_MESSAGE,
+                    ServerNoticeMessageBuilder.Build(
+                        PartyTeleportRemoteMemberMessage)));
+                return;
+            }
+
+            // 全有或全无: 任一队员未解锁目标区域(等级/任务门槛)则整队不传送。
+            // 客户端对未解锁区域的房间出口有本地门禁, 把未解锁队员带进去会
+            // 困在房间里; 逐人跳过又会静默拆散队伍。
+            foreach (var memberSession in eligible)
+            {
+                if (MeetsTownAreaPermission(
+                        memberSession,
+                        request.TownId,
+                        request.AreaId,
+                        out var permissionReason))
+                {
+                    continue;
+                }
+
+                FileLogger.Log(
+                    $"[{ProtocolName}] PARTY_TELEPORT blocked by locked member: " +
+                    $"leaderCid={session.Player.CharacterId} " +
+                    $"memberCid={memberSession.Player.CharacterId} " +
+                    $"target={request.TownId}:{request.AreaId} " +
+                    $"reason={permissionReason}");
+                await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(
+                    0x00,
+                    (ushort)NotiPacketType.SERVER_NOTICE_MESSAGE,
+                    ServerNoticeMessageBuilder.Build(
+                        PartyTeleportMemberLockedMessage)));
+                return;
+            }
+
+            var moved = 0;
+            foreach (var memberSession in eligible)
+            {
                 await SetUserAreaCoreAsync(
                     memberSession,
                     areaBody,
@@ -790,6 +936,96 @@ namespace DfoServer.Network.Handlers
                 $"target={request.TownId}:{request.AreaId} " +
                 $"pos=({request.X},{request.Y}) direction={request.Direction} " +
                 $"moved={moved}/{snapshot.Count}");
+        }
+
+        private bool MeetsTownAreaPermission(
+            EnhancedClientSession memberSession,
+            int townId,
+            int areaId,
+            out string reason)
+        {
+            reason = null;
+            if (!GameWorld.Town.TryGetAreaPermission(
+                    townId,
+                    areaId,
+                    out var permission))
+            {
+                return true;
+            }
+
+            var cid = memberSession.Player.CharacterId;
+            reason = GameWorld.TownAreaPermissionPolicy.GetDenyReason(
+                permission,
+                memberSession.Player.Level,
+                questId => _database != null
+                    && new Game.Quests.QuestRepository(_database.ConnectionString)
+                        .LoadClearedFlags(cid)
+                        .ContainsKey(questId));
+            return reason == null;
+        }
+
+        // 组队传送同房间判定: 队员当前 town/area 必须与队长完全一致。
+        internal static bool IsPartyTeleportSameRoom(
+            PlayerContext leader,
+            PlayerContext member)
+            => leader != null
+               && member != null
+               && leader.CurTownId == member.CurTownId
+               && leader.CurAreaId == member.CurAreaId;
+
+        public async Task Handle_ENUM_CMDPACKET_SOLO_TELEPOART(
+            EnhancedClientSession session,
+            GamePacketHeader header,
+            byte[] body)
+        {
+            if (!SoloTeleportRequest.TryParse(body, out var request))
+            {
+                FileLogger.Log(
+                    $"[{ProtocolName}] SOLO_TELEPOART rejected invalid body: " +
+                    $"cid={session?.Player?.CharacterId ?? 0} " +
+                    $"length={body?.Length ?? 0}");
+                return;
+            }
+
+            if (!GameChannelTeleportPolicy.CanUsePartyTeleport(
+                    session.ListenerPort)
+                || !GameChannelSpawnPolicy.CanEnterTown(
+                    session.ListenerPort,
+                    request.TownId))
+            {
+                FileLogger.Log(
+                    $"[{ProtocolName}] SOLO_TELEPOART rejected by channel policy: " +
+                    $"cid={session?.Player?.CharacterId ?? 0} " +
+                    $"listener={session?.ListenerPort ?? 0} " +
+                    $"target={request.TownId}:{request.AreaId}");
+                await ChannelTownRestrictionSender.SendAsync(session, request.TownId);
+                return;
+            }
+
+            if (session?.Player == null
+                || session.Player.CurrentRun != null)
+            {
+                FileLogger.Log(
+                    $"[{ProtocolName}] SOLO_TELEPOART rejected unavailable state: " +
+                    $"cid={session?.Player?.CharacterId ?? 0}");
+                return;
+            }
+
+            var areaBody = new byte[6];
+            areaBody[0] = request.TownId;
+            areaBody[1] = request.AreaId;
+            BitConverter.TryWriteBytes(areaBody.AsSpan(2), request.X);
+            BitConverter.TryWriteBytes(areaBody.AsSpan(4), request.Y);
+            await SetUserAreaCoreAsync(
+                session,
+                areaBody,
+                default(TownProjectionGuard));
+
+            FileLogger.Log(
+                $"[{ProtocolName}] SOLO_TELEPOART: " +
+                $"cid={session.Player.CharacterId} " +
+                $"target={request.TownId}:{request.AreaId} " +
+                $"pos=({request.X},{request.Y}) direction={request.Direction}");
         }
 
         public async Task Handle_ENUM_CMDPACKET_GIVEUP_GAME(EnhancedClientSession session, GamePacketHeader header, byte[] body)
@@ -814,10 +1050,13 @@ namespace DfoServer.Network.Handlers
                     }
                     else if (selection == null || !selection.TryBeginReturn())
                     {
-                        FileLogger.Log(
-                            $"[{ProtocolName}] RETURN_TO_TOWN rejected without run: " +
-                            $"type=0x{header.type:X4} cid={session?.Player?.CharacterId ?? 0} " +
-                            $"selection={(selection?.SelectionId ?? 0)}");
+                        if (!await TryFinishRaidTownReturnAsync(session, header.type))
+                        {
+                            FileLogger.Log(
+                                $"[{ProtocolName}] RETURN_TO_TOWN rejected without run: " +
+                                $"type=0x{header.type:X4} cid={session?.Player?.CharacterId ?? 0} " +
+                                $"selection={(selection?.SelectionId ?? 0)}");
+                        }
                         return;
                     }
                     else
@@ -1465,6 +1704,9 @@ namespace DfoServer.Network.Handlers
             EnhancedClientSession session,
             TownProjectionGuard projectionGuard)
         {
+            if (projectionGuard.RaidReturnCurrent != null)
+                return projectionGuard.RaidReturnCurrent();
+
             if (projectionGuard.Selection != null)
             {
                 return projectionGuard.Selection.IsReturning
@@ -1491,5 +1733,92 @@ namespace DfoServer.Network.Handlers
                && player.CharacterId > 0
                && player.CurrentRun == null
                && player.UserState == 0x00;
+
+        internal static bool ShouldNotifyRaidTownLoaded(
+            int listenerPort,
+            PlayerContext player)
+            => GameNetworkConfig.IsRaidListener(listenerPort)
+               && IsTownArrivalStateEligible(player)
+               && !player.DungeonSelectionPending
+               && player.CurTownId == GameChannelSpawnPolicy.RaidTownId;
+
+        internal static byte[] BuildRaidUserFinishLoadPacket()
+            => GamePacketEnvelopeBuilder.Build(
+                0x00,
+                (ushort)NotiPacketTypeA21.RAID_USER_FINISH_LOAD,
+                Array.Empty<byte>());
+
+        internal static bool IsCompletedRaidTownReturn(
+            int listenerPort,
+            PlayerContext player,
+            Guid sessionId,
+            RaidSnapshot raid)
+        {
+            if (!ShouldNotifyRaidTownLoaded(listenerPort, player)
+                || player.CurrentDungeonSelection != null
+                || player.DungeonSelectionPending
+                || raid == null
+                || raid.PhaseIndex != 0
+                || raid.State != 5)
+            {
+                return false;
+            }
+
+            foreach (var member in raid.Members)
+            {
+                if (member.UserId == player.UserId
+                    && member.CharacterId == player.CharacterId
+                    && member.SessionId == sessionId)
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        private async Task<bool> TryFinishRaidTownReturnAsync(
+            EnhancedClientSession session,
+            ushort packetType)
+        {
+            if (packetType != (ushort)CmdPacketTypeA21.GIVEUP_GAME
+                || _raidManager == null
+                || session?.Player == null
+                || !_raidManager.TryGetCompletedTownReturn(
+                    session.Player.UserId, session.SessionId, out var raid)
+                || !IsCompletedRaidTownReturn(
+                    session.ListenerPort, session.Player, session.SessionId, raid))
+            {
+                return false;
+            }
+
+            var player = session.Player;
+            var generation = player.CurrentDungeonRunGeneration;
+            var guard = TownProjectionGuard.ForRaidReturn(Current);
+            if (!Current())
+                return true;
+            await session.SendPacketAsync(BuildReturnToTownSuccessPacket(packetType));
+            if (!Current())
+                return true;
+            await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(
+                0x00,
+                (ushort)NotiPacketTypeA21.USER_STATE,
+                EnterSelectDungeonStateBuilder.BuildUserState(player)));
+            if (!Current())
+                return true;
+            await SetUserAreaCoreAsync(session, BuildTownAreaProjectionBody(player), guard);
+            if (!Current())
+                return true;
+            await RefreshPartyProjectionAfterTownReturnAsync(session, guard);
+            return true;
+
+            bool Current()
+                => ReferenceEquals(player, session.Player)
+                   && generation == player.CurrentDungeonRunGeneration
+                   && _raidManager.TryGetCompletedTownReturn(
+                       player.UserId, session.SessionId, out var currentRaid)
+                   && currentRaid.InstanceId == raid.InstanceId
+                   && IsCompletedRaidTownReturn(
+                       session.ListenerPort, player, session.SessionId, currentRaid);
+        }
     }
 }

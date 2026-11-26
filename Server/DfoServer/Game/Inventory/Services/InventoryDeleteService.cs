@@ -178,6 +178,81 @@ namespace DfoServer.Game.Inventory
             return remaining == 0;
         }
 
+        internal static bool TryDeleteMainItemsByTemplateIdForClient(
+            InventoryService inventory,
+            int itemId,
+            int count,
+            out InventoryMutationSet changes)
+        {
+            changes = new InventoryMutationSet();
+            if (inventory == null || itemId <= 0 || count <= 0)
+                return false;
+
+            var availableTotal = 0;
+            foreach (var pair in inventory.GetItems(InventoryListType.Main))
+            {
+                var item = pair.Value;
+                if (item == null
+                    || item.ItemId != itemId
+                    || !CanDeleteForClient(
+                        inventory,
+                        InventoryListType.Main,
+                        pair.Key,
+                        1))
+                {
+                    continue;
+                }
+
+                availableTotal += InventoryStackRuleService.IsStackable(item)
+                    ? Math.Max(0, item.Count)
+                    : 1;
+                if (availableTotal >= count)
+                    break;
+            }
+            if (availableTotal < count)
+                return false;
+
+            var remaining = count;
+            foreach (var pair in inventory.GetItems(InventoryListType.Main))
+            {
+                if (remaining <= 0)
+                    break;
+
+                var item = pair.Value;
+                if (item == null
+                    || item.ItemId != itemId
+                    || !CanDeleteForClient(
+                        inventory,
+                        InventoryListType.Main,
+                        pair.Key,
+                        1))
+                {
+                    continue;
+                }
+
+                var available = InventoryStackRuleService.IsStackable(item)
+                    ? Math.Max(0, item.Count)
+                    : 1;
+                var deleteCount = Math.Min(remaining, available);
+                if (deleteCount <= 0
+                    || !TryDecreaseStack(
+                        inventory,
+                        InventoryListType.Main,
+                        pair.Key,
+                        deleteCount,
+                        out var deleted)
+                    || !deleted.Success)
+                {
+                    return false;
+                }
+
+                changes.AddRange(deleted.Changes);
+                remaining -= deleted.DeletedCount;
+            }
+
+            return remaining == 0;
+        }
+
         internal static bool TryDeleteForClient(
             InventoryService inventory,
             InventoryListType listType,
@@ -195,6 +270,19 @@ namespace DfoServer.Game.Inventory
             int expectedItemId,
             out InventoryMutationResult mutation)
         {
+            mutation = null;
+            if (!CanUseStackableForClient(inventory, listType, slotIndex, expectedItemId, out var itemId))
+                return false;
+
+            // PVF [unlimited waste] applies its action without spending a source.
+            // Explicit discard and material consumption still use the delete paths.
+            if (StackableItemProvider.RetainsSourceOnUse(itemId))
+            {
+                var source = inventory.GetItem(listType, slotIndex);
+                mutation = CreateMutation(listType, slotIndex, source, 1,
+                    new InventoryDeleteResult { Success = true, RemainingCount = source.Count });
+                return true;
+            }
             return TryDeleteForClient(inventory, listType, slotIndex, 1, expectedItemId, out mutation);
         }
 
@@ -421,7 +509,7 @@ namespace DfoServer.Game.Inventory
             if (source.ItemKind == ItemCore.KindAvatar && source.AvatarUid > 0)
                 inventory.AvatarDetails.RemoveDirty(source.AvatarUid);
             else if (source.ItemKind == ItemCore.KindCreature && source.CreatureUid > 0)
-                inventory.CreatureDetails.Remove(source.CreatureUid);
+                inventory.CreatureDetails.RemoveDirty(source.CreatureUid);
         }
 
         private static InventoryDeleteResult CreateResult()

@@ -51,12 +51,14 @@ namespace DfoServer.Network.Handlers.Dungeon
         internal Game.Party.PartyManager PartyManager { get; }
         internal Game.Raid.RaidManager RaidManager { get; }
         internal Game.Session.ISessionDirectory Sessions { get; }
+        internal PartyPacketSender PartyPackets { get; }
         internal CardRewardCoordinator CardRewards { get; }
         internal Game.Dungeon.DropService Drops { get; }
         internal Game.Premium.DevilContractUsagePolicy DevilContracts { get; }
         internal Game.Dungeon.DungeonEntryAdmissionApplicationService
             EntryAdmission { get; }
         internal Game.Dungeon.DungeonEntryLimitService EntryLimits { get; }
+        internal Game.Guilds.GuildDungeonService GuildDungeons { get; }
         internal DungeonAdmissionRejectSender AdmissionRejects { get; }
         internal DungeonProgressNotificationProjector ProgressNotifications { get; }
         internal DungeonTownReturnCoordinator TownReturn { get; }
@@ -69,6 +71,12 @@ namespace DfoServer.Network.Handlers.Dungeon
         internal Game.Dungeon.BloodAltar.BloodAltarRewardPlanningService
             BloodAltarRewardPlanner { get; }
         internal Game.Dungeon.LicensedDungeonService LicensedDungeons { get; }
+        internal Game.Dungeon.SequentialDungeonDailyLootGuard
+            SequentialLoot { get; }
+        internal Game.Dungeon.AntonAwakeningDailyCardService AntonCardService { get; }
+        internal Game.Dungeon.AntonAwakeningDailyProgressService
+            AntonAwakeningProgress { get; }
+        internal AntonAwakeningRewardCoordinator AntonRewards { get; }
 
         internal DungeonSharedServices(
             Game.ReviveCoin.ReviveCoinService reviveCoin,
@@ -88,19 +96,27 @@ namespace DfoServer.Network.Handlers.Dungeon
             Game.Dungeon.DungeonPersistentEffectApplicationService persistentEffects = null,
             Game.Dungeon.DungeonInstanceRegistry instanceRegistry = null,
             Game.Raid.RaidManager raidManager = null,
-            IGameDatabase database = null)
+            IGameDatabase database = null,
+            Game.DailyReset.DailyResetService dailyResetService = null,
+            Game.Dungeon.AntonAwakeningDailyProgressService
+                antonAwakeningProgress = null,
+            IInventoryOverflowRewardSink overflowRewardSink = null)
         {
             ReviveCoin = reviveCoin
                 ?? throw new ArgumentNullException(nameof(reviveCoin));
             CharacterRepository = characterRepository
                 ?? throw new ArgumentNullException(nameof(characterRepository));
             Database = database ?? GameDatabase.CreateDefault();
+            GuildDungeons = new Game.Guilds.GuildDungeonService(Database);
+            var dailyReset = dailyResetService
+                ?? new Game.DailyReset.DailyResetService(Database);
             ConnectionString = !string.IsNullOrWhiteSpace(connectionString)
                 ? connectionString
                 : Database.ConnectionString;
             PartyManager = partyManager;
             RaidManager = raidManager;
             Sessions = sessions;
+            PartyPackets = new PartyPacketSender(Sessions);
             SelectCharacterDataSource = selectCharacterDataSource
                 ?? throw new ArgumentNullException(nameof(selectCharacterDataSource));
             InventoryRefresh = inventoryRefresh;
@@ -118,7 +134,7 @@ namespace DfoServer.Network.Handlers.Dungeon
                 database: Database);
             DailyChallenges = new Game.Quests.DailyChallengeService(
                 ConnectionString,
-                new Game.DailyReset.DailyResetService(Database));
+                dailyReset);
             DevilContracts = new Game.Premium.DevilContractUsagePolicy(
                 Database);
             RecommendDungeonClears = recommendDungeonClears
@@ -184,9 +200,27 @@ namespace DfoServer.Network.Handlers.Dungeon
                 new Game.Dungeon.BloodAltar
                     .BloodAltarRewardPlanningService();
             LicensedDungeons = new Game.Dungeon.LicensedDungeonService(Database);
+            SequentialLoot = new Game.Dungeon.SequentialDungeonDailyLootGuard(
+                dailyReset);
+            AntonCardService = new Game.Dungeon.AntonAwakeningDailyCardService(
+                dailyReset);
+            AntonAwakeningProgress = antonAwakeningProgress
+                ?? new Game.Dungeon.AntonAwakeningDailyProgressService(
+                    new Game.Dungeon.AntonAwakeningDailyProgressRepository(
+                        Database,
+                        dailyReset));
+            AntonRewards = new AntonAwakeningRewardCoordinator(
+                AntonCardService,
+                new Game.Dungeon.AntonAwakeningRewardGrantService(
+                    AntonCardService,
+                    overflowRewardSink),
+                Sessions,
+                InventoryRefresh,
+                new AntonNormalConquestNotificationSender(PartyPackets));
 
             PersistentMechanisms = new DungeonPersistentMechanismCoordinator(
-                CharacterStateRepository);
+                CharacterStateRepository,
+                AntonAwakeningProgress);
             DeathTower = new DeathTowerCoordinator(
                 ConnectionString,
                 sendExpGrantNotification: (session, settlement) =>
@@ -209,7 +243,8 @@ namespace DfoServer.Network.Handlers.Dungeon
             CardRewards = new CardRewardCoordinator(
                 new Game.Dungeon.CardRewardService(PersistentEffects),
                 sessions: Sessions,
-                database: Database);
+                database: Database,
+                antonRewards: AntonRewards);
             AdmissionRejects = new DungeonAdmissionRejectSender();
         }
     }

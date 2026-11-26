@@ -610,9 +610,9 @@ namespace DfoServer.Network.Handlers.Dungeon
                                         settlement.ChampionTotalExp),
                                     superChampionExp: ToInt32Saturated(
                                         settlement.SuperChampionTotalExp),
-                                    freeCardGold: settlement.FreeGold.GoldAmount,
-                                    freeCardItemId: settlement.FreeItem.ItemId,
-                                    freeCardItemCount: settlement.FreeItem.StackCount,
+                                    freeCardSeats: BuildClearRewardFreeCardSeats(
+                                        run,
+                                        settlement),
                                     paidCardCost: settlement.PaidCardCost,
                                     objectExperienceEntries:
                                         settlement.ObjectExperienceEntries)))))
@@ -810,6 +810,59 @@ namespace DfoServer.Network.Handlers.Dungeon
             }
         }
 
+        // 0x0023 carries the whole party's free cards: each participant's
+        // frozen (gold, item) is projected into the seat matching that
+        // member's entry party slot, so every client renders teammates'
+        // clear cards, not only its own. A participant whose settlement
+        // runtime is not ready yet (clear commit still in flight or the
+        // member disconnected) keeps the empty seat placeholder instead of
+        // blocking the projection.
+        internal static IReadOnlyList<ClearRewardFreeCardSeat>
+            BuildClearRewardFreeCardSeats(
+                DungeonRun run,
+                DungeonSettlementRuntime ownSettlement,
+                IReadOnlyList<DungeonParticipantRosterEntry> roster = null)
+        {
+            var seats = new ClearRewardFreeCardSeat[
+                DungeonNotificationBuilder.CardSeatCount];
+            if (run == null || ownSettlement == null)
+                return seats;
+
+            var ownSlot = run.EntryPartySlotIndex;
+            if (ownSlot >= seats.Length)
+                ownSlot = 0;
+            seats[ownSlot] = new ClearRewardFreeCardSeat(
+                ownSettlement.FreeGold.GoldAmount,
+                ownSettlement.FreeItem.ItemId,
+                ownSettlement.FreeItem.StackCount);
+
+            if (roster == null)
+                roster = CardRewardCoordinator.CaptureCardRewardRoster(run);
+            if (roster.Count == 0)
+                return seats;
+            foreach (var participant in roster)
+            {
+                var peerRun = participant?.Run;
+                if (peerRun == null || ReferenceEquals(peerRun, run))
+                    continue;
+                var partySlot = peerRun.EntryPartySlotIndex;
+                if (partySlot >= seats.Length || partySlot == ownSlot)
+                    continue;
+                DungeonSettlementRuntime peerSettlement;
+                lock (peerRun.SyncRoot)
+                {
+                    peerSettlement = peerRun.SettlementRuntime;
+                }
+                if (peerSettlement == null)
+                    continue;
+                seats[partySlot] = new ClearRewardFreeCardSeat(
+                    peerSettlement.FreeGold.GoldAmount,
+                    peerSettlement.FreeItem.ItemId,
+                    peerSettlement.FreeItem.StackCount);
+            }
+            return seats;
+        }
+
         private async Task<bool> PrepareSettlementFromClearAsync(
             EnhancedClientSession session,
             DungeonRun run,
@@ -992,6 +1045,24 @@ namespace DfoServer.Network.Handlers.Dungeon
                         "persistent-dungeon-mechanisms",
                         async () => await _svc.PersistentMechanisms
                             .ApplyDungeonClearAsync(session, run)))
+                {
+                    run.Effects.TryFail(authoritativeReservation);
+                    return false;
+                }
+
+                if (run.Selection.GuildDungeon != null
+                    && !await ExecuteSettlementEffectAsync(session, run, identity, "guild-dungeon-clear", async () =>
+                    {
+                        var result = _svc.GuildDungeons.ApplyClear(session.Player.CharacterId, run);
+                        await session.SendPacketAsync(Builders.Guilds.GuildDungeonPacketBuilder.Build(
+                            _svc.GuildDungeons.Read(session.Player.CharacterId)));
+                        if (result.MailId > 0)
+                            await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(0,
+                                (ushort)NotiPacketTypeA21.MAILBOX_ALARM,
+                                MailboxHandler.BuildMailboxAlarmNotification(1)));
+                        FileLogger.Log($"[GuildDungeon] clear cid={session.Player.CharacterId} dungeon={run.DungeonId} "
+                            + $"applied={result.Applied} clears={result.ClearCount} mail={result.MailId}");
+                    }))
                 {
                     run.Effects.TryFail(authoritativeReservation);
                     return false;
@@ -1307,7 +1378,17 @@ namespace DfoServer.Network.Handlers.Dungeon
                     partyMemberCount,
                     partyEventBonusRate: 0.0);
 
-            var lcg = run.RoomLcg ?? new DnfLcg(run.Seed);
+            // Card rewards roll on a dedicated per-participant stream. The
+            // shared run.RoomLcg is left untouched: party members freeze the
+            // same room seed, so consuming it here would deal identical
+            // cards to the whole party, and advancing it would perturb the
+            // room drop stream it still serves.
+            var lcg = new DnfLcg(
+                DropService.DeriveParticipantCardSeed(
+                    run.Seed,
+                    run.PartyDungeonInstanceId,
+                    run.CurrentRoomInstanceId,
+                    session.Player?.CharacterId ?? 0));
             var characterJob = session.Player != null ? session.Player.Job : -1;
             var characterGrowType = session.Player != null
                 ? session.Player.GrowType
@@ -2639,6 +2720,17 @@ namespace DfoServer.Network.Handlers.Dungeon
                         "Dungeon clear effect reservation was lost before commit.");
                 }
 
+                // Scripted quest NPCs register a client-side mouse action.
+                // Once the authoritative clear commits there is no valid
+                // interaction target left, so explicitly discard that action
+                // before projecting the result UI.  Without this notification
+                // the client can keep replaying the last NPC click even after
+                // the cursor has moved away.
+                await session.SendPacketAsync(
+                    MouseRegistrationDiscardPacketBuilder.BuildPacket());
+                if (!session.Player.IsCurrentDungeonRun(identity))
+                    return false;
+
                 if (run.AnotherAradActive && run.AnotherAradQuest != null)
                 {
                     run.AnotherAradQuest.EvaluateSettlement(
@@ -2759,7 +2851,8 @@ namespace DfoServer.Network.Handlers.Dungeon
                 int characterId,
                 ushort participantUserId,
                 DungeonRun candidateRun,
-                long attachmentGeneration)
+                long attachmentGeneration,
+                byte partySlot)
             {
                 if (candidateRun == null
                     || characterId <= 0
@@ -2777,18 +2870,39 @@ namespace DfoServer.Network.Handlers.Dungeon
                     candidateRun,
                     snapshot.RunIdentity,
                     snapshot.RoomIdentity,
-                    attachmentGeneration));
+                    attachmentGeneration,
+                    partySlot));
             }
+
+            var sourcePlayer = sourceSession?.Player;
+            var party = sourcePlayer != null
+                ? _svc.PartyManager?.GetPartyByUser(sourcePlayer.UserId)
+                : null;
+            var partySlots = party?.MembersBySlot().ToDictionary(
+                value => value.CharacterId,
+                value => value.SlotIndex)
+                ?? new Dictionary<int, byte>();
 
             foreach (var participant in _svc.InstanceRegistry
                          .CaptureInstanceParticipantRoster(
                              sourceRun.CaptureInstanceIdentity()))
             {
-                if (seen.Add(participant.RunIdentity.ParticipantIdentity))
-                    result.Add(participant);
+                if (!seen.Add(participant.RunIdentity.ParticipantIdentity))
+                    continue;
+                result.Add(new DungeonParticipantRosterEntry(
+                    participant.CharacterId,
+                    participant.ParticipantUserId,
+                    participant.Run,
+                    participant.RunIdentity,
+                    participant.RoomIdentity,
+                    participant.AttachmentGeneration,
+                    partySlots.TryGetValue(
+                        participant.CharacterId,
+                        out var participantSlot)
+                            ? participantSlot
+                            : byte.MaxValue));
             }
 
-            var sourcePlayer = sourceSession?.Player;
             if (sourcePlayer == null)
                 return result;
 
@@ -2796,11 +2910,14 @@ namespace DfoServer.Network.Handlers.Dungeon
                 sourcePlayer.CharacterId,
                 sourcePlayer.UserId,
                 sourceRun,
-                attachmentGeneration: 0);
+                attachmentGeneration: 0,
+                partySlot: partySlots.TryGetValue(
+                    sourcePlayer.CharacterId,
+                    out var sourceSlot)
+                        ? sourceSlot
+                        : (byte)0);
 
-            var partyManager = _svc.PartyManager;
             var sessions = _svc.Sessions;
-            var party = partyManager?.GetPartyByUser(sourcePlayer.UserId);
             if (party == null || sessions == null)
                 return result;
 
@@ -2813,7 +2930,8 @@ namespace DfoServer.Network.Handlers.Dungeon
                     member.CharacterId,
                     player?.UserId ?? 0,
                     player?.CurrentRun,
-                    attachmentGeneration: 0);
+                    attachmentGeneration: 0,
+                    partySlot: member.SlotIndex);
             }
 
             return result;
@@ -2864,6 +2982,18 @@ namespace DfoServer.Network.Handlers.Dungeon
                         $"source={sourceCharacterId} member={participant.CharacterId} " +
                         $"event={clearFact.SourceEventId:N} error={ex.Message}");
                 }
+            }
+
+            try
+            {
+                await _svc.AntonRewards.PrepareClearAsync(sourceRun, clearFact);
+            }
+            catch (Exception ex)
+            {
+                FileLogger.Log(
+                    $"[AntonAwakening] clear reward coordination failed: "
+                    + $"instance={sourceRun.PartyDungeonInstanceId} "
+                    + $"event={clearFact.SourceEventId:N} error={ex.Message}");
             }
         }
 
@@ -3325,12 +3455,12 @@ namespace DfoServer.Network.Handlers.Dungeon
         {
             try
             {
-                var dungeonBasisLevel = DungeonData.GetDungeonBasicLv(run.DungeonId);
-                return SecretShopOfferFactory.Create(
+                var roll = RollSecretShop(run);
+                return SecretShopOfferFactory.CreateForNpc(
                     SecretShopCatalogProvider.Current,
                     run.DungeonId,
-                    dungeonBasisLevel,
-                    partySize: 1,
+                    DungeonData.GetDungeonBasicLv(run.DungeonId),
+                    roll.NpcId,
                     ServerRandom.Next);
             }
             catch (Exception ex)
@@ -3338,6 +3468,19 @@ namespace DfoServer.Network.Handlers.Dungeon
                 FileLogger.Log($"[SecretShop] offer creation failed closed: dungeon={run.DungeonId} error={ex.Message}");
                 return new SecretShopOffer(1000, Array.Empty<SecretShopItemCandidate>());
             }
+        }
+
+        private static SecretShopRoll RollSecretShop(DungeonRun run)
+        {
+            var dungeonBasisLevel = DungeonData.GetDungeonBasicLv(run.DungeonId);
+            var catalog = SecretShopCatalogProvider.Current;
+            return run.Instance.GetOrCreateSecretShopRoll(
+                () => SecretShopOfferFactory.RollNpc(
+                    catalog,
+                    run.DungeonId,
+                    dungeonBasisLevel,
+                    run.EntryPartyMemberCount,
+                    ServerRandom.Next));
         }
 
         private static int ResolveCurrentMapId(DungeonRun run)

@@ -26,10 +26,6 @@ namespace DfoServer.SelfTests
                 (ushort)CmdPacketTypeA21.PREMIUM_SERVICE == 0x036F,
                 ref failures);
             Check(
-                "A21 premium state uses NOTI 0x032F",
-                (ushort)NotiPacketTypeA21.PREMIUM_SERVICE == 0x032F,
-                ref failures);
-            Check(
                 "A21 contract activation uses CERA_SPECIALITEM 0x0042",
                 (ushort)NotiPacketTypeA21.CERA_SPECIALITEM == 0x0042,
                 ref failures);
@@ -52,10 +48,13 @@ namespace DfoServer.SelfTests
 
             var sequence = NewCharacterInitSequence.Build();
             Check(
-                "character init proactively sends A21 premium service state",
+                "character init sends the A21 cmd=1 premium service response",
                 sequence.Any(packet =>
                     packet.Kind == SelectCharacterPacketTemplateKind.Raw
-                    && packet.Command == 0x00
+                    && packet.Command == 0x01
+                    && packet.Type == (ushort)CmdPacketTypeA21.PREMIUM_SERVICE)
+                && !sequence.Any(packet =>
+                    packet.Kind == SelectCharacterPacketTemplateKind.Raw
                     && packet.Type == (ushort)NotiPacketTypeA21.PREMIUM_SERVICE),
                 ref failures);
 
@@ -71,8 +70,9 @@ namespace DfoServer.SelfTests
             };
             var initBuilder = new PremiumServiceInitBodyBuilder();
             Check(
-                "premium init builder uses A21 NOTI body layout",
-                initBuilder.TryBuild(initSnapshot, 0, out var initBody)
+                "premium init builder uses A21 cmd=1 response body layout",
+                initBuilder.CmdType == (ushort)CmdPacketTypeA21.PREMIUM_SERVICE
+                && initBuilder.TryBuild(initSnapshot, out var initBody)
                 && initBody.Length == 77
                 && initBody[0] == 1
                 && BitConverter.ToUInt16(initBody, 1) == PremiumService.DefaultServiceType
@@ -327,6 +327,35 @@ VALUES (7, @goldCardType, @expire);";
                     "premium state projects the gold-card daily used count",
                     BitConverter.ToInt32(serviceData, 10)
                         == DevilContractUsagePolicy.GoldCardDailyLimit,
+                    ref failures);
+
+                using (var connection = new SqliteConnection(connectionString))
+                {
+                    connection.Open();
+                    using (var command = connection.CreateCommand())
+                    {
+                        command.CommandText = @"
+UPDATE account_premiums SET end_time = @expired
+WHERE account_id = 7 AND premium_type = @goldCardType;";
+                        command.Parameters.AddWithValue(
+                            "@goldCardType",
+                            DevilContractCatalog.SlotToPremiumType(
+                                DevilContractUsagePolicy.GoldCardSlot));
+                        command.Parameters.AddWithValue(
+                            "@expired",
+                            DateTimeOffset.UtcNow.ToUnixTimeSeconds() - 1);
+                        command.ExecuteNonQuery();
+                    }
+                }
+
+                var expiredServiceData = PremiumService.BuildPremiumServiceData(
+                    connectionString,
+                    accountId: 7,
+                    usage);
+                Check(
+                    "premium state omits an expired contract slot entirely",
+                    BitConverter.ToInt32(expiredServiceData, 6) == 0
+                    && BitConverter.ToInt32(expiredServiceData, 10) == 0,
                     ref failures);
             }
             finally

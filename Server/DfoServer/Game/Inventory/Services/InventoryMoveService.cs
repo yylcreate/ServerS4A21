@@ -48,6 +48,10 @@ namespace DfoServer.Game.Inventory
 
         public int DestinationCount { get; set; }
 
+        // 两个槽都有物品时走 ApplySwap：双方物品互换槽位，成长值迁移方向必须
+        // 由交换本身各自登记，不能套用请求的单一方向。
+        public bool SwappedSlots { get; set; }
+
         public InventoryMutationSet Changes { get; } = new InventoryMutationSet();
     }
 
@@ -72,6 +76,37 @@ namespace DfoServer.Game.Inventory
         private static readonly ItemSlotRange MainQuickSlotRange = new ItemSlotRange(3, 8);
 
         internal static bool TryMove(
+            InventoryService inventory,
+            InventoryMoveRequest request,
+            byte characterJob,
+            int characterGrowType,
+            out InventoryMoveServiceResult result)
+        {
+            var moved = TryMoveCore(
+                inventory,
+                request,
+                characterJob,
+                characterGrowType,
+                out result);
+
+            // 跨列表移动(背包<->穿戴)会改变 item_uid，龙跃武器成长值必须跟着
+            // 同一件物品迁移。这里只登记"空槽落位"的单向移动；两个槽都有物品的
+            // 交换由 ApplySwap 各自登记双方方向，避免把方向登记反。
+            if (moved && inventory != null && request != null
+                && request.SourceListType != request.DestinationListType
+                && !result.SwappedSlots)
+            {
+                inventory.RecordGrowthMigration(
+                    request.SourceListType,
+                    request.SourceSlotIndex,
+                    request.DestinationListType,
+                    request.DestinationSlotIndex);
+            }
+
+            return moved;
+        }
+
+        private static bool TryMoveCore(
             InventoryService inventory,
             InventoryMoveRequest request,
             byte characterJob,
@@ -517,6 +552,20 @@ namespace DfoServer.Game.Inventory
                 InventoryStackRuleService.IsStackable(sourceToDestination) ? sourceToDestination.Count : 0);
             SyncAvatarClearAvatarId(inventory, destinationToSource, sourceListType, sourceSlotIndex, source);
             SyncAvatarClearAvatarId(inventory, sourceToDestination, destinationListType, destinationSlotIndex, destination);
+
+            // 交换是双向的：源物品落到目标槽、目标物品落到源槽，跨列表时两件物品
+            // 的 item_uid 都会变，必须各自登记成长值迁移，否则会跟着错的槽搬走。
+            result.SwappedSlots = true;
+            if (sourceListType != destinationListType)
+            {
+                inventory.RecordGrowthMigration(
+                    sourceListType, sourceSlotIndex,
+                    destinationListType, destinationSlotIndex);
+                inventory.RecordGrowthMigration(
+                    destinationListType, destinationSlotIndex,
+                    sourceListType, sourceSlotIndex);
+            }
+
             return true;
         }
 
@@ -594,7 +643,8 @@ namespace DfoServer.Game.Inventory
                     item.ItemKind,
                     targetListType,
                     targetSlotIndex,
-                    inventory.GetListParam16(InventoryListType.Main)))
+                    inventory.GetListParam16(InventoryListType.Main),
+                    inventory.GetListParam16(InventoryListType.Avatar)))
                 return Fail(result, InventoryMoveServiceError.InvalidDestinationSlot);
 
             return true;
@@ -802,9 +852,11 @@ namespace DfoServer.Game.Inventory
             if (item == null || item.SortLockFlag == 0)
                 return true;
 
+            // 位置锁采用槽位语义：穿戴栏不展示位置锁，穿/脱一律不携带锁，
+            // 同时清掉历史遗留的穿戴栏锁脏数据。
             if (sourceListType == InventoryListType.Equipment
                 || destinationListType == InventoryListType.Equipment)
-                return true;
+                return false;
 
             if (sourceListType != destinationListType)
                 return false;
@@ -821,12 +873,14 @@ namespace DfoServer.Game.Inventory
                     sourceListType,
                     sourceSlotIndex,
                     inventory.GetListParam16(InventoryListType.Main),
-                    out var sourceKind)
+                    out var sourceKind,
+                    inventory.GetListParam16(InventoryListType.Avatar))
                 && ItemSlotBoundService.TryGetItemKindBySlot(
                     destinationListType,
                     destinationSlotIndex,
                     inventory.GetListParam16(InventoryListType.Main),
-                    out var destinationKind)
+                    out var destinationKind,
+                    inventory.GetListParam16(InventoryListType.Avatar))
                 && sourceKind == item.ItemKind
                 && destinationKind == item.ItemKind;
         }
@@ -964,8 +1018,8 @@ namespace DfoServer.Game.Inventory
 
             cloneAvatarResolver = cloneAvatarResolver ?? ItemMetadataResolver.IsCloneAvatarItem;
             var isCloneAvatar = cloneAvatarResolver(item.ItemId);
-            var borrowCloneAppearance = isCloneAvatar
-                && !ItemMetadataResolver.IsAuroraLookReplaceAvatar(item.ItemId);
+            var isAuroraLookReplace = ItemMetadataResolver.IsAuroraLookReplaceAvatar(item.ItemId);
+            var borrowCloneAppearance = isCloneAvatar && !isAuroraLookReplace;
             var clearAvatarId = 0;
             var color1 = detail.Color1;
             var color2 = detail.Color2;
@@ -992,9 +1046,27 @@ namespace DfoServer.Game.Inventory
                     color2 = previousDetail?.Color2 ?? 0;
                 }
             }
+            byte[] lookReplaceJewels = null;
+            if (isAuroraLookReplace)
+            {
+                if (IsEquippedAvatarSlot(listType, slotIndex)
+                    && previousItemAtSlot != null
+                    && previousItemAtSlot.ItemKind == ItemCore.KindAvatar
+                    && previousItemAtSlot.AvatarUid > 0
+                    && ItemMetadataResolver.IsAuroraStatSourceAvatar(previousItemAtSlot.ItemId))
+                {
+                    clearAvatarId = previousItemAtSlot.AvatarUid;
+                }
+                else if (!IsEquippedAvatarSlot(listType, slotIndex))
+                {
+                    // Drop sockets copied onto the cover by older builds.
+                    lookReplaceJewels = new byte[JewelSocket.Size];
+                }
+            }
 
             if (detail.ClearAvatarId == clearAvatarId
-                && (!isCloneAvatar || (detail.Color1 == color1 && detail.Color2 == color2)))
+                && (!isCloneAvatar || (detail.Color1 == color1 && detail.Color2 == color2))
+                && lookReplaceJewels == null)
                 return;
 
             detail.ClearAvatarId = clearAvatarId;
@@ -1003,6 +1075,8 @@ namespace DfoServer.Game.Inventory
                 detail.Color1 = color1;
                 detail.Color2 = color2;
             }
+            if (lookReplaceJewels != null)
+                detail.JewelSocket = lookReplaceJewels;
             inventory.AvatarDetails.MarkDirty(detail.AvatarUid);
         }
 

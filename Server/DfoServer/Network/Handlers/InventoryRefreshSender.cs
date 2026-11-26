@@ -209,7 +209,7 @@ namespace DfoServer.Network.Handlers
                 A21UsableCount0465BodyBuilder.Build(items, mode)));
         }
 
-        internal static async Task<bool> TrySendOwnedItemListRefresh(
+        internal static byte[] PrepareOwnedItemListRefresh(
             EnhancedClientSession session,
             InventoryLease expectedLease,
             InventoryListType listType,
@@ -225,7 +225,7 @@ namespace DfoServer.Network.Handlers
                     session.SessionId,
                     player.CharacterId))
             {
-                return false;
+                return null;
             }
 
             byte[] body;
@@ -237,7 +237,7 @@ namespace DfoServer.Network.Handlers
                         player.CharacterId)
                     || !projectionGuard())
                 {
-                    return false;
+                    return null;
                 }
 
                 body = ItemListPacketBuilder.BuildItemSpaceListBody(
@@ -251,14 +251,24 @@ namespace DfoServer.Network.Handlers
                     player.CharacterId)
                 || !projectionGuard())
             {
-                return false;
+                return null;
             }
 
-            await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(
-                0x00,
-                0x000D,
-                body));
-            return true;
+            return GamePacketEnvelopeBuilder.Build(0x00, (ushort)NotiPacketTypeA21.ITEM_LIST, body);
+        }
+
+        internal static async Task<bool> TrySendOwnedItemListRefresh(
+            EnhancedClientSession session, InventoryLease expectedLease,
+            InventoryListType listType, Func<bool> projectionGuard)
+        {
+            var packet = PrepareOwnedItemListRefresh(session, expectedLease, listType, projectionGuard);
+            if (packet == null) return false;
+            // Existing standalone callers retain the send-lock ownership check.
+            // Coupled callers prepare inside SendPreparedPacketBatchAsync instead.
+            return await session.TrySendPacketAsync(packet, System.Threading.CancellationToken.None,
+                () => InventoryContext.IsCurrentLease(
+                    expectedLease, session.SessionId, session.Player?.CharacterId ?? 0)
+                    && projectionGuard());
         }
 
         public Task SendUpdateItemList(EnhancedClientSession session, InventoryListType itemSpace, short slotIndex)
@@ -307,23 +317,6 @@ namespace DfoServer.Network.Handlers
             await SendUpdateItemList(session, listType, slotIndex);
         }
 
-        public async Task SendSortItemLockRefresh(EnhancedClientSession session, InventoryListType listType)
-        {
-            var (cid, _) = SessionOwnerResolver.Resolve(session);
-            var refreshListType = MapToSortLockListType(listType);
-            var locks = LoadOnlineSortItemLocks(session, cid, refreshListType);
-            foreach (var entry in locks)
-                await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(0x01, 0x02CA, SortItemLockBuilder.BuildLock(entry)));
-        }
-
-        public async Task SendAllSortItemLockRefresh(EnhancedClientSession session)
-        {
-            var (cid, _) = SessionOwnerResolver.Resolve(session);
-            var locks = LoadOnlineSortItemLocks(session, cid, null);
-            foreach (var entry in locks)
-                await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(0x01, 0x02CA, SortItemLockBuilder.BuildLock(entry)));
-        }
-
         public async Task SendEquipmentItemLockListRefresh(EnhancedClientSession session, InventoryListType listType)
         {
             if (!IsEquipmentItemLockListType(listType))
@@ -343,18 +336,6 @@ namespace DfoServer.Network.Handlers
             LogEquipmentItemLockList("ITEM_LOCK_LIST_ALL", locks);
             await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(0x00, 0x00FB,
                 EquipmentItemLockBuilder.BuildLockList(locks)));
-        }
-
-        private static IReadOnlyList<SortItemLockEntry> LoadOnlineSortItemLocks(
-            EnhancedClientSession session,
-            int characterId,
-            InventoryListType? listType)
-        {
-            if (!InventoryContext.TryGetLease(characterId, out var lease) || !lease.IsOwnedBy(session.SessionId))
-                return Array.Empty<SortItemLockEntry>();
-
-            lock (lease.SyncRoot)
-                return InventoryLockService.LoadSortItemLocks(lease.Inventory, listType);
         }
 
         private static IReadOnlyList<EquipmentItemLockEntry> LoadOnlineEquipmentItemLocks(
@@ -380,6 +361,36 @@ namespace DfoServer.Network.Handlers
             short slotIndex)
         {
             return SendOnlineUpdateItemList(session, itemSpace, new[] { slotIndex });
+        }
+
+        // 整栏重发（0x000D）。0x000E 单槽更新不会让客户端重建条目，
+        // 物品模板变化（如龙跃武器自动升星换模板、名称/星级改变）必须用整栏刷新。
+        // 注意：不能先发空更新把槽清掉——客户端收到空更新后会丢弃条目，
+        // 且随后的整栏重建不足以让它重新创建该槽，武器会从 UI 消失。
+        internal static async Task SendOnlineItemListRefresh(
+            EnhancedClientSession session,
+            InventoryListType itemSpace)
+        {
+            if (session == null || !IsNewItemListUpdateSpace(itemSpace))
+                return;
+
+            var (cid, _) = SessionOwnerResolver.Resolve(session);
+            if (cid <= 0 || !InventoryContext.TryGetLease(cid, out var lease))
+                return;
+            if (!lease.IsOwnedBy(session.SessionId))
+                return;
+
+            byte[] body;
+            lock (lease.SyncRoot)
+                body = ItemListPacketBuilder.BuildItemSpaceListBody(lease.Inventory, itemSpace);
+
+            if (body == null || body.Length == 0)
+                return;
+
+            await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(
+                0x00,
+                0x000D,
+                body));
         }
 
         internal static async Task SendOnlineUpdateItemList(
