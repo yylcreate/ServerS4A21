@@ -1,9 +1,10 @@
-using DfoServer.Game.Accounts;
+﻿using DfoServer.Game.Accounts;
 using DfoServer.Game.CharacterData;
 using DfoServer.Game.Characters;
 using DfoServer.Game.DailyReset;
 using DfoServer.Game.Dungeon;
 using DfoServer.Game.Events;
+using DfoServer.Game.Events.GuardianAltar;
 using DfoServer.Game.Events.DailyAttendanceAnytime;
 using DfoServer.Game.Events.Joust;
 using DfoServer.Game.Events.PcRoomTimePoint;
@@ -15,10 +16,12 @@ using DfoServer.Game.KnightShield;
 using DfoServer.Game.Lottery;
 using DfoServer.Game.Mercenary;
 using DfoServer.Game.Mailbox;
+using DfoServer.Game.Auction;
 using DfoServer.Game.Party;
 using DfoServer.Game.Raid;
 using DfoServer.Game.SelectCharacter;
 using DfoServer.Game.Session;
+using DfoServer.GameWorld;
 using DfoServer.Network;
 using DfoServer.Network.Handlers;
 using DfoServer.Network.Handlers.Pets;
@@ -144,6 +147,16 @@ namespace DfoServer.Infrastructure
             var accountRepository = new SqliteAccountRepository(Database);
             var rentalTimeProvider = SystemRentalTimeProvider.Instance;
             var dailyResetService = new DailyResetService(Database);
+            var sequentialCatalog =
+                SequentialDungeonDefinitionCatalog.Current;
+            var antonProgressRepository =
+                new AntonAwakeningDailyProgressRepository(
+                    Database,
+                    dailyResetService,
+                    sequentialCatalog);
+            var antonProgress = new AntonAwakeningDailyProgressService(
+                antonProgressRepository,
+                sequentialCatalog);
             var dungeonPersistentEffects =
                 new DungeonPersistentEffectApplicationService(
                     Database.ConnectionString,
@@ -159,7 +172,8 @@ namespace DfoServer.Infrastructure
                 characterRepository,
                 inventoryLifecycle,
                 rentalTimeProvider,
-                dailyResetService);
+                dailyResetService,
+                antonProgress);
             var getUserInfoTemplate = new SqliteUserInfoBlobRepository(Database)
                 .LoadGetUserInfoTemplate();
             var eventManager = new EventManager(Database);
@@ -171,6 +185,7 @@ namespace DfoServer.Infrastructure
                 characterRepository,
                 rentalTimeProvider,
                 dailyResetService,
+                antonProgress,
                 dungeonPersistentEffects,
                 experienceItemUseService,
                 selectCharacterDataSource,
@@ -358,7 +373,8 @@ namespace DfoServer.Infrastructure
                     world.MercenaryRestrictions,
                     core.Database,
                     core.DailyResetService,
-                    inventory.MailboxService),
+                    inventory.MailboxService,
+                    core.EventManager.SeriaLuckUi),
                 new InventoryHandler(
                     core.ExperienceItemUseService,
                     core.SelectCharacterDataSource,
@@ -373,7 +389,8 @@ namespace DfoServer.Infrastructure
                     core.Database,
                     inventory.OverflowRewardSink,
                     inventory.MailboxService,
-                    inventory.KnightShieldService),
+                    inventory.KnightShieldService,
+                    core.EventManager.SeriaLuckUi),
                 new KnightShieldHandler(
                     inventory.KnightShieldService,
                     core.CharacterRepository,
@@ -546,7 +563,11 @@ namespace DfoServer.Infrastructure
                         inventory.TotalAttendance,
                     instanceRegistry: world.DungeonInstances,
                     raidManager: world.RaidManager,
-                    database: core.Database));
+                    database: core.Database,
+                    dailyResetService: core.DailyResetService,
+                    antonAwakeningProgress: core.AntonAwakeningProgress,
+                    overflowRewardSink: inventory.OverflowRewardSink,
+                    fatigueAcceleration: core.EventManager.FatigueAccelerationEntry));
         }
 
         internal GameProtocolSocialHandlers GetOrCreateGameProtocolSocialHandlers(
@@ -592,7 +613,8 @@ namespace DfoServer.Infrastructure
                 world,
                 townDungeon,
                 udpRelay,
-                pvpUdpRelay);
+                pvpUdpRelay,
+                GetOrCreateGameProtocolInventoryDependencies(core).InventoryRefreshSender);
             return _gameProtocolSocialHandlers;
         }
 
@@ -601,7 +623,8 @@ namespace DfoServer.Infrastructure
             GameProtocolWorldDependencies world,
             GameProtocolTownDungeonHandlers townDungeon,
             PartyUdpRelay udpRelay,
-            PartyUdpRelay pvpUdpRelay)
+            PartyUdpRelay pvpUdpRelay,
+            InventoryRefreshSender inventoryRefresh)
         {
             if (core == null) throw new ArgumentNullException(nameof(core));
             if (world == null) throw new ArgumentNullException(nameof(world));
@@ -618,10 +641,16 @@ namespace DfoServer.Infrastructure
             var raid = new RaidHandler(
                 core.CharacterRepository,
                 world.Sessions,
-                world.RaidManager);
+                world.RaidManager,
+                new Game.Quests.QuestService(core.Database.ConnectionString));
+            party.AttachRaidHandler(raid);
+            raid.RaidPeerRequestAsync = party.RequestRaidPeerAsync;
             var chat = new ChatHandler(
                 world.Sessions,
-                world.PartyManager);
+                world.PartyManager,
+                world.CharacterTransitions,
+                world.RaidManager);
+            chat.ConfigureBlacklist(new Game.Friends.BlacklistRepository(core.Database));
             townDungeon.Town.ConfigureDungeonGiveupPartyDeparture(
                 party.HandleDungeonGiveupWithinTransitionAsync);
             townDungeon.Town.ConfigureTownPartyListPublisher(
@@ -648,9 +677,16 @@ namespace DfoServer.Infrastructure
                 world.Sessions,
                 townDungeon.Town.BuildFullUserInfoPacket,
                 world.CharacterTransitions,
+                announceTownArrivalWithinTransition:
+                    townDungeon.Town.AnnouncePvpTownArrivalWithinTransitionAsync,
                 pvpUdpRelay: pvpUdpRelay,
                 database: core.Database);
             party.AttachPvpRoomHandler(pvpRoom);
+
+            var guildRepository = new DfoServer.Game.Guilds.GuildRepository(core.Database);
+            var guildPublisher = new GuildStatePublisher(guildRepository, world.CharacterTransitions, world.Sessions, inventoryRefresh);
+            chat.ConfigureGuilds(guildRepository, world.CharacterTransitions);
+            townDungeon.Town.ConfigureGuildEntrance(guildRepository, world.CharacterTransitions);
 
             return new GameProtocolSocialHandlers(
                 party,
@@ -659,7 +695,20 @@ namespace DfoServer.Infrastructure
                 dungeonLoading,
                 dungeonRejoin,
                 new PvpChannelInfoHandler(),
-                pvpRoom);
+                pvpRoom,
+                new GuildCreationHandler(
+                    new DfoServer.Game.Guilds.GuildRepository(core.Database),
+                    world.CharacterTransitions,
+                    inventoryRefresh),
+                new GuildMemberHandler(
+                    new DfoServer.Game.Guilds.GuildRepository(core.Database),
+                    world.CharacterTransitions,
+                    world.Sessions),
+                new GuildJoinHandler(guildRepository,
+                    world.CharacterTransitions, world.Sessions, inventoryRefresh, guildPublisher),
+                new GuildManagementHandler(guildRepository, world.CharacterTransitions, guildPublisher, inventoryRefresh),
+                guildPublisher,
+                new ItemTradeHandler(world.Sessions, world.CharacterTransitions, core.Database));
         }
 
         internal GameProtocolFeatureHandlers GetOrCreateGameProtocolFeatureHandlers(
@@ -764,7 +813,41 @@ namespace DfoServer.Infrastructure
                 new EventTotalAttendanceHandler(
                     inventory.TotalAttendance);
 
-            return new GameProtocolFeatureHandlers(
+            var guardianDefinition = new Lazy<GuardianAltarMenuDefinition>(GuardianAltarMenuDefinition.Load);
+            var guardianProgress = new GuardianAltarProgressService(core.Database,
+                core.DailyResetService, () => guardianDefinition.Value,
+                inventory.MailboxService);
+            core.DungeonPersistentEffects.BindGuardianAltarProgressService(guardianProgress);
+            var guardianAltarOpening = new GuardianAltarOpeningCoordinator(
+                core.EventManager.GuardianAltarOpening,
+                world.Sessions,
+                world.CharacterTransitions,
+                ClockService.Instance,
+                progress: guardianProgress, definition: () => guardianDefinition.Value);
+
+            var eventDungeons = new EventDungeonOpeningCoordinator(
+                core.EventManager.EventDungeons,
+                world.Sessions,
+                world.CharacterTransitions,
+                ClockService.Instance,
+                townDungeon.Dungeon.EntryLimits);
+            townDungeon.Dungeon.ConfigureEventDungeons(
+                core.EventManager.EventDungeons,
+                eventDungeons.NotifyCountsAfterEntryWhileTransitionHeldAsync);
+            var epicRoad = core.EventManager.EpicRoadEntry;
+            var accountDungeonCounts = new AccountDungeonCountNotifier(
+                townDungeon.Dungeon.EntryLimits, world.Sessions,
+                Game.Events.EpicRoad.EpicRoadEntryService.DungeonId,
+                epicRoad.Definition.AccountMaximumCount);
+            townDungeon.Dungeon.ConfigureEpicRoad(epicRoad, accountDungeonCounts.PublishWhileTransitionHeldAsync);
+            townDungeon.Town.ConfigureEpicRoadEntry(epicRoad);
+            townDungeon.Town.ConfigureAccountDungeonCountProjection(accountDungeonCounts.PublishWhileTransitionHeldAsync);
+
+            var auctionService = new AuctionService(
+                new AuctionRepository(core.Database), inventory.MailboxService);
+            auctionService.RegisterClock(ClockService.Instance);
+
+            var handlers = new GameProtocolFeatureHandlers(
                 lotteryItem,
                 new PetCreatureHandler(
                     core.SelectCharacterDataSource,
@@ -821,7 +904,19 @@ namespace DfoServer.Infrastructure
                 eventJoustHandler,
                 eventPcRoomTimePointHandler,
                 eventDailyAttendanceAnytimeHandler,
-                eventTotalAttendanceHandler);
+                eventTotalAttendanceHandler,
+                new NpcFavorHandler(
+                    core.Database,
+                    inventory.InventoryRefreshSender),
+                new EventFatigueAccelerationHandler(
+                    core.EventManager.FatigueAccelerationEntry,
+                    world.CharacterTransitions),
+                new AuctionHandler(auctionService, world.CharacterTransitions),
+                guardianAltarOpening,
+                eventDungeons);
+            guardianAltarOpening.Start();
+            eventDungeons.Start();
+            return handlers;
         }
 
         internal CharacterSessionLifecycleCoordinator
@@ -937,7 +1032,9 @@ namespace DfoServer.Infrastructure
                 socialHandlers.PvpRoom,
                 inventory.InventoryRefreshSender,
                 core.Database,
-                core.DailyResetService);
+                core.DailyResetService,
+                featureHandlers.GuardianAltarOpening,
+                featureHandlers.EventDungeons);
         }
 
         public void Dispose()
@@ -946,6 +1043,8 @@ namespace DfoServer.Infrastructure
                 return;
 
             _disposed = true;
+            _gameProtocolFeatureHandlers?.GuardianAltarOpening?.Dispose();
+            _gameProtocolFeatureHandlers?.EventDungeons?.Dispose();
             _gameProtocolSocialHandlers?.Dispose();
             _gameProtocolWorld?.Dispose();
         }

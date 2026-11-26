@@ -2,6 +2,7 @@ using Microsoft.Data.Sqlite;
 using DfoServer.Game.Inventory;
 using System;
 using System.Collections.Generic;
+using System.Threading.Tasks;
 
 namespace DfoServer.Game.Mailbox
 {
@@ -13,6 +14,9 @@ namespace DfoServer.Game.Mailbox
         {
             _repository = repository ?? throw new ArgumentNullException(nameof(repository));
         }
+
+        // 只投影已提交的系统邮件；不承担邮件或附件的持久化真源。
+        internal Func<int, Task> SystemMailArrivedNotifier { get; set; }
 
         public MailboxSendResult SendMail(MailboxSendRequest request)
         {
@@ -36,7 +40,26 @@ namespace DfoServer.Game.Mailbox
 
         public MailboxSendResult SendSystemMail(MailboxSendRequest request)
         {
-            return _repository.SendSystemMail(request);
+            var result = _repository.SendSystemMail(request);
+            if (result.Success && !result.AlreadyExists)
+                _ = NotifySystemMailArrivedSafeAsync(request?.ReceiverCharacterId ?? 0);
+            return result;
+        }
+
+        private async Task NotifySystemMailArrivedSafeAsync(int characterId)
+        {
+            var notifier = SystemMailArrivedNotifier;
+            if (characterId <= 0 || notifier == null)
+                return;
+            try
+            {
+                await notifier(characterId).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                // 已提交邮件不可因投影失败回滚或重发；重登/打开邮箱重读持久列表。
+                FileLogger.Log($"[Mailbox] system mail notification failed cid={characterId}: {ex.Message}");
+            }
         }
 
         public MailboxSendResult SendSystemMails(IReadOnlyList<MailboxSendRequest> requests)

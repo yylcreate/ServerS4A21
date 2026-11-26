@@ -1,8 +1,13 @@
 using System;
 using DfoServer.Game.Events.DailyAttendanceAnytime;
+using DfoServer.Game.Events.FatigueAcceleration;
+using DfoServer.Game.Events.GuardianAltar;
 using DfoServer.Game.Events.Joust;
 using DfoServer.Game.Events.PcRoomTimePoint;
 using DfoServer.Game.Events.TotalAttendance;
+using DfoServer.Game.Events.SeriaLuck;
+using DfoServer.Game.Events.ScheduledDungeons;
+using DfoServer.Game.Events.EpicRoad;
 using DfoServer.Infrastructure;
 
 namespace DfoServer.Game.Events
@@ -15,12 +20,40 @@ namespace DfoServer.Game.Events
         {
             Database = database ?? throw new ArgumentNullException(nameof(database));
             _repository = new GameEventRepository(Database);
+            FatigueAccelerationEntry = new FatigueAccelerationEntryService(Database);
+            SeriaLuckUi = new SeriaLuckUiService(Database);
+            EpicRoadEntry = new EpicRoadEntryService(Database);
         }
 
         internal IGameDatabase Database { get; }
 
+        internal GuardianAltarOpeningService GuardianAltarOpening { get; } = new();
+
+        internal EventDungeonOpeningService EventDungeons { get; } = new();
+
+        internal FatigueAccelerationEntryService FatigueAccelerationEntry { get; }
+
+        internal SeriaLuckUiService SeriaLuckUi { get; }
+        internal EpicRoadEntryService EpicRoadEntry { get; }
+
         internal void Initialize()
         {
+            SeriaLuckUi.Initialize();
+            FatigueAccelerationEntry.Initialize(Environment.GetEnvironmentVariable(
+                FatigueAccelerationEntryService.EntryEnvironmentVariable));
+            EpicRoadEntry.Initialize(Environment.GetEnvironmentVariable(EpicRoadEntryService.EntryEnvironmentVariable));
+            if (EpicRoadEntry.Definition.IsValid)
+                new Game.Dungeon.DungeonEntryLimitService(Database).EnsureAccountDungeonLimit(
+                    EpicRoadEntryService.DungeonId, EpicRoadEntry.Definition.AccountMaximumCount);
+
+            if (!GuardianAltarOpening.TryConfigureEnvironment(out var openingError))
+                FileLogger.Log("[GuardianAltarEntry] invalid entry-only window; disabled: "
+                    + openingError);
+
+            if (!EventDungeons.TryConfigureEnvironment(out var dungeonOpeningError))
+                FileLogger.Log("[EventDungeonEntry] invalid opening configuration: "
+                    + dungeonOpeningError);
+
             var joustConfig = JoustConfigProvider.Instance;
             joustConfig.Warmup();
             new JoustRepository(Database)

@@ -481,7 +481,9 @@ namespace DfoServer.Network.Handlers
                     listType,
                     slotIndex);
             }
-            await ChannelTownRestrictionSender.SendAsync(session);
+            await ChannelTownRestrictionSender.SendAsync(
+                session,
+                definition.TargetTownId);
             return true;
         }
 
@@ -1037,7 +1039,8 @@ namespace DfoServer.Network.Handlers
                         RequestedCount = request.RequestedCount,
                     },
                     out var result,
-                    out var persistenceFailed))
+                    out var persistenceFailed,
+                    out var luckProjection))
             {
                 FileLogger.Log($"[{ProtocolName}] OPEN_MAGIC_BOX: failed cid={cid} aid={aid} slot={request.SlotIndex} item=0x{request.ItemTemplateId:X8} material=0x{request.MaterialItemTemplateId:X8}@{request.MaterialSlotIndex} requested={request.RequestedCount} persistenceFailed={persistenceFailed} elapsed={elapsed.ElapsedMilliseconds}ms");
                 await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(
@@ -1050,7 +1053,7 @@ namespace DfoServer.Network.Handlers
             }
 
             result.MagicBoxClientType = request.RawListType;
-            await SendBoosterUseResult(session, header.type, result);
+            await SendBoosterUseResult(session, header.type, result, luckProjection);
             if (result.UsableCountState != null)
                 await SendUsableCountLimitUpdateAsync(session, result.UsableCountState);
             FileLogger.Log($"[{ProtocolName}] OPEN_MAGIC_BOX: source=0x{result.SourceItemTemplateId:X8} slot={result.SourceSlotIndex} requested={request.RequestedCount} applied={result.ConsumedSourceCount} remaining={result.SourceRemainingStackCount} material=0x{result.ConsumedMaterialItemTemplateId:X8}x{result.ConsumedMaterialCount}@{result.ConsumedMaterialSlotIndex} materialRemaining={result.ConsumedMaterialRemainingStackCount}{FormatBoosterOpenState(result)} rewards={string.Join(",", result.Rewards.Select(r => $"{r.ListType}:0x{r.ItemTemplateId:X8}x{r.GrantedCount}@{r.SlotIndex}"))} elapsed={elapsed.ElapsedMilliseconds}ms");
@@ -1089,7 +1092,8 @@ namespace DfoServer.Network.Handlers
                         RequestedCount = request.RequestedCount,
                     },
                     out var result,
-                    out var persistenceFailed))
+                    out var persistenceFailed,
+                    out var luckProjection))
             {
                 FileLogger.Log($"[{ProtocolName}] OPEN_MAGIC_BOX_SINGLE: failed cid={cid} aid={aid} slot={request.SlotIndex} materialSlot={(materialSlotIndex.HasValue ? materialSlotIndex.Value.ToString() : "auto")} requested={request.RequestedCount} persistenceFailed={persistenceFailed} elapsed={elapsed.ElapsedMilliseconds}ms");
                 await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(
@@ -1102,7 +1106,7 @@ namespace DfoServer.Network.Handlers
             }
 
             result.MagicBoxClientType = request.RawListType;
-            await SendBoosterUseResult(session, header.type, result);
+            await SendBoosterUseResult(session, header.type, result, luckProjection);
             if (result.UsableCountState != null)
                 await SendUsableCountLimitUpdateAsync(session, result.UsableCountState);
             FileLogger.Log($"[{ProtocolName}] OPEN_MAGIC_BOX_SINGLE: source=0x{result.SourceItemTemplateId:X8} slot={result.SourceSlotIndex} requested={request.RequestedCount} applied={result.ConsumedSourceCount} remaining={result.SourceRemainingStackCount} material=0x{result.ConsumedMaterialItemTemplateId:X8}x{result.ConsumedMaterialCount}@{result.ConsumedMaterialSlotIndex} materialRemaining={result.ConsumedMaterialRemainingStackCount}{FormatBoosterOpenState(result)} rewards={string.Join(",", result.Rewards.Select(r => $"{r.ListType}:0x{r.ItemTemplateId:X8}x{r.GrantedCount}@{r.SlotIndex}"))} elapsed={elapsed.ElapsedMilliseconds}ms");
@@ -1146,7 +1150,7 @@ namespace DfoServer.Network.Handlers
             {
                 SlotIndex = slotIndex,
                 SelectedItemTemplateIds = selectedItemTemplateIds,
-            }, out var result, out var persistenceFailed))
+            }, out var result, out var persistenceFailed, out var luckProjection))
             {
                 if (result != null && result.ErrorCode != 0)
                 {
@@ -1164,7 +1168,7 @@ namespace DfoServer.Network.Handlers
                 return false;
             }
 
-            await SendBoosterUseResult(session, header.type, result);
+            await SendBoosterUseResult(session, header.type, result, luckProjection);
             FileLogger.Log($"[{ProtocolName}] USE_BOOSTER: source=0x{result.SourceItemTemplateId:X8} slot={result.SourceSlotIndex} remaining={result.SourceRemainingStackCount}, rewards={string.Join(",", result.Rewards.Select(r => $"{r.ListType}:0x{r.ItemTemplateId:X8}x{r.GrantedCount}@{r.SlotIndex}"))}, elapsed={elapsed.ElapsedMilliseconds}ms");
             return true;
         }
@@ -1365,20 +1369,26 @@ namespace DfoServer.Network.Handlers
             int characterId,
             BoosterUseRequest request,
             out BoosterUseResult result,
-            out bool persistenceFailed)
+            out bool persistenceFailed,
+            out SeriaLuckGaugeProjection luckProjection)
         {
             result = null;
             persistenceFailed = false;
+            luckProjection = null;
             if (!TryGetOwnedInventoryLease(session, characterId, out var lease))
                 return false;
 
-            return InventorySpecialConsumableCommitService.TryCommitBoosterItem(
+            var source = SeriaLuckGaugeProjection.Capture(session, lease);
+            var committed = InventorySpecialConsumableCommitService.TryCommitBoosterItem(
                 lease,
                 request,
                 ResolveCharacterJobLabel(characterId),
                 _overflowRewardSink,
                 out result,
                 out persistenceFailed);
+            if (committed && result?.IsSeriaLuckValueSource == true)
+                luckProjection = source;
+            return committed;
         }
 
         private bool TryOpenOnlinePackage0207(
@@ -1451,8 +1461,11 @@ namespace DfoServer.Network.Handlers
                 : null;
         }
 
-        private async Task SendBoosterUseResult(EnhancedClientSession session, ushort responseType, BoosterUseResult result)
+        private async Task SendBoosterUseResult(EnhancedClientSession session, ushort responseType,
+            BoosterUseResult result, SeriaLuckGaugeProjection luckProjection = null)
         {
+            if (luckProjection != null && !luckProjection.IsCurrent())
+                return;
             var wallet = PersistHappyTokenCeraRewards(session, result);
             var magicBoxBatchType = (ushort)CmdPacketType.USE_RANDOMBOX_ITEM_EXPAND;
             var useNativeMagicBoxBatchAck = responseType == magicBoxBatchType && ShouldUseNativeMagicBoxBatchAck(result);
@@ -1510,6 +1523,8 @@ namespace DfoServer.Network.Handlers
                 await _refresh.SendEmptyUpdateItemList(session, InventoryListType.Main, result.SourceSlotIndex);
 
             await SendBoosterMainItemUpdates(session, result, result.SourceRemainingStackCount > 0);
+            if (luckProjection != null)
+                await luckProjection.SendAsync(_seriaLuckUi, result);
             if (wallet != null)
             {
                 await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(

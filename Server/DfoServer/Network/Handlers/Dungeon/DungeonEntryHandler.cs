@@ -3,6 +3,7 @@ using DfoServer.Game.CharacterData;
 using DfoServer.Game.Characters;
 using DfoServer.Game.Dungeon;
 using DfoServer.Game.Friends;
+using DfoServer.Game.Events.EpicRoad;
 using DfoServer.Game.Inventory;
 using DfoServer.Game.Quests;
 using DfoServer.Game.SelectCharacter;
@@ -56,6 +57,16 @@ namespace DfoServer.Network.Handlers.Dungeon
             internal DungeonEntryAdmissionPreparation Preparation;
             internal EntryCostResult CostResult;
             internal byte PartySlot;
+        }
+
+        private sealed class PartyEntryAdmissionFailure
+        {
+            internal DungeonAdmissionReject Rejection =
+                DungeonAdmissionReject.InvalidSelectionState;
+            internal string Reason = string.Empty;
+            internal EnhancedClientSession MemberSession;
+            internal byte MemberSlot;
+            internal EntryCostResult Validation;
         }
 
         internal void ConfigureRejectedPartySelectionReturn(
@@ -247,6 +258,58 @@ namespace DfoServer.Network.Handlers.Dungeon
                && selection.PartyCohort == null
                && party?.Count > 1;
 
+        internal static bool ShouldIgnoreClearedAntonFollowerDuplicateSelect(
+            DungeonRun run,
+            Game.Party.Party party,
+            ushort userId,
+            Guid sessionId,
+            SelectDungeonRequest request)
+        {
+            if (run == null
+                || (run.RunState != DungeonRunState.ClearCommitting
+                    && run.RunState != DungeonRunState.Cleared))
+            {
+                return false;
+            }
+
+            var definition = run.Instance?.SequentialDefinition;
+            if (definition == null
+                || !definition.ShowIndividualProcess
+                || definition.IndexOf(run.DungeonId) < 0
+                || request.DungeonId != run.DungeonId
+                || request.Difficulty != run.Difficulty
+                || request.Flag1 != 0
+                || request.Flag2 != 0
+                || request.A21Sentinel != 0xFFFF
+                || request.TrailingLength != 6
+                || request.HasNonZeroTrailingBytes
+                || party == null
+                || party.Count <= 1
+                || party.IsLeader(userId))
+            {
+                return false;
+            }
+
+            var member = party.GetMember(userId);
+            return member != null && member.SessionId == sessionId;
+        }
+
+        private static bool TryParseSelectDungeonRequest(
+            byte[] body,
+            out SelectDungeonRequest request)
+        {
+            try
+            {
+                request = SelectDungeonRequest.Parse(body);
+                return true;
+            }
+            catch (ArgumentException)
+            {
+                request = default;
+                return false;
+            }
+        }
+
         private static bool HasValidDungeonUserInfoIdentity(
             DungeonPartySelectionParticipant participant)
             => participant.UserId != 0
@@ -337,10 +400,7 @@ namespace DfoServer.Network.Handlers.Dungeon
                 wireType,
                 responseBody));
         }
-
-        // A21: 客户端进入副本选择界面后会用 CMD SEQUENTIAL_DUNGEON_INFO(0x035D)
         // 询问当前区域的连续副本序列进度(抓包: body = int32 configKey,
-        // 镇魂/远古区域 key=26)。之前服务端未注册该 CMD, 客户端拿不到应答会
         // 反复重发并卡死选择界面。这里始终按请求的 key 应答
         // NOTI SEQUENTIAL_DUNGEON_INFO(0x025B, int32 key + byte progress +
         // int32 routeMask, 与既有主动推送同布局); 无对应序列或无进度记录时
@@ -368,18 +428,37 @@ namespace DfoServer.Network.Handlers.Dungeon
             }
 
             var configKey = BitConverter.ToInt32(body, 0);
-            var progress = _svc.PersistentMechanisms.ResolveSequentialProgress(
+            _svc.PersistentMechanisms.TryResolveSequentialState(
                 player.CharacterId,
-                configKey);
+                configKey,
+                out var state);
+            var progress = state?.ProgressIndex ?? (byte)0;
+            var routeMask = state?.RouteMask ?? 0;
+            // 主动推送路径 (AntonNormalConquestNotificationSender.SendAsync)
+            // 是 DUNGEON_PERMISSION + SEQUENTIAL_DUNGEON_INFO 两包一起发;
+            // 这里只回序列包, 客户端拿不到暴走安徒恩(序列 41)的逐本通关状态,
+            // 组队时就会判「与组队模式不符」。补齐成和推送路径一致。
+            if (state != null && state.PermissionEntries.Count > 0)
+            {
+                await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(
+                    0x00,
+                    (ushort)NotiPacketTypeA21.DUNGEON_PERMISSION,
+                    DungeonPermissionBodyBuilder.BuildEntries(
+                        state.PermissionEntries)));
+            }
             await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(
                 0x00,
                 (ushort)NotiPacketTypeA21.SEQUENTIAL_DUNGEON_INFO,
                 DungeonNotificationBuilder.BuildSequentialDungeonInfo(
-                    configKey, progress, 0)));
+                    configKey,
+                    progress,
+                    routeMask)));
             FileLogger.Log(
                 $"[{DungeonSharedServices.ProtocolLogName}] " +
                 $"SEQUENTIAL_DUNGEON_INFO answered: " +
-                $"cid={player.CharacterId} key={configKey} progress={progress}");
+                $"cid={player.CharacterId} key={configKey} " +
+                $"progress={progress} routeMask=0x{routeMask:X2} " +
+                $"permissions={state?.PermissionEntries.Count ?? 0}");
         }
 
         internal async Task HandleEnterSelectDungeon(EnhancedClientSession session, GamePacketHeader header, byte[] body)
@@ -581,6 +660,23 @@ namespace DfoServer.Network.Handlers.Dungeon
                         DungeonAdmissionReject.InvalidSelectionState);
                     return default;
                 }
+                var selectionPlayer = session.Player;
+                var selectionAccount = session.Account;
+                var selectionGameSession = session.GameSession;
+                int selectionCharacterId = selectionPlayer.CharacterId;
+                int selectionAccountId = selectionAccount?.AccountId ?? 0;
+                ushort selectionUserId = selectionPlayer.UserId;
+                var selectionRun = selectionPlayer.CurrentRun;
+                long selectionRunGeneration = selectionPlayer.CurrentDungeonRunGeneration;
+                InventoryContext.TryGetOwnedLease(session.SessionId, selectionCharacterId, out var selectionLease);
+                bool SelectionSourceCurrent() => ReferenceEquals(session.Player, selectionPlayer)
+                    && ReferenceEquals(session.Account, selectionAccount)
+                    && ReferenceEquals(session.GameSession, selectionGameSession)
+                    && selectionPlayer.CharacterId == selectionCharacterId && selectionPlayer.UserId == selectionUserId
+                    && (selectionAccount?.AccountId ?? 0) == selectionAccountId
+                    && IsEntrySourceCurrent(session, selectionRun, selectionRunGeneration, selection)
+                    && (selectionLease == null || InventoryContext.IsCurrentLease(selectionLease, session.SessionId, selectionCharacterId))
+                    && (_svc.Sessions == null || (_svc.Sessions.TryGet(selectionCharacterId, out var current) && ReferenceEquals(current, session)));
                 if (partyCohort != null
                     && !ReferenceEquals(selection.PartyCohort, partyCohort))
                 {
@@ -710,14 +806,21 @@ namespace DfoServer.Network.Handlers.Dungeon
                     await session.SendPacketAsync(packet);
                 }
                 await _svc.PersistentMechanisms.RestoreBeforeSelectionAsync(session);
+                if (_svc.GuildDungeons.Catalog.IsValid
+                    && Town.TryGetDungeonGateReturnInfo(session.Player.CurTownId, session.Player.CurAreaId, out var guildGate)
+                    && guildGate.WorldMapAreaId == _svc.GuildDungeons.Catalog.WorldMapAreaId)
+                    await _svc.GuildDungeonProgress.SendAsync(session, "enter-select-dungeon");
                 if (!isA21TutorialEntry)
                 {
-                    await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(
+                    if (!await session.TrySendPacketAsync(GamePacketEnvelopeBuilder.Build(
                         0x00,
-                        0x001B,
+                        (ushort)NotiPacketTypeA21.ENTER_SELECT_DUNGEON,
                         EnterSelectDungeonStateBuilder.BuildA21EnterSelectDungeon(
                             hellPartySelection.UserIds,
-                            hellPartySelection.BlockedSlots)));
+                            hellPartySelection.BlockedSlots)),
+                        System.Threading.CancellationToken.None,
+                        SelectionSourceCurrent))
+                        return default;
                 }
                 else
                 {
@@ -728,7 +831,6 @@ namespace DfoServer.Network.Handlers.Dungeon
                 }
                 await _svc.GrowthCapsuleSync.SendExpProgressAsync(
                     session, "enter-select-dungeon", honor: honorSummary);
-                // 进本过图后客户端重置结婚属性 UI：USERINFO subtype1/
                 // USER_STATE 投影之后补发婚礼回放三包。只覆盖进/出本
                 // 触发点，不挂城镇内每次过图。
                 await InventoryRefreshSender.SendWeddingReplayRefresh(session);
@@ -978,8 +1080,10 @@ namespace DfoServer.Network.Handlers.Dungeon
                 UserInfoBodyBuilder.WriteA21Subtype1Prefix(
                     writer,
                     (ushort)record.CharacterId,
-                    addition.ManageLevel,
-                    addition.AuraSkinFlag);
+                    addition.Progress1,
+                    addition.Progress2,
+                    addition.AuraSkinFlag,
+                    addition.GrowthCapsuleExp);
                 writer.WriteBytes(UserInfoSubtype1Builder.BuildFromSnapshot(
                     addition,
                     skillSnapshot,
@@ -1074,12 +1178,14 @@ namespace DfoServer.Network.Handlers.Dungeon
                 session,
                 wireType,
                 DungeonAdmissionReject.InvalidSelectionState);
-            await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(
-                0x00,
-                (ushort)NotiPacketType.SERVER_NOTICE_MESSAGE,
-                ServerNoticeMessageBuilder.Build(
-                    RaidSelectionRestrictionMessage)));
+            await session.SendPacketAsync(BuildRaidSelectionRestrictionNotice());
         }
+
+        internal static byte[] BuildRaidSelectionRestrictionNotice()
+            => GamePacketEnvelopeBuilder.Build(
+                0x00,
+                (ushort)NotiPacketTypeA21.SERVER_NOTICE_MESSAGE,
+                ServerNoticeMessageBuilder.BuildRaidNotice(RaidSelectionRestrictionMessage));
 
         private DungeonPartySelectionCohort CapturePartySelectionCohort(
             EnhancedClientSession leader,
@@ -1993,6 +2099,7 @@ namespace DfoServer.Network.Handlers.Dungeon
             AnotherAradSelection? anotherAradSelection)
         {
             var initialSelection = session?.Player?.CurrentDungeonSelection;
+            var predecessorRun = session?.Player?.CurrentRun;
             if (!CanEnterRaidDungeonSelection(session))
             {
                 FileLogger.Log(
@@ -2023,7 +2130,6 @@ namespace DfoServer.Network.Handlers.Dungeon
                 return;
             }
 
-            var predecessorRun = session?.Player?.CurrentRun;
             var predecessorGeneration =
                 session?.Player?.CurrentDungeonRunGeneration ?? 0;
             var expectedSelection = expectedPredecessorIdentity.HasValue
@@ -2036,6 +2142,35 @@ namespace DfoServer.Network.Handlers.Dungeon
                         expectedPredecessorIdentity.Value)))
             {
                 return;
+            }
+            if (!expectedPredecessorIdentity.HasValue
+                && predecessorRun != null)
+            {
+                var duplicateSelectParty = session?.Player == null
+                    ? null
+                    : _svc.PartyManager?.GetPartySnapshotByUser(
+                        session.Player.UserId);
+                var parsedDuplicateSelect = TryParseSelectDungeonRequest(
+                    body,
+                    out var duplicateSelectRequest);
+                if (parsedDuplicateSelect
+                    && ShouldIgnoreClearedAntonFollowerDuplicateSelect(
+                        predecessorRun,
+                        duplicateSelectParty,
+                        session?.Player?.UserId ?? 0,
+                        session?.SessionId ?? Guid.Empty,
+                        duplicateSelectRequest))
+                {
+                    FileLogger.Log(
+                        $"[{DungeonSharedServices.ProtocolLogName}] " +
+                        "SELECT_DUNGEON ignored settling Anton awakening " +
+                        $"follower duplicate: cid={session.Player.CharacterId} " +
+                        $"run={predecessorRun.RunId} " +
+                        $"party={duplicateSelectParty.PartyId} " +
+                        $"dungeon={duplicateSelectRequest.DungeonId} " +
+                        $"difficulty={duplicateSelectRequest.Difficulty}");
+                    return;
+                }
             }
             if (!expectedPredecessorIdentity.HasValue
                 && (predecessorRun != null
@@ -2107,6 +2242,12 @@ namespace DfoServer.Network.Handlers.Dungeon
             }
 
             var req = Network.Parsers.Dungeon.SelectDungeonRequest.Parse(body);
+            var eventEntryPlayer = session.Player;
+            var eventEntryAccount = session.Account;
+            var eventEntryGameSession = session.GameSession;
+            var eventEntryCharacterId = eventEntryPlayer.CharacterId;
+            var eventEntryUserId = eventEntryPlayer.UserId;
+            var eventEntryAccountId = eventEntryAccount?.AccountId ?? 0;
             var entryLimitDungeonId = req.DungeonId;
             if (anotherAradSelection.HasValue)
             {
@@ -2143,6 +2284,34 @@ namespace DfoServer.Network.Handlers.Dungeon
                 }
             }
 
+            if (!TryNormalizeEventDungeonRequest(session, ref req, out var eventEntryFailure))
+            {
+                FileLogger.Log($"[EventDungeonEntry] selection rejected cid={session.Player.CharacterId} "
+                    + $"dungeon={req.DungeonId} reason={eventEntryFailure}");
+                await RejectSelectionAsync(session, expectedSelection, header.type,
+                    DungeonAdmissionReject.DungeonUnavailable);
+                return;
+            }
+
+            Game.Guilds.GuildDungeonAdmissionSnapshot guildAdmission;
+            try
+            {
+                if (!_svc.GuildDungeons.TryPrepare(session.Player.CharacterId, session.Account?.AccountId ?? 0,
+                    req.DungeonId, req.Difficulty, session.Player.CurTownId, session.Player.CurAreaId,
+                    out guildAdmission, out var guildFailure))
+                {
+                    FileLogger.Log($"[GuildDungeon] selection rejected cid={session.Player.CharacterId} dungeon={req.DungeonId}: {guildFailure}");
+                    await RejectSelectionAsync(session, expectedSelection, header.type, DungeonAdmissionReject.DungeonUnavailable);
+                    return;
+                }
+            }
+            catch (Exception exception)
+            {
+                FileLogger.Log("[GuildDungeon] admission unavailable: " + exception.Message);
+                await RejectSelectionAsync(session, expectedSelection, header.type, DungeonAdmissionReject.DungeonUnavailable);
+                return;
+            }
+
             if (!anotherAradSelection.HasValue
                 && !WorldMap.IsStoryDungeon(req.DungeonId)
                 && !DungeonData.MeetsMinimumRequiredLevel(
@@ -2160,6 +2329,29 @@ namespace DfoServer.Network.Handlers.Dungeon
                     expectedSelection,
                     header.type,
                     DungeonAdmissionReject.DungeonUnavailable);
+                return;
+            }
+            if (!TryEvaluateAntonAwakeningEntry(
+                    session.Player.CharacterId,
+                    req.DungeonId,
+                    out var antonEntryValidation))
+            {
+                FileLogger.Log(
+                    $"[{DungeonSharedServices.ProtocolLogName}] " +
+                    $"SELECT_DUNGEON Anton admission rejected: " +
+                    $"cid={session.Player.CharacterId} " +
+                    $"dungeon={req.DungeonId} " +
+                    $"reason={antonEntryValidation.FailReason}");
+                await RejectSelectionAsync(
+                    session,
+                    expectedSelection,
+                    header.type,
+                    ResolveEntryAdmissionReject(
+                        antonEntryValidation,
+                        ResolvePartySlot(session)),
+                    antonEntryValidation,
+                    session,
+                    ResolvePartySlot(session));
                 return;
             }
 
@@ -2356,7 +2548,9 @@ namespace DfoServer.Network.Handlers.Dungeon
                     session,
                     entryParty,
                     _svc.Sessions,
-                    entryPartyMemberCount);
+                    entryPartyMemberCount,
+                    _svc.FatigueAcceleration,
+                    req.DungeonId);
             var isDimensionDungeon = DungeonData.IsDimensionDungeon(req.DungeonId);
             if (!await TryValidateEntryLimitAsync(
                     session,
@@ -2368,7 +2562,11 @@ namespace DfoServer.Network.Handlers.Dungeon
             }
 
             // 塔类副本分流: dungeonKind==1 走专属流程(NOTI 142+143, 非普通副本的 START_MAP)
-            if (_svc.DeathTower.TryCreateSession(req.DungeonId, out var tower))
+            if (_svc.DeathTower.TryCreateSession(
+                req.DungeonId,
+                (expectedSelection?.PartyCohort?.Participants.Select(member => member.UserId)
+                    ?? Enumerable.Empty<ushort>()).Append(session.Player.UserId),
+                out var tower))
             {
                 await DungeonMechanismCoordinator.ClearRunEffectsAsync(
                     session,
@@ -2495,6 +2693,8 @@ namespace DfoServer.Network.Handlers.Dungeon
             }
             var run = session.Player.CurrentRun;
             var runIdentity = run.CaptureIdentity();
+            if (guildAdmission != null && !run.Instance.TryFreezeGuildDungeonAdmission(guildAdmission))
+                throw new InvalidOperationException("Guild admission could not bind the selected physical instance.");
             run.AnotherAradActive = anotherAradSelection.HasValue;
             run.AnotherAradWrapperDungeonId = anotherAradSelection.HasValue
                 ? anotherAradSelection.Value.WrapperDungeonId
@@ -2513,9 +2713,7 @@ namespace DfoServer.Network.Handlers.Dungeon
             // The first A21 tutorial is a normal flow regardless of the
             // dungeon id selected by the character's job. Ignore stale hell
             // flags so they cannot alter its map projection.
-            run.HellMode = !isA21TutorialEntry
-                && req.HellPartyRequestFlag != 0
-                && DungeonData.IsHellDungeon(req.DungeonId);
+            run.HellMode = ShouldUseManualHellParty(req.DungeonId, isA21TutorialEntry, req.HellPartyRequestFlag);
 
             WarmUpDropConfigs(run.HellMode);
 
@@ -2680,16 +2878,38 @@ namespace DfoServer.Network.Handlers.Dungeon
                     entryLease,
                     entryPreparation,
                     out var partyEntryPlans,
-                    out var partyEntryRejection,
                     out var partyEntryFailure))
             {
                 await RejectPreparedPartyEntryAsync(
                     session,
                     header.type,
                     partyEntryPlans,
-                    partyEntryRejection,
                     partyEntryFailure);
                 return;
+            }
+            if (guildAdmission != null)
+            {
+                foreach (var plan in partyEntryPlans)
+                {
+                    var participantSession = plan.Session;
+                    var participantPlayer = participantSession.Player;
+                    var participantAccount = participantSession.Account;
+                    var participantGameSession = participantSession.GameSession;
+                    int participantId = participantPlayer.CharacterId;
+                    int participantAccountId = participantAccount?.AccountId ?? 0;
+                    ushort participantUid = participantPlayer.UserId;
+                    plan.Preparation.CostPlan.GuildDungeonSourceCurrent = () =>
+                        ReferenceEquals(participantSession.Player, participantPlayer)
+                        && ReferenceEquals(participantSession.Account, participantAccount)
+                        && ReferenceEquals(participantSession.GameSession, participantGameSession)
+                        && participantGameSession != null && participantAccountId > 0
+                        && participantAccount.AccountId == participantAccountId
+                        && participantPlayer.CharacterId == participantId && participantPlayer.UserId == participantUid
+                        && plan.Run != null && ReferenceEquals(plan.Run.Instance, run.Instance)
+                        && participantPlayer.IsCurrentDungeonRun(plan.Run.CaptureIdentity())
+                        && _svc.Sessions != null && _svc.Sessions.TryGet(participantId, out var currentParticipant)
+                        && ReferenceEquals(currentParticipant, participantSession);
+                }
             }
             if (!await TryPreparePartyDungeonEntryRunsAsync(
                     session,
@@ -2702,8 +2922,12 @@ namespace DfoServer.Network.Handlers.Dungeon
                     session,
                     header.type,
                     partyEntryPlans,
-                    DungeonAdmissionReject.InvalidSelectionState,
-                    "party_run_prepare_failed");
+                    new PartyEntryAdmissionFailure
+                    {
+                        Rejection =
+                            DungeonAdmissionReject.InvalidSelectionState,
+                        Reason = "party_run_prepare_failed",
+                    });
                 return;
             }
 
@@ -2724,6 +2948,32 @@ namespace DfoServer.Network.Handlers.Dungeon
 
             foreach (var plan in partyEntryPlans)
                 await NotifyTownAreaRosterDepartureAsync(plan.Session);
+
+            // Recheck the absolute opening and party state after asynchronous
+            // run preparation, before either existing debit owner commits.
+            var eventCommitFailure = string.Empty;
+            var eventSourceCurrent = (!IsManagedEventDungeon(run.DungeonId) && guildAdmission == null)
+                || (ReferenceEquals(session.Player, eventEntryPlayer)
+                    && ReferenceEquals(session.Account, eventEntryAccount)
+                    && ReferenceEquals(session.GameSession, eventEntryGameSession)
+                    && eventEntryGameSession != null
+                    && eventEntryPlayer.CharacterId == eventEntryCharacterId
+                    && eventEntryPlayer.UserId == eventEntryUserId
+                    && eventEntryAccountId > 0 && session.Account.AccountId == eventEntryAccountId
+                    && session.Player.IsCurrentDungeonRun(runIdentity)
+                    && _svc.Sessions != null
+                    && _svc.Sessions.TryGet(eventEntryCharacterId, out var currentEventSession)
+                    && ReferenceEquals(currentEventSession, session));
+            if (!eventSourceCurrent
+                || !TryValidateEventDungeonEntry(session, run, out eventCommitFailure))
+            {
+                if (!eventSourceCurrent) eventCommitFailure = "entry_source_changed";
+                FileLogger.Log($"[EventDungeonEntry] commit rejected cid={eventEntryCharacterId} "
+                    + $"dungeon={run.DungeonId} reason={eventCommitFailure}");
+                await ReturnPreparedPartyRunsToTownAsync(session, header.type, partyEntryPlans,
+                    DungeonAdmissionReject.DungeonUnavailable, "event_window_or_party_changed");
+                return;
+            }
 
             // 暗精灵遗迹入场在组队费用提交前最后提交; 此后任何失败路径都必须回滚 licensed entry
             var licensedCommittedStatus = default(LicensedDungeonStatus);
@@ -2949,6 +3199,14 @@ namespace DfoServer.Network.Handlers.Dungeon
                     "leader_start_map_projection_failed");
                 return;
             }
+            if (!session.Player.IsCurrentDungeonRun(runIdentity))
+                return;
+
+            if (_svc.EventDungeons.IsManagedDungeon(run.DungeonId)
+                && _svc.EventDungeonCountsChanged != null)
+                await _svc.EventDungeonCountsChanged(session);
+            if (run.DungeonId == EpicRoadEntryService.DungeonId && _svc.AccountDungeonCountsChanged != null)
+                await _svc.AccountDungeonCountsChanged(session);
             if (!session.Player.IsCurrentDungeonRun(runIdentity))
                 return;
 
@@ -3295,15 +3553,18 @@ namespace DfoServer.Network.Handlers.Dungeon
                     run,
                     req.DungeonId,
                     selectedMazeIndex);
-            if (StrikerSupportTagCharacterPacketBuilder.TryBuildOwnerSupportBody(
-                    s.Player.CharacterId,
+            if (StrikerSupportTagCharacterPacketBuilder.TryBuildPartySupportBody(
+                    ResolveStrikerSupportOwnerIds(s, run),
                     _svc.Database,
                     out var strikerBody))
-                await s.SendPacketAsync(GamePacketEnvelopeBuilder.Build(0x00, 0x019F, strikerBody));
+                await s.SendPacketAsync(GamePacketEnvelopeBuilder.Build(
+                    0x00,
+                    (ushort)NotiPacketTypeA21.TAG_CHARACTER_INFO,
+                    strikerBody));
             else
                 await s.SendPacketAsync(GamePacketEnvelopeBuilder.Build(
                     0x00,
-                    0x019F,
+                    (ushort)NotiPacketTypeA21.TAG_CHARACTER_INFO,
                     StrikerSupportTagCharacterBodyBuilder.BuildEmptyBody()));
             if (!s.Player.IsCurrentDungeonRun(runIdentity)
                 || !run.IsCurrentLoadingProjection(loadingProjectionId))
@@ -3366,6 +3627,23 @@ namespace DfoServer.Network.Handlers.Dungeon
             return true;
         }
 
+        // 进本 0x019F 需要覆盖全队：每个队员的客户端都按 mappedCharacterId
+        // （= 成员 cid）查本地表来渲染队友支援兵。名单优先取进本时冻结的
+        // selection cohort（leader/follower 的 run 挂同一对象，见
+        // DungeonRunLifecycle.BeginRunFromSelection）；单人进本无 cohort，只发本人。
+        private static IReadOnlyList<int> ResolveStrikerSupportOwnerIds(
+            EnhancedClientSession s,
+            DungeonRun run)
+        {
+            var cohort = run?.EntryPartySelectionCohort;
+            if (cohort == null)
+                return new[] { s.Player.CharacterId };
+            return cohort.Participants
+                .OrderBy(participant => participant.SlotIndex)
+                .Select(participant => participant.CharacterId)
+                .ToList();
+        }
+
         private bool TryBuildPartyEntryAdmissionPlans(
             EnhancedClientSession leader,
             DungeonRun leaderRun,
@@ -3373,18 +3651,16 @@ namespace DfoServer.Network.Handlers.Dungeon
             InventoryLease leaderLease,
             DungeonEntryAdmissionPreparation leaderPreparation,
             out List<PartyEntryAdmissionPlan> plans,
-            out DungeonAdmissionReject rejection,
-            out string failureReason)
+            out PartyEntryAdmissionFailure failure)
         {
             plans = new List<PartyEntryAdmissionPlan>();
-            rejection = DungeonAdmissionReject.InvalidSelectionState;
-            failureReason = string.Empty;
+            failure = new PartyEntryAdmissionFailure();
             if (leader?.Player == null
                 || leaderRun == null
                 || leaderLease == null
                 || leaderPreparation == null)
             {
-                failureReason = "leader_preparation_missing";
+                failure.Reason = "leader_preparation_missing";
                 return false;
             }
             plans.Add(new PartyEntryAdmissionPlan
@@ -3403,7 +3679,7 @@ namespace DfoServer.Network.Handlers.Dungeon
             if (_svc.Sessions == null
                 || cohort.LeaderUserId != leader.Player.UserId)
             {
-                failureReason = "party_cohort_unavailable";
+                failure.Reason = "party_cohort_unavailable";
                 return false;
             }
 
@@ -3422,7 +3698,7 @@ namespace DfoServer.Network.Handlers.Dungeon
                     || !candidate.TcpClient.Connected
                     || candidate.Player.CurrentRun != null)
                 {
-                    failureReason =
+                    failure.Reason =
                         $"session_mismatch_uid_{participant.UserId}";
                     return false;
                 }
@@ -3440,11 +3716,14 @@ namespace DfoServer.Network.Handlers.Dungeon
                         out validation,
                         requireCurrentRun: false))
                 {
-                    rejection = ResolveEntryAdmissionReject(
+                    failure.Rejection = ResolveEntryAdmissionReject(
                         validation,
                         participant.SlotIndex);
-                    failureReason = validation?.FailReason
+                    failure.Reason = validation?.FailReason
                         ?? $"selection_mismatch_uid_{participant.UserId}";
+                    failure.MemberSession = candidate;
+                    failure.MemberSlot = participant.SlotIndex;
+                    failure.Validation = validation;
                     return false;
                 }
                 plans.Add(new PartyEntryAdmissionPlan
@@ -3459,7 +3738,7 @@ namespace DfoServer.Network.Handlers.Dungeon
 
             if (plans.Count != cohort.Participants.Count)
             {
-                failureReason = "party_plan_count_mismatch";
+                failure.Reason = "party_plan_count_mismatch";
                 return false;
             }
             plans.Sort((left, right) =>
@@ -3513,8 +3792,6 @@ namespace DfoServer.Network.Handlers.Dungeon
         {
             if (body == null || body.Length <= 13)
                 return false;
-
-            // A21 客户端 VERY_DIFFICULT_HELL_PARTY: body[12] 固定为7, body[13] 为0表示勾选, 为1表示取消。
             return body[13] == 0;
         }
 
@@ -3704,6 +3981,22 @@ namespace DfoServer.Network.Handlers.Dungeon
                     EntryCostFailureKind.InvalidState);
                 return false;
             }
+            if (!TryValidateEventDungeonEntry(session, run, out var eventEntryFailure))
+            {
+                validation = new EntryCostResult().Fail(
+                    "event dungeon " + eventEntryFailure, EntryCostFailureKind.MissingPermission);
+                return false;
+            }
+            var guildDefinition = DungeonData.GetDungeonFile(run.DungeonId);
+            if (guildDefinition?.GuildDungeonDefinitionValid != true
+                || ((guildDefinition.GuildDungeon == true || _svc.GuildDungeons.Catalog.IsManagedDungeon(run.DungeonId))
+                    && (run.Instance.GuildDungeonAdmission == null
+                        || !_svc.GuildDungeons.ValidateParticipant(session.Player.CharacterId,
+                            session.Account?.AccountId ?? 0, run.Instance.GuildDungeonAdmission))))
+            {
+                validation = new EntryCostResult().Fail("guild membership or conquest unavailable", EntryCostFailureKind.MissingPermission);
+                return false;
+            }
             if (!WorldMap.IsStoryDungeon(run.DungeonId)
                 && !DungeonData.MeetsMinimumRequiredLevel(
                     run.DungeonId,
@@ -3722,6 +4015,13 @@ namespace DfoServer.Network.Handlers.Dungeon
                 validation = new EntryCostResult().Fail(
                     "mercenary content restricted",
                     EntryCostFailureKind.MissingPermission);
+                return false;
+            }
+            if (!TryEvaluateAntonAwakeningEntry(
+                    session.Player.CharacterId,
+                    run.DungeonId,
+                    out validation))
+            {
                 return false;
             }
             if (!TryLoadEntryQuestSets(
@@ -3784,6 +4084,167 @@ namespace DfoServer.Network.Handlers.Dungeon
                 return false;
             }
             return true;
+        }
+
+        internal bool TryNormalizeEventDungeonRequest(
+            EnhancedClientSession session,
+            ref SelectDungeonRequest request,
+            out string reason)
+        {
+            reason = string.Empty;
+            if (request.DungeonId == EpicRoadEntryService.DungeonId)
+            {
+                if (!TryValidateEpicRoadEntry(session, request.Difficulty, out var epicDifficulty, out reason))
+                    return false;
+                request = new SelectDungeonRequest(request.DungeonId, epicDifficulty,
+                    request.Flag1, request.Flag2, request.A21Sentinel,
+                    request.TrailingLength, request.HasNonZeroTrailingBytes);
+                return true;
+            }
+            if (!_svc.EventDungeons.IsManagedDungeon(request.DungeonId))
+                return true;
+            if (!TryValidateEventDungeonEntry(session, request.DungeonId,
+                    out var difficulty, out reason))
+                return false;
+            request = new SelectDungeonRequest(request.DungeonId, difficulty,
+                request.Flag1, request.Flag2, request.A21Sentinel,
+                request.TrailingLength, request.HasNonZeroTrailingBytes);
+            return true;
+        }
+
+        private bool TryValidateEventDungeonEntry(
+            EnhancedClientSession session, DungeonRun run, out string reason)
+        {
+            reason = string.Empty;
+            if (run.DungeonId == EpicRoadEntryService.DungeonId)
+                return TryValidateEpicRoadEntry(session, run.Difficulty, out var epicDifficulty, out reason)
+                    && run.Difficulty == epicDifficulty;
+            if (!_svc.EventDungeons.IsManagedDungeon(run.DungeonId))
+                return true;
+            return TryValidateEventDungeonEntry(session, run.DungeonId,
+                    out var difficulty, out reason)
+                && (run.Difficulty == difficulty || FailDifficulty(out reason));
+
+            static bool FailDifficulty(out string failure)
+            {
+                failure = "designated_difficulty_changed";
+                return false;
+            }
+        }
+
+        private bool IsManagedEventDungeon(int dungeonId)
+            => dungeonId == EpicRoadEntryService.DungeonId || _svc.EventDungeons.IsManagedDungeon(dungeonId);
+
+        internal static bool ShouldUseManualHellParty(int dungeonId, bool isTutorial, byte requestFlag)
+            // This activity's hell actors belong to its native Boss MAPs.
+            // The WDM hell icon does not define a manual party room/ticket.
+            => !isTutorial && dungeonId != EpicRoadEntryService.DungeonId
+                && requestFlag != 0 && DungeonData.IsHellDungeon(dungeonId);
+
+        private bool TryValidateEpicRoadEntry(EnhancedClientSession session, byte requestedDifficulty,
+            out byte difficulty, out string reason)
+        {
+            difficulty = 0;
+            reason = "epic_road_unavailable";
+            var player = session?.Player;
+            var service = _svc.EpicRoadEntry;
+            if (player == null || service == null || !service.TryValidateDungeon(player.Level,
+                    _svc.PartyManager?.GetPartyByUser(player.UserId)?.Count ?? 1,
+                    player.CurTownId, player.CurAreaId, requestedDifficulty, out difficulty, out reason))
+                return false;
+            try
+            {
+                var cleared = new QuestRepository(_svc.ConnectionString).LoadClearedFlags(player.CharacterId);
+                reason = TownAreaPermissionPolicy.GetDenyReason(service.Definition.TargetPermission,
+                    player.Level, quest => cleared.ContainsKey(quest));
+                if (reason != null)
+                    return false;
+                return AccountDungeonCountProjection.TryCreate(EpicRoadEntryService.DungeonId,
+                    service.Definition.AccountMaximumCount,
+                    _svc.EntryLimits.LoadSpecialDungeonLimits(session.Account?.AccountId ?? 0, player.CharacterId),
+                    out _, out reason);
+            }
+            catch (Exception exception) when (exception is Microsoft.Data.Sqlite.SqliteException
+                or InvalidOperationException or System.IO.IOException)
+            {
+                FileLogger.Log($"[EpicRoad] entry state unavailable cid={player.CharacterId}: {exception.Message}");
+                reason = "epic_road_entry_state_unavailable";
+                return false;
+            }
+        }
+
+        private bool TryValidateEventDungeonEntry(
+            EnhancedClientSession session, int dungeonId, out byte difficulty, out string reason)
+        {
+            difficulty = 0;
+            reason = string.Empty;
+            var player = session?.Player;
+            if (player == null)
+            {
+                reason = "event_character_unavailable";
+                return false;
+            }
+            if (!_svc.EventDungeons.TryValidateEntry(dungeonId,
+                    player.Level, _svc.PartyManager?.GetPartyByUser(player.UserId)?.Count ?? 1,
+                    DateTimeOffset.UtcNow, out difficulty, out reason))
+                return false;
+            if (dungeonId != Game.Events.ScheduledDungeons.EventDungeonOpeningService.GoldSilverDungeonId)
+                return true;
+            try
+            {
+                var limits = _svc.EntryLimits.LoadSpecialDungeonLimits(
+                    session.Account?.AccountId ?? 0, player.CharacterId);
+                return Game.Events.ScheduledDungeons.GoldSilverHornCountProjection.TryCreate(
+                    _svc.EventDungeons.GoldSilverConfiguration, limits,
+                    out _, out _, out reason);
+            }
+            catch (Exception ex) when (ex is Microsoft.Data.Sqlite.SqliteException
+                or InvalidOperationException or System.IO.IOException)
+            {
+                FileLogger.Log($"[EventDungeonEntry] limit read failed cid={player.CharacterId}: {ex}");
+                reason = "gold_silver_limit_unavailable";
+                return false;
+            }
+        }
+
+        private bool TryEvaluateAntonAwakeningEntry(
+            int characterId,
+            int dungeonId,
+            out EntryCostResult validation)
+        {
+            validation = null;
+            try
+            {
+                var anton = _svc.PersistentMechanisms.EvaluateEntryAdmission(
+                    characterId,
+                    dungeonId);
+                if (anton.Allowed)
+                    return true;
+
+                if (anton.Status == AntonAwakeningAdmissionStatus.InvalidState)
+                {
+                    validation = new EntryCostResult().Fail(
+                        "anton awakening admission is ambiguous",
+                        EntryCostFailureKind.InvalidState);
+                    return false;
+                }
+
+                validation = new EntryCostResult().FailMissingPrerequisites(
+                    dungeonId,
+                    anton.MissingDungeonIds);
+                return false;
+            }
+            catch (Exception ex)
+            {
+                FileLogger.Log(
+                    $"[AntonAwakeningProgress] admission unavailable: " +
+                    $"cid={characterId} dungeon={dungeonId} " +
+                    $"error={ex.Message}");
+                validation = new EntryCostResult().Fail(
+                    "anton awakening progress unavailable",
+                    EntryCostFailureKind.InvalidState);
+                return false;
+            }
         }
 
         private bool TryLoadEntryQuestSets(
@@ -4017,9 +4478,12 @@ namespace DfoServer.Network.Handlers.Dungeon
             EnhancedClientSession leader,
             ushort wireType,
             IReadOnlyList<PartyEntryAdmissionPlan> plans,
-            DungeonAdmissionReject rejection,
-            string reason)
+            PartyEntryAdmissionFailure failure)
         {
+            failure ??= new PartyEntryAdmissionFailure
+            {
+                Reason = "party_entry_failure_missing",
+            };
             DungeonSelectionContext leaderSelection = null;
             if (plans != null)
             {
@@ -4044,10 +4508,13 @@ namespace DfoServer.Network.Handlers.Dungeon
             }
             try
             {
-                await _svc.AdmissionRejects.SendAsync(
+                await SendEntryAdmissionRejectProjectionAsync(
                     leader,
                     wireType,
-                    rejection);
+                    failure.Rejection,
+                    failure.MemberSession,
+                    failure.MemberSlot,
+                    failure.Validation);
             }
             catch (Exception ex)
             {
@@ -4059,7 +4526,8 @@ namespace DfoServer.Network.Handlers.Dungeon
             FileLogger.Log(
                 $"[{DungeonSharedServices.ProtocolLogName}] " +
                 $"PARTY_DUNGEON_COOP rejected: " +
-                $"cid={leader?.Player?.CharacterId ?? 0} reason={reason}");
+                $"cid={leader?.Player?.CharacterId ?? 0} " +
+                $"reason={failure.Reason}");
             if (leaderSelection?.PartyCohort?.ReturnToTownOnEntryReject == true
                 && _returnRejectedPartySelectionToTown != null)
             {
@@ -4306,13 +4774,13 @@ namespace DfoServer.Network.Handlers.Dungeon
                 return true;
             }
 
-            if (!_svc.EntryLimits.TryConsumeSpecialDungeonLimit(
-                    accountId,
-                    characterId,
-                    entryLimitDungeonId,
-                    1,
-                    out var result)
-                || result?.Allowed != true)
+            DungeonEntryLimitConsumeResult result;
+            var consumed = entryLimitDungeonId == EpicRoadEntryService.DungeonId
+                ? _svc.EntryLimits.TryConsumeAccountDungeonLimit(accountId, characterId,
+                    entryLimitDungeonId, _svc.EpicRoadEntry?.Definition.AccountMaximumCount ?? 0, out result)
+                : _svc.EntryLimits.TryConsumeSpecialDungeonLimit(accountId, characterId,
+                    entryLimitDungeonId, 1, out result);
+            if (!consumed || result?.Allowed != true)
             {
                 FileLogger.Log(
                     $"[{DungeonSharedServices.ProtocolLogName}] " +
@@ -4418,14 +4886,20 @@ namespace DfoServer.Network.Handlers.Dungeon
             EnhancedClientSession session,
             DungeonSelectionContext selection,
             ushort wireType,
-            DungeonAdmissionReject rejection)
+            DungeonAdmissionReject rejection,
+            EntryCostResult validation = null,
+            EnhancedClientSession failedMember = null,
+            byte failedMemberSlot = 0)
         {
             try
             {
-                await _svc.AdmissionRejects.SendAsync(
+                await SendEntryAdmissionRejectProjectionAsync(
                     session,
                     wireType,
-                    rejection);
+                    rejection,
+                    failedMember,
+                    failedMemberSlot,
+                    validation);
             }
             catch (Exception ex)
             {
@@ -4442,6 +4916,89 @@ namespace DfoServer.Network.Handlers.Dungeon
                     session,
                     selection);
             }
+        }
+
+        internal static string ResolveDungeonDisplayName(int dungeonId)
+        {
+            if (dungeonId <= 0)
+                return string.Empty;
+
+            try
+            {
+                return DungeonData.GetDungeonFile(dungeonId)?.Name?.Trim()
+                    ?? string.Empty;
+            }
+            catch (Exception ex)
+            {
+                FileLogger.Log(
+                    $"[{DungeonSharedServices.ProtocolLogName}] " +
+                    "dungeon display name lookup failed: " +
+                    $"dungeon={dungeonId} error={ex.Message}");
+                return string.Empty;
+            }
+        }
+
+        private async Task SendEntryAdmissionRejectProjectionAsync(
+            EnhancedClientSession recipient,
+            ushort wireType,
+            DungeonAdmissionReject rejection,
+            EnhancedClientSession failedMember,
+            byte failedMemberSlot,
+            EntryCostResult validation)
+        {
+            var memberName = failedMember?.Player?.Name == null
+                ? string.Empty
+                : ClientTextEncoding.GetString(failedMember.Player.Name);
+            var targetDungeonName = string.Empty;
+            IReadOnlyList<string> missingPrerequisiteDungeonNames =
+                Array.Empty<string>();
+            if (validation?.FailureKind
+                == EntryCostFailureKind.MissingPrerequisite)
+            {
+                targetDungeonName = ResolveDungeonDisplayName(
+                    validation.TargetDungeonId);
+                missingPrerequisiteDungeonNames = validation
+                    .MissingPrerequisiteDungeonIds
+                    .Select(ResolveDungeonDisplayName)
+                    .ToArray();
+            }
+            var presentation =
+                SequentialDungeonAdmissionRejectPolicy.Resolve(
+                    validation,
+                    memberName,
+                    failedMemberSlot,
+                    SequentialDungeonDefinitionCatalog.Current,
+                    targetDungeonName,
+                    missingPrerequisiteDungeonNames);
+            if (validation?.FailureKind
+                == EntryCostFailureKind.MissingPrerequisite)
+            {
+                FileLogger.Log(
+                    $"[{DungeonSharedServices.ProtocolLogName}] " +
+                    $"sequential prerequisite rejection: " +
+                    $"leaderCid={recipient?.Player?.CharacterId ?? 0} " +
+                    $"memberCid=" +
+                    $"{failedMember?.Player?.CharacterId ?? 0} " +
+                    $"memberName={memberName} " +
+                    $"memberSlot={failedMemberSlot} " +
+                    $"target={validation.TargetDungeonId} " +
+                    $"missing={string.Join(",", validation.MissingPrerequisiteDungeonIds)} " +
+                    $"projection={presentation.Projection}");
+            }
+
+            await _svc.AdmissionRejects.SendAsync(
+                recipient,
+                wireType,
+                rejection,
+                presentation.Projection);
+            if (!presentation.HasNotice || recipient == null)
+                return;
+
+            await recipient.SendPacketAsync(GamePacketEnvelopeBuilder.Build(
+                0x00,
+                (ushort)NotiPacketTypeA21.SERVER_NOTICE_MESSAGE,
+                ServerNoticeMessageBuilder.Build(
+                    presentation.NoticeMessage)));
         }
 
         private void RollbackLicensedDungeonEntry(
@@ -4472,6 +5029,8 @@ namespace DfoServer.Network.Handlers.Dungeon
             {
                 case EntryCostFailureKind.MissingRequiredItem:
                     return DungeonAdmissionReject.MissingRequiredItem(memberSlot);
+                case EntryCostFailureKind.MissingPrerequisite:
+                    return DungeonAdmissionReject.MissingPrerequisite(memberSlot);
                 case EntryCostFailureKind.MissingPermission:
                     return DungeonAdmissionReject.MissingPermission(memberSlot);
                 case EntryCostFailureKind.Unavailable:
@@ -4563,7 +5122,6 @@ namespace DfoServer.Network.Handlers.Dungeon
 
         // 城镇残留白影修复(与切区域同一机制, 见 TownAreaRosterDepartureNotifier):
         // 进本提交后玩家离开城镇, 向旧区域广播离开者 USER_AREA(0x0017) 远程移除。
-        // 不得广播 AREA_USERS(0x0018)：已在场客户端会 setDrawLoadingMode 并关掉界面。
         private async Task NotifyTownAreaRosterDepartureAsync(
             EnhancedClientSession session)
         {

@@ -99,6 +99,8 @@ namespace DfoServer.Game.Mailbox
     public sealed class MailboxSendResult
     {
         public bool Success { get; set; }
+        // 已提交的同一幂等发送，不应重复产生新邮件通知。
+        public bool AlreadyExists { get; set; }
         public MailboxSendError Error { get; set; }
         public long MessageId { get; set; }
         public int FeeGold { get; set; }
@@ -136,11 +138,13 @@ namespace DfoServer.Game.Mailbox
         public MailboxSendError Error { get; set; }
         public long MessageId { get; set; }
         public int ClaimedGold { get; set; }
+        public int ClaimedTokenCera { get; set; }
         public int ClaimedAttachmentCount { get; set; }
         public bool RemovedFromInbox { get; set; }
         public IReadOnlyList<short> UpdatedMainSlots { get; set; } = Array.Empty<short>();
         public IReadOnlyList<short> UpdatedAvatarSlots { get; set; } = Array.Empty<short>();
         public IReadOnlyList<short> UpdatedPetSlots { get; set; } = Array.Empty<short>();
+        public IReadOnlyList<short> UpdatedGuildMedalSlots { get; set; } = Array.Empty<short>();
         public IReadOnlyList<InventoryMutationResult> InventoryMutations { get; set; } =
             Array.Empty<InventoryMutationResult>();
 

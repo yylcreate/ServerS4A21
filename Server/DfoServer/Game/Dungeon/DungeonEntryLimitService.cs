@@ -189,6 +189,51 @@ namespace DfoServer.Game.Dungeon
             _utcNowProvider = utcNowProvider ?? (() => DateTime.UtcNow);
         }
 
+        // Resource initialization uses the existing configuration/record owner.
+        // Preserve an operator's existing row; admission rejects incompatible
+        // scope or counts instead of silently rewriting live progress.
+        internal void EnsureAccountDungeonLimit(int dungeonId, int maximumCount)
+        {
+            if (dungeonId <= 0 || maximumCount <= 0 || maximumCount > byte.MaxValue)
+                throw new ArgumentOutOfRangeException(nameof(maximumCount));
+            using var connection = new SqliteConnection(_connectionString);
+            connection.Open();
+            using var transaction = connection.BeginTransaction();
+            using var command = connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = @"
+INSERT OR IGNORE INTO dungeon_limit_config(dgn_id, scope_type, limit_count, enabled, sort_order)
+VALUES(@dungeonId, 'account', @maximumCount, 1, @dungeonId);";
+            command.Parameters.AddWithValue("@dungeonId", dungeonId);
+            command.Parameters.AddWithValue("@maximumCount", maximumCount);
+            command.ExecuteNonQuery();
+            transaction.Commit();
+        }
+
+        internal bool TryConsumeAccountDungeonLimit(int accountId, int characterId,
+            int dungeonId, int maximumCount, out DungeonEntryLimitConsumeResult result)
+        {
+            result = DungeonEntryLimitConsumeResult.Reject(dungeonId, "account_count_unavailable");
+            using var connection = new SqliteConnection(_connectionString);
+            connection.Open();
+            using var transaction = connection.BeginTransaction();
+            // The expected scope and resource maximum are checked inside the
+            // same transaction as consumption. A changed/disabled config must
+            // never fall through the generic owner's unlimited fallback.
+            if (!AccountDungeonCountProjection.TryCreate(dungeonId, maximumCount,
+                    LoadSpecialDungeonLimits(connection, transaction, accountId, characterId),
+                    out _, out var reason))
+            {
+                result = DungeonEntryLimitConsumeResult.Reject(dungeonId, reason);
+                return false;
+            }
+            if (!TryConsumeSpecialDungeonLimit(connection, transaction,
+                    accountId, characterId, dungeonId, 1, out result) || result?.IsLimited != true)
+                return false;
+            transaction.Commit();
+            return true;
+        }
+
         internal IReadOnlyList<SpecialDungeonEntryLimitSnapshot>
             LoadSpecialDungeonLimits(int accountId, int characterId)
         {
@@ -695,7 +740,7 @@ namespace DfoServer.Game.Dungeon
             return true;
         }
 
-        private int CurrentDayId()
+        internal int CurrentDayId()
             => DailyResetService.TodayId(_utcNowProvider());
 
         private static int ResolveRecordCharacterId(

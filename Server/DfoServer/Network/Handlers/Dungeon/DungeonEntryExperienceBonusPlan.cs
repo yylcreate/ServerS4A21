@@ -1,4 +1,6 @@
 using DfoServer.Game.Dungeon;
+using DfoServer.Game.Events.FatigueAcceleration;
+using DfoServer.Game.Inventory;
 using DfoServer.Game.Party;
 using DfoServer.Game.Session;
 using System;
@@ -30,10 +32,15 @@ namespace DfoServer.Network.Handlers.Dungeon
             EnhancedClientSession leader,
             Party party,
             ISessionDirectory sessions,
-            int partyMemberCount)
+            int partyMemberCount,
+            FatigueAccelerationEntryService fatigueAcceleration = null,
+            int dungeonId = 0)
         {
             var participants = new Dictionary<int, CapturedParticipant>();
-            CaptureParticipant(leader, expectedSessionId: null, participants);
+            var dungeon = fatigueAcceleration == null ? null
+                : GameWorld.Dungeon.GetDungeonFile(dungeonId);
+            CaptureParticipant(leader, expectedSessionId: null, participants,
+                fatigueAcceleration, dungeonId, dungeon);
 
             if (party != null)
             {
@@ -54,7 +61,7 @@ namespace DfoServer.Network.Handlers.Dungeon
                         member.SessionId == Guid.Empty
                             ? null
                             : member.SessionId,
-                        participants);
+                        participants, fatigueAcceleration, dungeonId, dungeon);
                 }
             }
 
@@ -79,7 +86,10 @@ namespace DfoServer.Network.Handlers.Dungeon
             var characterId = session?.Player?.CharacterId ?? 0;
             if (characterId <= 0
                 || !_participants.TryGetValue(characterId, out var participant)
-                || participant.SessionId != session.SessionId)
+                || participant.SessionId != session.SessionId
+                || !ReferenceEquals(participant.GameSession, session.GameSession)
+                || (participant.FactsCaptured && !InventoryContext.IsCurrentLease(
+                    participant.InventoryLease, session.SessionId, characterId)))
             {
                 return DungeonParticipantExperienceBonusSnapshot.None;
             }
@@ -89,13 +99,18 @@ namespace DfoServer.Network.Handlers.Dungeon
             return new DungeonParticipantExperienceBonusSnapshot(
                 PartyMemberCount,
                 PartyHasEquippedAvatar,
-                hasEquippedCreature);
+                hasEquippedCreature,
+                fatigueBurnExperienceBonusPercent: participant.Effects.ExperienceBonusPercent,
+                fatigueConsumptionMultiplier: participant.Effects.FatigueConsumptionMultiplier);
         }
 
         private static void CaptureParticipant(
             EnhancedClientSession session,
             Guid? expectedSessionId,
-            IDictionary<int, CapturedParticipant> participants)
+            IDictionary<int, CapturedParticipant> participants,
+            FatigueAccelerationEntryService fatigueAcceleration,
+            int dungeonId,
+            PvfLib.DungeonFile dungeon)
         {
             var characterId = session?.Player?.CharacterId ?? 0;
             if (characterId <= 0
@@ -110,26 +125,43 @@ namespace DfoServer.Network.Handlers.Dungeon
                 .TryCaptureOwned(
                     session.SessionId,
                     characterId,
-                    out var facts);
+                    out var facts,
+                    out var lease);
             participants[characterId] = new CapturedParticipant(
                 session.SessionId,
+                session.GameSession,
+                captured ? lease : null,
                 captured ? facts : default,
-                captured);
+                captured,
+                captured && fatigueAcceleration != null
+                    ? fatigueAcceleration.CaptureEffects(
+                        session.GameSession?.FatigueAcceleration,
+                        characterId, dungeonId, dungeon)
+                    : FatigueAccelerationEffectProfile.Inactive);
         }
 
         private readonly struct CapturedParticipant
         {
             internal CapturedParticipant(
                 Guid sessionId,
+                GameSession gameSession,
+                InventoryLease inventoryLease,
                 DungeonParticipantEquipmentBonusFacts facts,
-                bool factsCaptured)
+                bool factsCaptured,
+                FatigueAccelerationEffectProfile effects)
             {
                 SessionId = sessionId;
+                GameSession = gameSession;
+                InventoryLease = inventoryLease;
                 Facts = facts;
                 FactsCaptured = factsCaptured;
+                Effects = effects;
             }
 
             internal Guid SessionId { get; }
+            internal GameSession GameSession { get; }
+            internal InventoryLease InventoryLease { get; }
+            internal FatigueAccelerationEffectProfile Effects { get; }
             internal DungeonParticipantEquipmentBonusFacts Facts { get; }
             internal bool FactsCaptured { get; }
         }

@@ -7,6 +7,9 @@ namespace DfoServer.Game.SelectCharacter
     {
         public const int DailyChallengeClaimFlagCount = 5;
 
+        // Both login projections consume one catalog read for this selection.
+        internal Events.GameEventInfoSnapshot EventInfoSnapshot { get; set; }
+
         public ExpertJobInfoSnapshot ExpertJobInfo { get; set; } = new ExpertJobInfoSnapshot();
 
         public ItemLockListSnapshot ItemLockList { get; set; } = new ItemLockListSnapshot();
@@ -107,6 +110,9 @@ namespace DfoServer.Game.SelectCharacter
 
         
         public ushort LuckyStar { get; set; }
+
+        // Account-owned durable progress; this snapshot only projects the UI.
+        public int SeriaLuckValue { get; set; }
 
         
         public ushort FatigueAccelValue { get; set; }

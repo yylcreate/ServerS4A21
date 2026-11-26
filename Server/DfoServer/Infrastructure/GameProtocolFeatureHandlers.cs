@@ -29,7 +29,12 @@ namespace DfoServer.Infrastructure
             EventJoustHandler eventJoust,
             EventPcRoomTimePointHandler eventPcRoomTimePoint,
             EventDailyAttendanceAnytimeHandler eventDailyAttendanceAnytime,
-            EventTotalAttendanceHandler eventTotalAttendance)
+            EventTotalAttendanceHandler eventTotalAttendance,
+            NpcFavorHandler npcFavor,
+            EventFatigueAccelerationHandler eventFatigueAcceleration,
+            AuctionHandler auction,
+            GuardianAltarOpeningCoordinator guardianAltarOpening = null,
+            EventDungeonOpeningCoordinator eventDungeons = null)
         {
             LotteryItem = lotteryItem
                 ?? throw new ArgumentNullException(nameof(lotteryItem));
@@ -68,6 +73,13 @@ namespace DfoServer.Infrastructure
                     nameof(eventDailyAttendanceAnytime));
             EventTotalAttendance = eventTotalAttendance
                 ?? throw new ArgumentNullException(nameof(eventTotalAttendance));
+            NpcFavor = npcFavor
+                ?? throw new ArgumentNullException(nameof(npcFavor));
+            EventFatigueAcceleration = eventFatigueAcceleration
+                ?? throw new ArgumentNullException(nameof(eventFatigueAcceleration));
+            Auction = auction ?? throw new ArgumentNullException(nameof(auction));
+            GuardianAltarOpening = guardianAltarOpening;
+            EventDungeons = eventDungeons;
         }
 
         internal LotteryItemHandler LotteryItem { get; }
@@ -112,5 +124,15 @@ namespace DfoServer.Infrastructure
             EventDailyAttendanceAnytime { get; }
 
         internal EventTotalAttendanceHandler EventTotalAttendance { get; }
+
+        internal NpcFavorHandler NpcFavor { get; }
+
+        internal EventFatigueAccelerationHandler EventFatigueAcceleration { get; }
+
+        internal AuctionHandler Auction { get; }
+
+        internal GuardianAltarOpeningCoordinator GuardianAltarOpening { get; }
+
+        internal EventDungeonOpeningCoordinator EventDungeons { get; }
     }
 }

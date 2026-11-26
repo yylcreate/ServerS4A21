@@ -1,4 +1,5 @@
 using DfoServer.Game.Inventory;
+using DfoServer.Game.Events.SeriaLuck;
 using DfoServer.Game.SelectCharacter;
 using DfoServer.Game.Session;
 using DfoServer.Infrastructure;
@@ -28,6 +29,12 @@ namespace DfoServer.Network.Builders
         public InitPacketBuilderRegistry(
             IGameDatabase database,
             ISessionDirectory sessions)
+            : this(database, sessions, null)
+        {
+        }
+
+        internal InitPacketBuilderRegistry(IGameDatabase database,
+            ISessionDirectory sessions, SeriaLuckUiService seriaLuckUi)
         {
             _database = database ?? throw new ArgumentNullException(nameof(database));
             var collectBoxProgressRepository = new CollectBoxProgressRepository(
@@ -35,9 +42,11 @@ namespace DfoServer.Network.Builders
 
             Register(new SkillInfoBodyBuilder());              
             Register(new DarkKnightComboSkillInfoBodyBuilder());
-            Register(new QuestListBodyBuilder());              
+            Register(new QuestListBodyBuilder(_database));
             Register(new UserInfoBodyBuilder());
             Register(new UserStateInitBodyBuilder());
+            Register(new Pvp.PvpRecordBodyBuilder(_database));
+            Register(new Pvp.PvpTotalMatchTeamBodyBuilder(_database));
             Register(new SimpleByteBodyBuilder(0x00CA, _ => 0));
             Register(new A21UsableCount0465BodyBuilder());
             Register(new A21UsableCount021EBodyBuilder());
@@ -63,6 +72,7 @@ namespace DfoServer.Network.Builders
                 (ushort)NotiPacketTypeA21.UPGRADE_CARRY_GOLD,
                 s => s.GoldLimitUpgradeLevel));
             Register(new PremiumServiceInitBodyBuilder());
+            Register(new AuctionServiceInitBodyBuilder());
 
             
             Register(new EnterGameWorldCompleteBodyBuilder());
@@ -77,6 +87,7 @@ namespace DfoServer.Network.Builders
 
             
             Register(new EventInfoBodyBuilder(_database));
+            Register(new SeriaLuckGaugeBodyBuilder(seriaLuckUi ?? new SeriaLuckUiService(_database)));
             Register(new HotkeyConfigBodyBuilder());                                    
             Register(new CharacterOptionBodyBuilder());
 

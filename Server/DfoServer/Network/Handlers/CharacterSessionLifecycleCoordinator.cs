@@ -46,6 +46,8 @@ namespace DfoServer.Network.Handlers
         private readonly EventDailyAttendanceAnytimeHandler
             _eventDailyAttendanceAnytimeHandler;
         private readonly EventTotalAttendanceHandler _eventTotalAttendanceHandler;
+        private readonly GuardianAltarOpeningCoordinator _guardianAltarOpening;
+        private readonly EventDungeonOpeningCoordinator _eventDungeons;
         private readonly PvpRoomHandler _pvpRoomHandler;
         private readonly InventoryRefreshSender _inventoryRefreshSender;
         private readonly IGameDatabase _database;
@@ -71,7 +73,9 @@ namespace DfoServer.Network.Handlers
             PvpRoomHandler pvpRoomHandler,
             InventoryRefreshSender inventoryRefreshSender,
             IGameDatabase database,
-            DailyResetService dailyResetService = null)
+            DailyResetService dailyResetService = null,
+            GuardianAltarOpeningCoordinator guardianAltarOpening = null,
+            EventDungeonOpeningCoordinator eventDungeons = null)
         {
             _loginHandler = loginHandler;
             _characterSelectHandler = characterSelectHandler;
@@ -90,6 +94,8 @@ namespace DfoServer.Network.Handlers
             _eventDailyAttendanceAnytimeHandler =
                 eventDailyAttendanceAnytimeHandler;
             _eventTotalAttendanceHandler = eventTotalAttendanceHandler;
+            _guardianAltarOpening = guardianAltarOpening;
+            _eventDungeons = eventDungeons;
             _pvpRoomHandler = pvpRoomHandler;
             _inventoryRefreshSender = inventoryRefreshSender;
             _database = database ?? throw new ArgumentNullException(nameof(database));
@@ -243,6 +249,7 @@ namespace DfoServer.Network.Handlers
             }
             finally
             {
+                GuildStatBuffNotifier.CancelForSession(session);
                 if (characterId > 0)
                 {
                     try
@@ -489,6 +496,8 @@ namespace DfoServer.Network.Handlers
                     EpicBuffPotionBuffNotifier.ScheduleRemoveForCurrentEffect(
                         session,
                         selectedCharacterId);
+                    await GuildStatBuffNotifier.ApplyForCharacterAsync(
+                        session, _database, selectedCharacterId, _characterTransitions);
                     await session.GameSession.QuestManager
                         .SyncItemSeekingQuestProgressAsync(null);
                     await PetCreatureRuntimeService.BeginTownAsync(
@@ -506,6 +515,13 @@ namespace DfoServer.Network.Handlers
                     if (_eventTotalAttendanceHandler != null)
                         await _eventTotalAttendanceHandler
                             .NotifyStateOnLoginAsync(session);
+                    if (_guardianAltarOpening != null)
+                        await _guardianAltarOpening
+                            .NotifyStateOnLoginWhileTransitionHeldAsync(session);
+                    if (_eventDungeons != null)
+                        await _eventDungeons
+                            .NotifyStateOnLoginWhileTransitionHeldAsync(session);
+                    await _townHandler.ProjectAccountDungeonCountsAsync(session);
                     // 上线 hook：初始好友列表已由 init 包流下发
                     // （UnitedServerFriendInfoBodyBuilder），这里只做单向推送——
                     // 0x0112 进入频道 + 同频道补发 0x0111 归零频道文字 + USERINFO 实体。
@@ -740,8 +756,11 @@ namespace DfoServer.Network.Handlers
             if (session?.Player == null)
                 return;
 
+            GuildStatBuffNotifier.CancelForSession(session);
             session.Player.CharacterId = 0;
             session.Player.UserId = 0;
+            session.Player.PvpGrade = 0;
+            session.Player.PvpRatingGrade = 0;
         }
 
         private CharacterRecord ResolveSelectedCharacter(
@@ -984,6 +1003,7 @@ namespace DfoServer.Network.Handlers
             if (displaced == null)
                 return;
 
+            GuildStatBuffNotifier.CancelForSession(displaced);
             try
             {
                 await _expertJobStoreHandler.CloseSessionAsync(
@@ -1074,6 +1094,7 @@ namespace DfoServer.Network.Handlers
             int characterId,
             EnhancedClientSession session)
         {
+            GuildStatBuffNotifier.CancelForCharacter(session, characterId);
             var removed = false;
             try
             {

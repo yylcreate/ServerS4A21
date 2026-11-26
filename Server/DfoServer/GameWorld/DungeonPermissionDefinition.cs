@@ -11,7 +11,8 @@ namespace DfoServer.GameWorld
             string filePath,
             bool isTaskExclusive,
             bool hasWorldMapReference,
-            bool hasExplicitDifficultyConfiguration)
+            bool hasExplicitDifficultyConfiguration,
+            bool isGuildDungeon = false)
         {
             DungeonId = dungeonId;
             FilePath = filePath ?? string.Empty;
@@ -19,6 +20,7 @@ namespace DfoServer.GameWorld
             HasWorldMapReference = hasWorldMapReference;
             HasExplicitDifficultyConfiguration =
                 hasExplicitDifficultyConfiguration;
+            IsGuildDungeon = isGuildDungeon;
         }
 
         internal int DungeonId { get; }
@@ -30,6 +32,7 @@ namespace DfoServer.GameWorld
         internal bool HasWorldMapReference { get; }
 
         internal bool HasExplicitDifficultyConfiguration { get; }
+        internal bool IsGuildDungeon { get; }
     }
 
     internal static class DungeonPermissionDefinitionResolver
@@ -73,6 +76,11 @@ namespace DfoServer.GameWorld
                     failureReason = "dungeon definition is incomplete";
                     return false;
                 }
+                if (!file.GuildDungeonDefinitionValid)
+                {
+                    failureReason = "guild dungeon marker is malformed";
+                    return false;
+                }
 
                 var hasWorldMapReference = WorldMap.TryGetAdmissionDefinition(
                     dungeonId,
@@ -84,7 +92,8 @@ namespace DfoServer.GameWorld
                         ? admission.IsTaskExclusive
                         : WorldMap.IsTaskExclusiveDungeon(dungeonId),
                     hasWorldMapReference,
-                    HasExplicitDifficultyConfiguration(file));
+                    HasExplicitDifficultyConfiguration(file),
+                    file.GuildDungeon == true || Game.Guilds.GuildDungeonCatalog.Current.IsManagedDungeon(dungeonId));
                 return true;
             }
             catch (Exception ex)

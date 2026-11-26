@@ -3,21 +3,27 @@ using DfoServer.Game.Appearance;
 using DfoServer.Game.DailyReset;
 using DfoServer.Game.Characters;
 using DfoServer.Game.Friends;
+using DfoServer.Game.Guilds;
 using DfoServer.Game.Inventory;
 using DfoServer.Game.KnightShield;
 using DfoServer.Game.Mercenary;
 using DfoServer.Game.Mailbox;
 using DfoServer.Game.Names;
 using DfoServer.Game.Premium;
+using DfoServer.Game.Pvp;
 using DfoServer.Game.Quests;
 using DfoServer.Game.SelectCharacter;
 using DfoServer.GameWorld;
 using DfoServer.Infrastructure;
 using DfoServer.Network.Builders;
+using DfoServer.Network.Builders.Guilds;
+using DfoServer.Network.Builders.Pvp;
 using DfoServer.Network.Parsers;
+using DfoServer.Network.Parsers.Pvp;
 using Microsoft.Data.Sqlite;
 using System;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace DfoServer.Network.Handlers
@@ -87,7 +93,8 @@ namespace DfoServer.Network.Handlers
             IMercenaryRestrictionService mercenaryRestrictions = null,
             IGameDatabase database = null,
             DailyResetService dailyResetService = null,
-            MailboxService mailboxService = null)
+            MailboxService mailboxService = null,
+            Game.Events.SeriaLuck.SeriaLuckUiService seriaLuckUi = null)
         {
             _database = database ?? GameDatabase.CreateDefault();
             _selectCharacterDataSource = selectCharacterDataSource ?? throw new ArgumentNullException(nameof(selectCharacterDataSource));
@@ -107,7 +114,7 @@ namespace DfoServer.Network.Handlers
             _pvpSkillRepository = new Game.Skills.SqlitePvpSkillRepository(
                 _database);
             _initPacketBuilders = new Network.Builders.InitPacketBuilderRegistry(
-                _database, _sessions);
+                _database, _sessions, seriaLuckUi);
             if (mailboxService != null)
             {
                 _questAssistantGifts = new QuestAssistantGiftService(
@@ -321,6 +328,7 @@ namespace DfoServer.Network.Handlers
             int slot)
         {
             GameChannelSpawn selectedSpawn = null;
+            var resolvingSpawn = false;
             try
             {
                 // 换角色前丢弃上一个角色的副本局: PlayerContext 实例跨角色复用, 不丢会把
@@ -363,9 +371,15 @@ namespace DfoServer.Network.Handlers
                     var inventory = TryLoadInventoryForLease(
                         record.CharacterId,
                         ResolveAccountId(session, record));
+                    resolvingSpawn = true;
                     selectedSpawn = GameChannelSpawnPolicy.Resolve(
                         session.ListenerPort,
                         record.TownId);
+                    if (selectedSpawn.TownId == GuildAgitAccessPolicy.TownId
+                        && new GuildRepository(_database).GetForMember(record.CharacterId) == null)
+                        selectedSpawn = GameChannelSpawnPolicy.Resolve(
+                            session.ListenerPort, GameChannelSpawnPolicy.NormalTownFallbackId);
+                    resolvingSpawn = false;
                     session.Player.HydrateFrom(
                         record,
                         selectedSpawn);
@@ -417,16 +431,18 @@ namespace DfoServer.Network.Handlers
 
                     session.Player.AppearanceEntries = record.Appearance ?? Array.Empty<CharacterAppearanceEntry>();
                     if (GameChannelSpawnPolicy.ShouldPersistPosition(
-                            session.ListenerPort))
+                            session.ListenerPort,
+                            selectedSpawn.TownId,
+                            selectedSpawn.AreaId))
                     {
                         _characterRepository.UpdatePosition(
-                            session.Player.CharacterId,
-                            session.Player.CurTownId,
-                            session.Player.CurAreaId,
-                            session.Player.CurPosX,
-                            session.Player.CurPosY,
-                            session.Player.CurDirection,
-                            session.Player.CurAreaState);
+                            record.CharacterId,
+                            selectedSpawn.TownId,
+                            selectedSpawn.AreaId,
+                            selectedSpawn.X,
+                            selectedSpawn.Y,
+                            selectedSpawn.Direction,
+                            selectedSpawn.AreaState);
                     }
                     FileLogger.Log($"[{ProtocolName}] Select character hydrated session {session.SessionId} slot={slot} <- character_id={record.CharacterId} name={record.DisplayName} town={session.Player.CurTownId} area={session.Player.CurAreaId} pos=({session.Player.CurPosX},{session.Player.CurPosY})");
                 }
@@ -437,6 +453,11 @@ namespace DfoServer.Network.Handlers
             }
             catch (Exception ex)
             {
+                if (resolvingSpawn)
+                {
+                    FileLogger.Log($"[{ProtocolName}] Select character spawn rejected: {ex.Message}");
+                    throw;
+                }
                 FileLogger.Log($"[{ProtocolName}] Select character DB load failed: {ex.Message}");
             }
 
@@ -510,16 +531,13 @@ namespace DfoServer.Network.Handlers
             }
 
             SkillInfoSnapshot pvpSkillOverride = null;
-            if (GameNetworkConfig.IsFreeDuelListener(session.ListenerPort))
+            if (GameNetworkConfig.IsPvpListener(session.ListenerPort))
             {
                 var skillOwner = _characterRepository.GetById(ownerCharId);
                 if (skillOwner != null)
                 {
-                    pvpSkillOverride = _pvpSkillRepository.LoadOrInitialize(
-                        ownerCharId,
-                        skillOwner.Job,
-                        skillOwner.Level,
-                        skillOwner.GrowType);
+                    pvpSkillOverride = Game.Skills.SkillStateService.LoadPvpAndSync(
+                        _pvpSkillRepository, skillOwner, skillOwner.Level).Skills;
                     FileLogger.Log(
                         $"[{ProtocolName}] Loaded independent PvP skills " +
                         $"character_id={ownerCharId} " +
@@ -594,6 +612,25 @@ namespace DfoServer.Network.Handlers
             await SendHonorLevelInfoAsync(session, "select-character-ready", characterList.Honor);
             await _growthCapsule.SendExpProgressAsync(
                 session, "select-character-ready", honor: characterList.Honor);
+            await ProjectGuildEntranceAsync(session);
+            await new Dungeon.GuildDungeonProgressNotifier(_database, new GuildDungeonService(_database), _sessions)
+                .SendAsync(session, "select-character-ready");
+        }
+
+        // Called with the existing selection transition held, AFTER all init
+        // packets: another init reader can otherwise clear the native agit state.
+        internal async Task ProjectGuildEntranceAsync(EnhancedClientSession session)
+        {
+            int id = session?.Player?.CharacterId ?? 0;
+            if (id <= 0 || _sessions == null
+                || !_sessions.TryGet(id, out var current) || !ReferenceEquals(current, session)
+                || !InventoryContext.TryGetOwnedLease(session.SessionId, id, out _))
+                return;
+            var roster = new GuildRepository(_database).GetRosterForMember(id);
+            if (roster == null) return; // Character init already restores nonmembership.
+            await session.SendPacketAsync(GuildJoinPacketBuilder.Rank(
+                roster.Members.Single(member => member.CharacterId == id).Rank));
+            await session.SendPacketAsync(GuildInfoPacketBuilder.Build(roster));
         }
 
         public async Task Handle_ENUM_CMDPACKET_GET_USERINFO(EnhancedClientSession session, GamePacketHeader header, byte[] body)
@@ -602,7 +639,7 @@ namespace DfoServer.Network.Handlers
             {
                 // body = {u16 targetUserId, u8 mode}，允许 padding。
                 // 城镇查看基本信息用 mode=3，只回一个 USERINFO subtype 3。
-                // mode 0/1 仍按目标查；mode 2 回请求者名册。
+                // mode 0/1 仍按目标查；mode 2 回请求者名册；mode 5 查询改名记录。
                 // 无效、过期、歧义或跨频道目标直接失败。
                 if (_sessions == null || body == null || body.Length < 3)
                 {
@@ -621,7 +658,8 @@ namespace DfoServer.Network.Handlers
                 if (mode != 0x00
                     && mode != 0x01
                     && mode != 0x02
-                    && mode != 0x03)
+                    && mode != 0x03
+                    && mode != 0x05)
                 {
                     FileLogger.Log(
                         $"[{ProtocolName}] GET_USERINFO rejected " +
@@ -717,7 +755,6 @@ namespace DfoServer.Network.Handlers
                 byte routingByte = _getUserInfoTemplate != null ? _getUserInfoTemplate.Pkt0RoutingByte7 : (byte)0;
                 await session.SendPacketAsync(BuildPacketWithRouting(0x00, 0x0002, characterList.Body, routingByte));
                 await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(0x01, 0x0286, new byte[] { 0x00, 0x04 }));
-                await SendHonorLevelInfoAsync(session, "get-userinfo-ready", characterList.Honor);
                 await _growthCapsule.SendExpProgressAsync(
                     session, "get-userinfo-ready", honor: characterList.Honor);
             }
@@ -725,6 +762,84 @@ namespace DfoServer.Network.Handlers
             {
                 FileLogger.Log($"[{ProtocolName}] GET_USERINFO EXCEPTION: {ex}");
             }
+        }
+
+        public Task HandleFairPvpScore(
+            EnhancedClientSession session, GamePacketHeader header, byte[] body)
+        {
+            if (!FairPvpScoreRequest.TryParse(body, out var request))
+            {
+                FileLogger.Log(
+                    $"[{ProtocolName}] FAIR_PVP_SCORE rejected invalid request");
+                return Task.CompletedTask;
+            }
+            return SendPvpScoreAsync(session, request.TargetUserId,
+                CmdPacketTypeA21.FAIR_PVP_SCORE, request.IsSelf, request.ViewMode);
+        }
+
+        public Task HandleIntegrateMatchPvpScore(
+            EnhancedClientSession session, GamePacketHeader header, byte[] body)
+        {
+            if (!IntegrateMatchPvpScoreRequest.TryParse(body, out var request))
+            {
+                FileLogger.Log(
+                    $"[{ProtocolName}] INTEGRATE_MATCH_PVP_SCORE rejected invalid request");
+                return Task.CompletedTask;
+            }
+            return SendPvpScoreAsync(session, request.TargetUserId,
+                CmdPacketTypeA21.INTEGRATE_MATCH_PVP_SCORE, null, 0);
+        }
+
+        private async Task SendPvpScoreAsync(
+            EnhancedClientSession session, ushort targetUserId,
+            CmdPacketTypeA21 command, bool? isSelf, byte viewMode)
+        {
+            if (session == null || !IsAuthorizedInspectRequester(session))
+            {
+                FileLogger.Log($"[{ProtocolName}] {command} rejected invalid session");
+                return;
+            }
+
+            var requesterCharacterId = session.Player.CharacterId;
+            var requesterAccountId = session.Account.AccountId;
+            var target = FindInspectableOnlineByUserId(
+                _sessions, session, targetUserId);
+            if (target == null
+                || !IsCurrentInspectableTarget(session, target, targetUserId)
+                || (isSelf.HasValue && isSelf.Value != ReferenceEquals(session, target)))
+            {
+                FileLogger.Log(
+                    $"[{ProtocolName}] {command} rejected target uid={targetUserId}");
+                return;
+            }
+
+            var targetCharacterId = target.Player.CharacterId;
+            var targetAccountId = target.Account.AccountId;
+            var record = _characterRepository.GetById(targetCharacterId);
+            if (record == null || record.Deleted
+                || record.CharacterId != targetCharacterId
+                || record.AccountId != targetAccountId)
+                return;
+
+            var response = command == CmdPacketTypeA21.INTEGRATE_MATCH_PVP_SCORE
+                ? IntegrateMatchPvpScoreResponseBuilder.BuildEmptyBody(targetUserId)
+                : FairPvpScoreResponseBuilder.BuildBody(
+                    targetUserId, viewMode, record.PvpGrade, record.PvpRatingGrade,
+                    new SqlitePvpRecordRepository(_database).LoadSeasonScore(targetCharacterId, viewMode));
+            var sent = await session.TrySendPacketAsync(
+                GamePacketEnvelopeBuilder.Build(
+                    0x01, (ushort)command, response),
+                CancellationToken.None,
+                () => session.Player.CharacterId == requesterCharacterId
+                    && session.Account?.AccountId == requesterAccountId
+                    && target.Player.CharacterId == targetCharacterId
+                    && target.Account?.AccountId == targetAccountId
+                    && IsAuthorizedInspectRequester(session)
+                    && IsCurrentInspectableTarget(session, target, targetUserId));
+            FileLogger.Log(
+                $"[{ProtocolName}] {command} uid={targetUserId} " +
+                $"mode={viewMode} grade={record.PvpGrade} " +
+                $"rating={record.PvpRatingGrade} bodyLen={response.Length} sent={sent}");
         }
 
         public async Task Handle_ENUM_CMDPACKET_OTHER_USER_TITLE_BOOK_LIST(
@@ -1128,7 +1243,6 @@ namespace DfoServer.Network.Handlers
             var accountId = session.Account?.AccountId ?? 1;
             var characterList = BuildCharacterList(accountId);
             await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(0x00, 0x0002, characterList.Body));
-            await SendHonorLevelInfoAsync(session, "character-list-ready", characterList.Honor);
             FileLogger.Log($"[{ProtocolName}] Sent character list for account_id={accountId}");
         }
 

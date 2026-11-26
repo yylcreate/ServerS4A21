@@ -108,6 +108,35 @@ namespace DfoServer.Network.Handlers.Dungeon
                 secondGrow);
         }
 
+        internal async Task<bool> RestoreGuardianControlsAsync(
+            EnhancedClientSession session, Func<bool> current)
+        {
+            ArgumentNullException.ThrowIfNull(current);
+            if (!current() || !InventoryContext.TryGetOwnedLease(session.SessionId,
+                    session.Player.CharacterId, out var lease))
+                return false;
+            var state = LoadSyncedSkillState(session.Player.CharacterId, session.Player.Level, persist: false);
+            if (state.Points == null || !current())
+                return false;
+            var prepared = false;
+            var skillPacket = GamePacketEnvelopeBuilder.Build(0,
+                (ushort)NotiPacketTypeA21.SKILLINFO, SkillInfoBodyBuilder.BuildFrom(state.Skills));
+            bool OwnedCurrent() => current() && InventoryContext.IsCurrentLease(
+                lease, session.SessionId, session.Player.CharacterId);
+            await session.SendPreparedPacketBatchAsync(() =>
+            {
+                if (!OwnedCurrent())
+                    return Array.Empty<byte[]>();
+                prepared = true;
+                return new[] { skillPacket };
+            });
+            if (!prepared || !OwnedCurrent())
+                return false;
+            var itemsSent = await InventoryRefreshSender.TrySendOwnedItemListRefresh(
+                session, lease, InventoryListType.Main, OwnedCurrent);
+            return itemsSent && OwnedCurrent();
+        }
+
         internal bool TryGetSkillPointProtocolState(
             EnhancedClientSession session,
             bool persist,
@@ -150,7 +179,8 @@ namespace DfoServer.Network.Handlers.Dungeon
             uint growthContractBonusExp = 0,
             uint eliteMonsterKillBonusExp = 0,
             uint experiencePotionBonusExp = 0,
-            bool reloadMissingAccountProgress = false)
+            bool reloadMissingAccountProgress = false,
+            uint fatigueBurnBonusExp = 0)
         {
             if (grant == null
                 || (grant.NormalExpGain == 0
@@ -189,6 +219,7 @@ namespace DfoServer.Network.Handlers.Dungeon
                     honor,
                     fatigueBuffBonusExp: experiencePotionBonusExp,
                     growthContractBonusExp: growthContractBonusExp,
+                    fatigueBurnBonusExp: fatigueBurnBonusExp,
                     eliteMonsterKillBonusExp: eliteMonsterKillBonusExp,
                     growthCapsuleExp: GrowthCapsuleDataProvider.GetDisplayProgress(
                         session.Player.Level,
@@ -228,7 +259,8 @@ namespace DfoServer.Network.Handlers.Dungeon
                     record.Job,
                     record.GrowType,
                     clearedFlags,
-                    allowedCreatureKinds);
+                    allowedCreatureKinds,
+                    Game.Events.GameEventRepository.LoadAdvertisedEventIds(_connectionString));
                 await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(
                     0x00,
                     (ushort)NotiPacketTypeA21.ACCEPTABLE_QUEST_LIST,

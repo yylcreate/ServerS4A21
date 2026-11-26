@@ -94,6 +94,9 @@ namespace DfoServer.Game.Dungeon
             }
 
             var plan = new DungeonEntryCostPlan("dungeon-entry");
+            var guildAdmission = run.Instance.GuildDungeonAdmission;
+            if (guildAdmission != null)
+                plan.GuildDungeonAdmission = guildAdmission.ForParticipant(lease.CharacterId, lease.Inventory.AccountId);
             if (!TryAddDungeonRequiredItems(
                     plan,
                     run.DungeonId,

@@ -25,6 +25,8 @@ namespace DfoServer.SelfTests
             Console.WriteLine("=== A21_TUTORIAL_PROTOCOL selftest ===");
             var failures = 0;
 
+            VerifySlotExpansionFinish(ref failures);
+
             Check(
                 "A21 EXP/DIE_MONSTER/GET_ITEM opcodes are direction-specific",
                 (ushort)NotiPacketTypeA21.EXP == 0x0025
@@ -321,9 +323,17 @@ namespace DfoServer.SelfTests
                     packet.Command == 0
                     && packet.Type == (ushort)NotiPacketTypeA21.EQUIPMENT_RENTAL_LIST)
                 && !initSequence.Exists(packet =>
-                    packet.Command == 0 && packet.Type == 0x0357)
-                && !initSequence.Exists(packet =>
-                    packet.Command == 0 && packet.Type == 0x019D),
+                    packet.Command == 0 && packet.Type == 0x0357),
+                ref failures);
+            var eventInfoIndex = initSequence.FindIndex(packet =>
+                packet.Command == 0 && packet.Type == (ushort)NotiPacketTypeA21.EVENT_INFO);
+            var seriaGaugeIndex = initSequence.FindIndex(packet =>
+                packet.Command == 0 && packet.Type == (ushort)NotiPacketTypeA21.BOOSTER_GAGE);
+            Check(
+                "A21 select-character init projects Seria luck gauge exactly once after EVENT_INFO",
+                eventInfoIndex >= 0 && seriaGaugeIndex == eventInfoIndex + 1
+                && initSequence.Count(packet => packet.Command == 0
+                    && packet.Type == (ushort)NotiPacketTypeA21.BOOSTER_GAGE) == 1,
                 ref failures);
 
             var enterFirst = EnterSelectDungeonStateBuilder
@@ -1142,8 +1152,10 @@ namespace DfoServer.SelfTests
                 dungeonId: 231);
             Check(
                 "sequential-dungeon mechanism monsters stay normal",
-                SequentialDungeonMonsterCatalog.Contains(225, 56639)
-                && SequentialDungeonMonsterCatalog.Contains(231, 56649)
+                SequentialDungeonDefinitionCatalog.Current
+                    .ContainsConfiguredMonster(225, 56639)
+                && SequentialDungeonDefinitionCatalog.Current
+                    .ContainsConfiguredMonster(231, 56649)
                 && togPromotionMap.Monsters.Count == 1
                 && togPromotionMap.Monsters[0].Code == 56639
                 && togPromotionMap.Monsters[0].Type == 0
@@ -2368,6 +2380,54 @@ namespace DfoServer.SelfTests
                 && BitConverter.ToInt32(pickupGold, 6) == 8,
                 ref failures);
 
+            // 模板抓自单人教程（picker 永远在队伍槽位 0）；slot 0 输出必须与
+            // 模板逐字节一致，保证已验证的单人/主机端行为零变化。
+            var expectedTemplate = FromHex(
+                "660039040001080000000100000000000000000100000000010000000000000000" +
+                "010000000001000000000000000001000000000100000000000000000100000000" +
+                "010000000000000000010000000001000000000000000001000000000100000000" +
+                "000000000100000000010000000000000000");
+            Check(
+                "A21 GET_ITEM gold notification keeps the captured solo wire bytes at party slot 0",
+                pickupGold.SequenceEqual(expectedTemplate),
+                ref failures);
+
+            // 组队拾取：客户端按自己的队伍槽位读对应 entry（与 0x0023 翻牌包同约定），
+            // gold 必须写到 6+14*partySlot，且非 0 槽位时 entry0 的 gold 要清零——
+            // 模板 entry0 自带 8，不清会让 0 槽客户端同时收到跳字。
+            var partyPickupGold = DropItemBuilder.BuildPickupGold(
+                sceneSlot: 0x66,
+                pickerActorId: 1081,
+                goldAmount: 500,
+                partySlot: 1);
+            Check(
+                "A21 GET_ITEM gold notification projects gold into the picker's party-slot entry",
+                partyPickupGold.Length == 117
+                && BitConverter.ToUInt16(partyPickupGold, 0) == 0x66
+                && BitConverter.ToUInt16(partyPickupGold, 2) == 1081
+                && BitConverter.ToInt32(partyPickupGold, 6) == 0
+                && partyPickupGold[5] == 1
+                && partyPickupGold[19] == 1
+                && BitConverter.ToInt32(partyPickupGold, 20) == 500
+                && BitConverter.ToInt32(partyPickupGold, 24) == 1
+                && BitConverter.ToInt32(partyPickupGold, 28) == 0
+                && partyPickupGold[32] == 0,
+                ref failures);
+
+            var clampedPickupGold = DropItemBuilder.BuildPickupGold(
+                sceneSlot: 0x66,
+                pickerActorId: 1081,
+                goldAmount: 500,
+                partySlot: 9);
+            Check(
+                "A21 GET_ITEM gold notification clamps an out-of-range party slot to seat 0",
+                clampedPickupGold.SequenceEqual(
+                    DropItemBuilder.BuildPickupGold(
+                        sceneSlot: 0x66,
+                        pickerActorId: 1081,
+                        goldAmount: 500)),
+                ref failures);
+
             var pickupAck = DropItemBuilder.BuildGetItemSuccessAck();
             Check(
                 "A21 GET_ITEM success ACK is one byte",
@@ -2454,6 +2514,21 @@ namespace DfoServer.SelfTests
                     ExpNotificationBuilder.RemovedChannelExpOffset) == 0,
                 ref failures);
 
+            var altHonor = new DfoServer.Game.Accounts.HonorLevelSummary
+            {
+                HonorLevel = 7,
+                HonorExp = 1234,
+            };
+            var altExp = ExpNotificationBuilder.Build(
+                level: 50,
+                totalExp: 456,
+                skillPoints: default,
+                honorLevel: altHonor);
+            Check(
+                "A21 non-max-level EXP preserves account honor instead of resetting it to zero",
+                BitConverter.ToUInt32(altExp, ExpNotificationBuilder.HonorLevelOffset) == altHonor.HonorLevel
+                && BitConverter.ToUInt32(altExp, ExpNotificationBuilder.HonorExpOffset) == altHonor.HonorExp,
+                ref failures);
             var eliteExp = ExpNotificationBuilder.Build(
                 level: 1,
                 totalExp: 100,
@@ -3759,6 +3834,14 @@ namespace DfoServer.SelfTests
             return false;
         }
 
+        private static byte[] FromHex(string hex)
+        {
+            var bytes = new byte[hex.Length / 2];
+            for (var index = 0; index < bytes.Length; index++)
+                bytes[index] = Convert.ToByte(hex.Substring(index * 2, 2), 16);
+            return bytes;
+        }
+
         private static bool ContainsInt(
             IReadOnlyList<int> values,
             int expected)
@@ -3818,6 +3901,73 @@ namespace DfoServer.SelfTests
                     }),
             };
             return run;
+        }
+
+        private static void VerifySlotExpansionFinish(ref int failures)
+        {
+            foreach (var (questId, slotType) in new[] { (649, 0), (650, 1) })
+            {
+                var resolution = QuestData.ResolveReward(questId, -1, 70, -1, -1);
+                Check($"PVF slot expansion quest {questId} maps to native type 23 and slot {slotType}",
+                    resolution.IsValid
+                    && resolution.Reward.ChainType == 23
+                    && resolution.Reward.GrowNumber == slotType,
+                    ref failures);
+                if (!resolution.IsValid)
+                    continue;
+
+                foreach (var finishType in new[]
+                {
+                    QuestFinishType.Seeking,
+                    QuestFinishType.MeetNpc,
+                    (QuestFinishType)0x19,
+                })
+                {
+                    var result = new QuestFinishResult
+                    {
+                        QuestId = 1,
+                        FinishType = finishType,
+                        CompletionCount = 1,
+                        ChainType = resolution.Reward.ChainType,
+                        GrowNumber = resolution.Reward.GrowNumber,
+                    };
+                    var hasConsumedPrefix = finishType == QuestFinishType.Seeking
+                        || (byte)finishType == 0x19;
+                    if (hasConsumedPrefix)
+                        result.ConsumedEntries.Add(new ConsumedItemEntry
+                        {
+                            UpdateType = 0,
+                            SlotIndex = 3,
+                            ConsumedCount = 2,
+                        });
+
+                    // A21：12B 公共前缀、按完成类型携带的消耗列表、chain=23；无尾部。
+                    var expected = hasConsumedPrefix
+                        ? new byte[] { 1, 1, 0, (byte)finishType, 0, 0, 0, 0, 1, 0, 0, 0,
+                            1, 0, 3, 0, 2, 0, 0, 0, 23 }
+                        : new byte[] { 1, 1, 0, 4, 0, 0, 0, 0, 1, 0, 0, 0, 23 };
+                    Check($"slot expansion {slotType}/{finishType} emits native chain 23 with no unread tail",
+                        QuestAckBuilder.BuildFinish(result).AsSpan().SequenceEqual(expected)
+                        && result.ChainType == QuestData.ChainTypeSlotExpansion
+                        && result.GrowNumber == slotType,
+                        ref failures);
+                    if (hasConsumedPrefix)
+                    {
+                        result.ConsumedEntries.Clear();
+                        var emptyConsumedExpected = new byte[]
+                        {
+                            1, 1, 0, (byte)finishType, 0, 0, 0, 0, 1, 0, 0, 0, 0, 23,
+                        };
+                        Check($"slot expansion {slotType}/{finishType} retains zero consumed count before chain",
+                            QuestAckBuilder.BuildFinish(result).AsSpan().SequenceEqual(emptyConsumedExpected),
+                            ref failures);
+                    }
+                    result.ErrorCode = 4;
+                    Check($"failed slot expansion {slotType}/{finishType} emits only failure",
+                        QuestAckBuilder.BuildFinish(result).AsSpan().SequenceEqual(new byte[] { 0, 4 }),
+                        ref failures);
+                }
+            }
         }
 
         private static string FormatInts(int[] values)

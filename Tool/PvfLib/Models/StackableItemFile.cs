@@ -166,6 +166,8 @@ namespace PvfLib
 
         
         public string StackableType { get; set; }
+        // 拍卖副职业分类的只读资源字段；不改变背包 ItemKind 或职业状态。
+        public string ExpertType { get; set; }
         public List<string> AvatarEmblemTargetTypes { get; set; } = new List<string>();
         // [usable equip type] 限定可作用的装备部位, 例如品级调整箱按武器/防具/首饰分箱。空表示不限部位。
         public List<string> UsableEquipTypes { get; set; } = new List<string>();
@@ -196,6 +198,7 @@ namespace PvfLib
         public int LotteryUseNeedItemCount { get; set; }
         public int CoolTime { get; set; } = -1;
         public string CooltimeGroup { get; set; }
+        public int? AdvanceAltarNeedGage { get; set; }
         public bool HasCooltimeMaintenance { get; set; }
         public bool HasEffectMaintenance { get; set; }
         public int StatChangeDurationMilliseconds { get; set; } = -1;
@@ -332,6 +335,7 @@ namespace PvfLib
 
                     
                     case "stackable type": stk.StackableType = StripBacktick(data); break;
+                    case "expert type": stk.ExpertType = StripBacktick(data); break;
                     case "avatar emblem target type":
                         stk.AvatarEmblemTargetTypes = ParseStringList(node, content);
                         stk.AvatarEmblemSocketType = ResolveAvatarEmblemSocketType(stk.AvatarEmblemTargetTypes);
@@ -364,6 +368,18 @@ namespace PvfLib
                     }
                     case "cool time": stk.CoolTime = ParseInt(data); break;
                     case "cooltime group": stk.CooltimeGroup = data; break;
+                    case "advance altar need gage":
+                    {
+                        // A missing scalar remains null; a present definition
+                        // must not become a fabricated zero-cost summon.
+                        GuardianAltarScriptReader.SingleChild(root, "advance altar need gage");
+                        GuardianAltarScriptReader.RequireLeaf(node);
+                        var needGage = GuardianAltarScriptReader.SingleInteger(node, content);
+                        if (needGage < 0)
+                            throw new InvalidOperationException("Advance Altar need gage must be non-negative");
+                        stk.AdvanceAltarNeedGage = needGage;
+                        break;
+                    }
                     case "cooltime maintenance": stk.HasCooltimeMaintenance = true; break;
                     case "effect maintenance": stk.HasEffectMaintenance = true; break;
                     case "stat change duration": ParseStatChangeDuration(data, stk); break;
@@ -691,7 +707,9 @@ namespace PvfLib
                     Group = 0,
                     ItemId = ints[i],
                     Weight = Math.Max(0, ints[i + 1]),
-                    Count = Math.Max(1, ints[i + 2]),
+                    // Keep the PVF value intact so business resolvers can
+                    // reject malformed non-positive reward quantities.
+                    Count = ints[i + 2],
                 });
             }
 

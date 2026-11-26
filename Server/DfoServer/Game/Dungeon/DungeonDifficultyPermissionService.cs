@@ -14,6 +14,7 @@ namespace DfoServer.Game.Dungeon
         None = 1,
         AccountDifficulty = 2,
         CharacterMechanism = 3,
+        GuildMechanism = 4,
     }
 
     internal static class DungeonPermissionScopePolicy
@@ -45,6 +46,9 @@ namespace DfoServer.Game.Dungeon
                         $"dungeon={dungeonId}: {failureReason}");
                     return DungeonPermissionPersistenceScope.Unknown;
                 }
+
+                if (definition.IsGuildDungeon)
+                    return DungeonPermissionPersistenceScope.GuildMechanism;
 
                 if (definition.IsTaskExclusive)
                     return DungeonPermissionPersistenceScope.None;

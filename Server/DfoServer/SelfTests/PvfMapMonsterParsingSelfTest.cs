@@ -1,11 +1,14 @@
 using DfoServer.GameWorld;
 using DfoServer.Game.Quests;
 using DfoServer.Game.Dungeon;
+using DfoServer.Network;
 using Microsoft.Data.Sqlite;
 using PvfLib;
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Reflection;
 
 namespace DfoServer.SelfTests
 {
@@ -16,6 +19,9 @@ namespace DfoServer.SelfTests
             Console.WriteLine("=== PVF_MAP_MONSTER_PARSING selftest ===");
             var failures = 0;
 
+            VerifyDeclaredDungeonMapResources(ref failures);
+            VerifyImplicitDungeonStartRooms(ref failures);
+            VerifyScreamTowerMapOwnership(ref failures);
             VerifyDummyBossAlignment(ref failures);
             VerifyNpcBossAlignment(ref failures);
             VerifyNpcDummyBossAlignment(ref failures);
@@ -25,11 +31,104 @@ namespace DfoServer.SelfTests
             VerifyAnotherAradQuestRuntime(ref failures);
             VerifySceneOwnedTimedMonsterWave(ref failures);
             VerifyWorldMapHuntMonsterQuestLayout(ref failures);
+            VerifyQuestAutomaticDropProjection(ref failures);
 
             Console.WriteLine(failures == 0
                 ? "PVF_MAP_MONSTER_PARSING selftest passed"
                 : $"PVF_MAP_MONSTER_PARSING selftest failed: {failures}");
             return failures == 0 ? 0 : 1;
+        }
+
+        private static void VerifyQuestAutomaticDropProjection(ref int failures)
+        {
+            var success = typeof(QuestDropCommitResult).GetMethods(
+                    BindingFlags.Static | BindingFlags.NonPublic)
+                .FirstOrDefault(method =>
+                    method.Name == "Success"
+                    && method.GetParameters().Length == 2
+                    && method.GetParameters()[1].ParameterType
+                        == typeof(IReadOnlyList<QuestSetTriggerResult>));
+            var triggerChanges = typeof(QuestDropCommitResult).GetProperty(
+                "TriggerChanges",
+                BindingFlags.Instance | BindingFlags.NonPublic);
+            Check(
+                "automatic quest-item commit preserves trigger changes for client projection",
+                success != null && triggerChanges != null,
+                ref failures);
+
+            var projectionOrder = new List<string>();
+            var projectedTriggers = new List<QuestSetTriggerResult>();
+            var batcher = new QuestDropNotificationBatcher(
+                (_, slots) =>
+                {
+                    projectionOrder.Add("inventory:" + string.Join(",", slots));
+                    return System.Threading.Tasks.Task.CompletedTask;
+                },
+                (_, changes) =>
+                {
+                    projectionOrder.Add("trigger");
+                    projectedTriggers.AddRange(changes);
+                    return System.Threading.Tasks.Task.CompletedTask;
+                });
+            var session = new EnhancedClientSession(
+                null,
+                new GamePacketHeader());
+            session.Player.CharacterId = 1;
+            batcher.Queue(
+                session,
+                new short[] { 187 },
+                new[]
+                {
+                    new QuestSetTriggerResult
+                    {
+                        QuestId = 2045,
+                        PreviousTriggerValue = 20,
+                        TriggerValue = 19,
+                    },
+                    new QuestSetTriggerResult
+                    {
+                        QuestId = 2045,
+                        PreviousTriggerValue = 19,
+                        TriggerValue = 18,
+                    },
+                });
+            batcher.FlushPendingAsync(session).GetAwaiter().GetResult();
+            Check(
+                "automatic quest-item projection sends inventory before the latest trigger",
+                projectionOrder.SequenceEqual(
+                    new[] { "inventory:187", "trigger" })
+                    && projectedTriggers.Count == 1
+                    && projectedTriggers[0].QuestId == 2045
+                    && projectedTriggers[0].TriggerValue == 18,
+                ref failures);
+
+            projectionOrder.Clear();
+            projectedTriggers.Clear();
+            batcher.Queue(
+                session,
+                new short[] { 187 },
+                new[]
+                {
+                    new QuestSetTriggerResult
+                    {
+                        QuestId = 2045,
+                        PreviousTriggerValue = 19,
+                        TriggerValue = 18,
+                    },
+                    new QuestSetTriggerResult
+                    {
+                        QuestId = 2045,
+                        PreviousTriggerValue = 20,
+                        TriggerValue = 19,
+                    },
+                });
+            batcher.FlushPendingAsync(session).GetAwaiter().GetResult();
+            Check(
+                "automatic quest-item projection keeps the latest state when notifications arrive out of order",
+                projectedTriggers.Count == 1
+                    && projectedTriggers[0].QuestId == 2045
+                    && projectedTriggers[0].TriggerValue == 18,
+                ref failures);
         }
 
         private static void VerifyDummyBossAlignment(ref int failures)
@@ -66,6 +165,137 @@ namespace DfoServer.SelfTests
                 && map.Monsters[0].Type == MonsterType.Boss
                 && map.Monsters[1].MonsterId == 62001,
                 ref failures);
+        }
+
+        private static void VerifyDeclaredDungeonMapResources(ref int failures)
+        {
+            if (string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("PVF_ARCHIVE_PATH")))
+                return;
+
+            var maze = Dungeon.GetDungeonMaze(41, 0);
+            var start = Dungeon.GetDungeonMapMonsterSummaryInformation(
+                41, 1, 0, 0, -1, maze.BossMap);
+            var boss = Dungeon.GetDungeonMapMonsterSummaryInformation(
+                41, 0, 0, 0, -1, maze.BossMap);
+            Check("Cold Boy resolves its start MAP from the differently named resource directory",
+                start.Index == 5801 && start.Monsters.Count == 4
+                && start.Monsters.All(m => m.Code == 600 && m.Type == 0), ref failures);
+            Check("Cold Boy resolves an authored Boss MAP with its blocking Boss",
+                (boss.Index == 5802 || boss.Index == 5803)
+                && boss.Monsters.Any(m => m.Code == 1030 && m.Type == 3 && m.IsBlocking),
+                ref failures);
+            foreach (var room in new[] { start, boss })
+            {
+                Check($"Cold Boy room=({room.X},{room.Y}) matches its maze door layout",
+                    DungeonMapResolver.TryGetMazeCellGreed(maze, room.X, room.Y, out var greed)
+                    && DungeonMapResolver.TryDecodeGreedSymbol(greed, out var expectedMask)
+                    && DungeonMapResolver.TryGetMapEntranceMask(room.Index, out var actualMask)
+                    && actualMask == expectedMask, ref failures);
+            }
+            var questId = AnotherAradConfigCatalog.ConfiguredQuestIds.First(
+                id => AnotherAradConfigCatalog.MatchesQuestDungeon(id, 41));
+            var resolved = AnotherAradSelectionResolver.TryResolve(41, questId, out var selection, out _);
+            Check("Cold Boy mirror selection has a PVF dungeon and quest pairing",
+                resolved && selection.HistoricalDungeonId == 41
+                && AnotherAradConfigCatalog.MatchesQuestDungeon(selection.CrackQuestId, 41),
+                ref failures);
+
+            foreach (var (dungeonId, expectedMapId) in new[] { (120, 17100), (121, 17101), (122, 17102) })
+            {
+                var tournamentMaze = Dungeon.GetDungeonMaze(dungeonId, 0);
+                var room = Dungeon.GetDungeonMapMonsterSummaryInformation(
+                    dungeonId, tournamentMaze.StartMap[0], tournamentMaze.StartMap[1],
+                    0, -1, tournamentMaze.BossMap);
+                Check($"shared Tournament directory selects dungeon={dungeonId}'s own MAP",
+                    room.Index == expectedMapId, ref failures);
+            }
+        }
+
+        private static void VerifyImplicitDungeonStartRooms(ref int failures)
+        {
+            if (string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("PVF_ARCHIVE_PATH")))
+                return;
+
+            var mapList = DungeonMapCatalog.LoadMapList();
+            var checkedRooms = 0;
+            foreach (var dungeonEntry in DungeonCatalog.LoadDungeonList().Entries)
+            {
+                var dungeon = Dungeon.GetDungeonFile(dungeonEntry.Id);
+                // 绝望之塔按楼层及房间序号选图，优先于通用入口匹配。
+                if (dungeon.TowerOfDespair > 0
+                    && Dungeon.TryGetTowerOfDespairFloor(dungeonEntry.Id, out _))
+                    continue;
+
+                for (var mazeIndex = 0; mazeIndex < dungeon.Mazes.Count; mazeIndex++)
+                {
+                    var maze = dungeon.Mazes[mazeIndex];
+                    if (maze.QuestConnection is { Length: >= 2 })
+                        continue;
+
+                    var directories = Dungeon.BuildMapDirCandidates(
+                        dungeonEntry.Id, mapList, maze, dungeonEntry.FilePath);
+                    var index = DungeonMapResolver.BuildIndex(mapList, directories);
+                    var entranceMaps = index.Entries
+                        .Where(entry => DungeonMapCatalog.GetDungeonOwner(entry.MapId) == dungeonEntry.Id)
+                        .Select(entry => (entry.MapId, Map: DungeonMapCatalog.GetMapFile(entry.MapId)))
+                        .Where(entry => string.Equals(entry.Map.Type, "[normal]", StringComparison.OrdinalIgnoreCase)
+                            && entry.Map.DungeonStartArea is { Length: >= 4 })
+                        .ToArray();
+                    var starts = maze.StartMap ?? Array.Empty<int>();
+                    for (var point = 0; point + 1 < starts.Length; point += 2)
+                    {
+                        var x = starts[point];
+                        var y = starts[point + 1];
+                        if ((maze.BossMap is { Length: >= 2 } && maze.BossMap[0] == x && maze.BossMap[1] == y)
+                            || maze.MapSpecifications.Any(spec => spec.X == x && spec.Y == y)
+                            || !DungeonMapResolver.TryGetMazeCellGreed(maze, x, y, out var greed))
+                            continue;
+
+                        // 从当前资源推导合法入口集合，适配显式指定 MAP 或调整布局的 PVF。
+                        var expected = entranceMaps.Where(entry => string.Equals(
+                            new string((entry.Map.Greed ?? string.Empty)
+                                .Where(ch => !char.IsWhiteSpace(ch) && ch != '`' && ch != ',')
+                                .Take(2).ToArray()), greed, StringComparison.OrdinalIgnoreCase))
+                            .Select(entry => entry.MapId).ToArray();
+                        if (expected.Length == 0)
+                            continue;
+
+                        var actual = DungeonMapResolver.ResolveMapId(
+                            dungeonEntry.Id, x, y, maze, mazeIndex, maze.BossMap);
+                        Check($"dungeon={dungeonEntry.Id} maze={mazeIndex} start=({x},{y}) selects an owned entrance with matching doors",
+                            expected.Contains(actual), ref failures);
+                        checkedRooms++;
+                    }
+                }
+            }
+            Console.WriteLine($"Implicit entrance selection checked {checkedRooms} configured start rooms.");
+        }
+
+        private static void VerifyScreamTowerMapOwnership(ref int failures)
+        {
+            if (string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("PVF_ARCHIVE_PATH")))
+                return;
+
+            var checkedRooms = 0;
+            foreach (var entry in DungeonCatalog.LoadDungeonList().Entries.Where(entry =>
+                entry.FilePath.Replace('\\', '/').StartsWith("Towers/ScreamTower", StringComparison.OrdinalIgnoreCase)))
+            {
+                var dungeon = Dungeon.GetDungeonFile(entry.Id);
+                for (var mazeIndex = 0; mazeIndex < dungeon.Mazes.Count; mazeIndex++)
+                {
+                    var maze = dungeon.Mazes[mazeIndex];
+                    var starts = maze.StartMap ?? Array.Empty<int>();
+                    for (var point = 0; point + 1 < starts.Length; point += 2)
+                    {
+                        var actual = DungeonMapResolver.ResolveMapId(
+                            entry.Id, starts[point], starts[point + 1], maze, mazeIndex, maze.BossMap);
+                        Check($"Scream Tower dungeon={entry.Id} maze={mazeIndex} entrance stays on its own floor",
+                            DungeonMapCatalog.GetDungeonOwner(actual) == entry.Id, ref failures);
+                        checkedRooms++;
+                    }
+                }
+            }
+            Console.WriteLine($"Scream Tower ownership checked {checkedRooms} configured start rooms.");
         }
 
         private static void VerifyRealArdenBossMap(ref int failures)

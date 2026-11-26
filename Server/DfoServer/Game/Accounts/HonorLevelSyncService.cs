@@ -3,6 +3,7 @@ using DfoServer.Game.SelectCharacter;
 using DfoServer.Infrastructure;
 using DfoServer.Network;
 using DfoServer.Network.Builders;
+using System;
 using System.Collections.Generic;
 using System.Threading.Tasks;
 
@@ -46,15 +47,27 @@ namespace DfoServer.Game.Accounts
             return _repository.LoadSummary(accountId, accountCharacters);
         }
 
-        public async Task SendInfoAsync(EnhancedClientSession session, string protocolName, string reason, HonorLevelSummary summary = null)
+        public async Task SendInfoAsync(EnhancedClientSession session, string protocolName, string reason,
+            HonorLevelSummary summary = null, Func<byte[], Task> sendPacket = null)
         {
             var accountId = session?.Account?.AccountId ?? 0;
             if (accountId <= 0)
                 return;
 
+            var characterLevel = session?.Player?.Level ?? 0;
+            if (!HonorLevelDataProvider.ShouldSendHonorLevelUpBanner(characterLevel))
+            {
+                FileLogger.Log($"[{protocolName}] HONOR_LEVEL_INFO skipped {reason}: account={accountId} cid={session?.Player?.CharacterId ?? 0} level={characterLevel}");
+                return;
+            }
+
             summary = summary ?? LoadSummary(accountId);
-            await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(0x00, 0x0289,
-                HonorLevelPacketBuilder.BuildInfoBody(summary)));
+            var packet = GamePacketEnvelopeBuilder.Build(0x00, (ushort)NotiPacketTypeA21.HONOR_LEVEL_INFO,
+                HonorLevelPacketBuilder.BuildInfoBody(summary));
+            if (sendPacket == null)
+                await session.SendPacketAsync(packet);
+            else
+                await sendPacket(packet);
             LogInfo(protocolName, reason, accountId, summary);
         }
 

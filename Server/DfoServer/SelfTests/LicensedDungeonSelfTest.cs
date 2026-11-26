@@ -841,9 +841,11 @@ WHERE type='table'
             {
                 using var command = connection.CreateCommand();
                 command.Transaction = transaction;
-                command.CommandText = @"
+                command.CommandText = MigrationSelfTestFixture.RemoveGuildContributionColumns + @"
 DROP TABLE character_license_dungeon_period_state;
 DROP TABLE character_license_dungeon_progress;
+-- The v11 fixture must not retain the guild progress table introduced in v35.
+DROP TABLE guild_dungeon_progress;
 UPDATE schema_metadata
 SET schema_version = 11,
     updated_at = CURRENT_TIMESTAMP

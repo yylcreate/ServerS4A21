@@ -339,9 +339,11 @@ namespace DfoServer.SelfTests
             });
 
             Check(
-                "EVENT_INFO body starts with count and joust event id",
-                BitConverter.ToUInt16(body, 0) == 1
+                "EVENT_INFO preserves joust first and adds the raid channel event",
+                BitConverter.ToUInt16(body, 0) == 2
                 && BitConverter.ToUInt16(body, 2) == JoustConfig.EventId
+                && BitConverter.ToUInt16(body, body.Length - 16)
+                    == EventInfoBodyBuilder.RaidChannelEventId
                 && body[body.Length - 1] == 0,
                 ref failures);
         }
@@ -358,7 +360,7 @@ namespace DfoServer.SelfTests
             {
                 using (var command = connection.CreateCommand())
                 {
-                    command.CommandText = @"
+                    command.CommandText = MigrationSelfTestFixture.RemoveGuildContributionColumns + @"
 DROP TABLE IF EXISTS event_joust_history;
 DROP TABLE IF EXISTS event_joust_match_results;
 DROP TABLE IF EXISTS event_joust_results;
@@ -369,6 +371,7 @@ DROP TABLE IF EXISTS event_joust_rules;
 DROP TABLE IF EXISTS game_event_info_extra;
 DROP TABLE IF EXISTS game_event_info_details;
 DROP TABLE IF EXISTS game_event_state;
+DROP TABLE guild_dungeon_progress;
 UPDATE schema_metadata SET schema_version=9 WHERE singleton_id=1;
 PRAGMA user_version=9;";
                     command.ExecuteNonQuery();

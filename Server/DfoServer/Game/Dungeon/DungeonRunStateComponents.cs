@@ -214,6 +214,11 @@ namespace DfoServer.Game.Dungeon
             get => Experience.MonsterEquipmentBonusExperience;
             set => Experience.SetEquipmentBonusForCompatibility(value);
         }
+        internal uint MonsterGuildBonusExp
+        {
+            get => Experience.MonsterGuildBonusExperience;
+            set => Experience.SetGuildBonusForCompatibility(value);
+        }
         internal int TotalGold { get; set; }
 
         internal ushort SceneSlotCounter { get; set; }
@@ -371,9 +376,12 @@ namespace DfoServer.Game.Dungeon
 
         internal DeathTower.DeathTowerSession Tower { get; set; }
 
-        internal bool HasBossEntranceConditionalSummon =>
+        internal bool HasBossEntranceCondition =>
             BossEntranceConditionTargets != null
-            && BossEntranceConditionTargets.Count > 0
+            && BossEntranceConditionTargets.Count > 0;
+
+        internal bool HasBossEntranceConditionalSummon =>
+            HasBossEntranceCondition
             && BossEntranceConditionalSummonCodes != null
             && BossEntranceConditionalSummonCodes.Count > 0;
     }

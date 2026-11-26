@@ -1,6 +1,7 @@
 using DfoServer.Game.Dungeon.Tournament;
 using DfoServer.Game.Dungeon.BloodAltar;
 using System;
+using System.Linq;
 
 namespace DfoServer.Game.Dungeon
 {
@@ -9,12 +10,56 @@ namespace DfoServer.Game.Dungeon
         private readonly object _syncRoot = new object();
         private TournamentDungeonRuntime _tournament;
         private BloodAltarDungeonRuntime _bloodAltar;
+        private Bio.BioDungeonRuntime _bio;
+        private Events.GuardianAltar.GuardianAltarDungeonStartPlan _guardianAltar;
+        private Events.GuardianAltar.GuardianAltarEnergyRuntime _guardianAltarEnergy;
+        private Events.GuardianAltar.GuardianAltarCombatRuntime _guardianAltarCombat;
         private DungeonBossRouteRuntime _bossRoute;
+        private AntonAwakeningRewardRuntime _antonAwakeningReward;
         private bool _conditionalBossSpawned;
         private int _conditionalBossCode;
 
         internal DungeonDynamicActorRegistry DynamicActors { get; } =
             new DungeonDynamicActorRegistry();
+
+        // The common Run/Room loading barrier still owns loading and ending.
+        // Energy is a disposable, per-instance elapsed-time projection.
+        internal Events.GuardianAltar.GuardianAltarDungeonStartPlan GuardianAltar
+        {
+            get { lock (_syncRoot) return _guardianAltar; }
+        }
+
+        internal bool TryAttachGuardianAltar(Events.GuardianAltar.GuardianAltarDungeonStartPlan plan)
+        {
+            ArgumentNullException.ThrowIfNull(plan);
+            lock (_syncRoot)
+            {
+                if (_guardianAltar == null)
+                {
+                    var energy = new Events.GuardianAltar.GuardianAltarEnergyRuntime(plan.Energy);
+                    var combat = new Events.GuardianAltar.GuardianAltarCombatRuntime(
+                        plan.CombatMap, plan.SummonData, Math.Max(1, plan.Centers.Count),
+                        plan.Centers.Select((center, index) => (center, index))
+                            .Where(x => x.center.IsFailureCenter).Select(x => checked((ushort)x.index)),
+                        plan.SurvivalRounds);
+                    _guardianAltar = plan;
+                    _guardianAltarEnergy = energy;
+                    _guardianAltarCombat = combat;
+                    return true;
+                }
+                return ReferenceEquals(_guardianAltar, plan);
+            }
+        }
+
+        internal Events.GuardianAltar.GuardianAltarEnergyRuntime GuardianAltarEnergy
+        {
+            get { lock (_syncRoot) return _guardianAltarEnergy; }
+        }
+
+        internal Events.GuardianAltar.GuardianAltarCombatRuntime GuardianAltarCombat
+        {
+            get { lock (_syncRoot) return _guardianAltarCombat; }
+        }
 
         internal bool ConditionalBossSpawned
         {
@@ -109,6 +154,31 @@ namespace DfoServer.Game.Dungeon
             }
         }
 
+        internal Bio.BioDungeonRuntime Bio
+        {
+            get
+            {
+                lock (_syncRoot)
+                    return _bio;
+            }
+        }
+
+        internal bool TryAttachBio(Bio.BioDungeonRuntime runtime)
+        {
+            if (runtime == null)
+                throw new ArgumentNullException(nameof(runtime));
+
+            lock (_syncRoot)
+            {
+                if (_bio == null)
+                {
+                    _bio = runtime;
+                    return true;
+                }
+                return ReferenceEquals(_bio, runtime);
+            }
+        }
+
         internal DungeonBossRouteRuntime BossRoute
         {
             get
@@ -134,13 +204,50 @@ namespace DfoServer.Game.Dungeon
             }
         }
 
+        internal AntonAwakeningRewardRuntime AntonAwakeningReward
+        {
+            get
+            {
+                lock (_syncRoot)
+                    return _antonAwakeningReward;
+            }
+        }
+
+        internal bool TryAttachAntonAwakeningReward(
+            AntonAwakeningRewardRuntime runtime)
+        {
+            if (runtime == null)
+                throw new ArgumentNullException(nameof(runtime));
+
+            lock (_syncRoot)
+            {
+                if (_antonAwakeningReward == null)
+                {
+                    _antonAwakeningReward = runtime;
+                    return true;
+                }
+                return ReferenceEquals(_antonAwakeningReward, runtime);
+            }
+        }
+
         internal void OnInstanceEnding()
         {
             BloodAltarDungeonRuntime bloodAltar;
+            Bio.BioDungeonRuntime bio;
+            Events.GuardianAltar.GuardianAltarEnergyRuntime guardianEnergy;
+            Events.GuardianAltar.GuardianAltarCombatRuntime guardianCombat;
             lock (_syncRoot)
+            {
                 bloodAltar = _bloodAltar;
+                bio = _bio;
+                guardianEnergy = _guardianAltarEnergy;
+                guardianCombat = _guardianAltarCombat;
+            }
 
             bloodAltar?.Timers.CancelAll();
+            bio?.End();
+            guardianEnergy?.Close();
+            guardianCombat?.Close();
         }
     }
 }

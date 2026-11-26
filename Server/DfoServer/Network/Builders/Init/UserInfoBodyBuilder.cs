@@ -25,8 +25,10 @@ namespace DfoServer.Network.Builders
                 WriteA21Subtype1Prefix(
                     w,
                     (ushort)c.CharacterId,
-                    addition.ManageLevel,
-                    addition.AuraSkinFlag);
+                    addition.Progress1,
+                    addition.Progress2,
+                    addition.AuraSkinFlag,
+                    addition.GrowthCapsuleExp);
                 w.WriteBytes(UserInfoSubtype1Builder.BuildFromSnapshot(
                     addition,
                     snapshot.InitializationSnapshot.SkillInfo,
@@ -56,15 +58,19 @@ namespace DfoServer.Network.Builders
         internal static void WriteA21Subtype1Prefix(
             GamePacketWriter writer,
             ushort characterId,
-            byte manageLevel,
-            byte auraSkinFlag)
+            uint honorLevel,
+            uint honorExp,
+            byte auraSkinFlag,
+            uint growthCapsuleExp)
         {
             writer.WriteByte(1);
             writer.WriteUInt16(1);
-            var prefix = new byte[15];
-            prefix[6] = manageLevel;
-            prefix[14] = auraSkinFlag != 0 ? (byte)1 : (byte)0;
-            writer.WriteBytes(prefix);
+            // The prefix carries the character's account honor level and EXP.
+            writer.WriteUInt32(growthCapsuleExp);
+            writer.WriteUInt16(0);
+            writer.WriteUInt32(honorLevel);
+            writer.WriteUInt32(honorExp);
+            writer.WriteByte(auraSkinFlag != 0 ? (byte)1 : (byte)0);
             writer.WriteUInt16(characterId);
         }
     }

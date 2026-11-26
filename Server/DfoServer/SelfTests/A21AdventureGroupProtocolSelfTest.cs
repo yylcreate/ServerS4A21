@@ -1,15 +1,19 @@
+using DfoServer.Game.Accounts;
 using DfoServer.Game.Characters;
 using DfoServer.Game.Inventory;
 using DfoServer.Game.ItemUpgrade;
 using DfoServer.Game.Mercenary;
 using DfoServer.Game.SelectCharacter;
 using DfoServer.Game.Skills;
+using DfoServer.Infrastructure;
 using DfoServer.Network;
 using DfoServer.Network.Builders;
 using DfoServer.Network.Handlers;
 using DfoServer.Network.Parsers.Mercenary;
+using Microsoft.Data.Sqlite;
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 
 namespace DfoServer.SelfTests
@@ -38,18 +42,98 @@ namespace DfoServer.SelfTests
             CheckSkillPageWireCombo(ref failures);
             CheckTagCharacterRecordLayout(ref failures);
             CheckTagCharacterEquipmentSlots(ref failures);
+            CheckPartySupportBody(ref failures);
             CheckCombatStatBlobIsShared(ref failures);
             CheckMercenaryWaitingAndReturn(ref failures);
             CheckInitSequencePushesMercenaryInfo(ref failures);
             CheckUserInfoSubtype6AndMoodValue(ref failures);
             CheckRosterWireIndex(ref failures);
             CheckHandlerRegistrationConstants(ref failures);
+            CheckAdventureGroupUserInfoTail(ref failures);
 
             Console.WriteLine(
                 failures == 0
                     ? "A21_ADVENTURE_GROUP_PROTOCOL: PASS"
                     : $"A21_ADVENTURE_GROUP_PROTOCOL: FAIL count={failures}");
             return failures == 0 ? 0 : 1;
+        }
+
+        private static void CheckAdventureGroupUserInfoTail(ref int failures)
+        {
+            var characters = new[]
+            {
+                new CharacterRecord { CharacterId = 5461, AccountId = 1, Level = 86 },
+                new CharacterRecord { CharacterId = 5462, AccountId = 1, Level = 86 },
+            };
+            var group = AdventureGroupDataProvider.Calculate(characters);
+            var honor = new HonorLevelSummary { HonorLevel = 9, HonorExp = 321 };
+            foreach (var populated in new[] { false, true })
+            {
+                var addition = new UserInfoAdditionSnapshot();
+                SkillInfoSnapshot skills = null;
+                if (populated)
+                {
+                    addition.SpecialRewardQuestIds.Add(0x34BE);
+                    addition.SpecialRewardQuestIds.Add(0x34C0);
+                    skills = new SkillInfoSnapshot();
+                    for (var pageIndex = 0; pageIndex < 2; pageIndex++)
+                    {
+                        var page = new SkillInfoPageSnapshot();
+                        page.Entries.Add(new SkillInfoEntrySnapshot { SkillId = 179, Level = 7 });
+                        page.Entries.Add(new SkillInfoEntrySnapshot { SkillId = 174, Level = 1 });
+                        skills.Pages.Add(page);
+                    }
+                }
+
+                var body = UserInfoBroadcastService.BuildSubtype1Body(characters[0], addition, characters, honor, skills);
+                using var stream = new MemoryStream(body);
+                using var reader = new BinaryReader(stream);
+                // Independent walk of 13E6370 and its packet-consuming callees.
+                var valid = reader.ReadByte() == 1 && reader.ReadUInt16() == 1;
+                reader.ReadUInt32();
+                reader.ReadUInt16();
+                valid &= reader.ReadUInt32() == honor.HonorLevel;
+                valid &= reader.ReadUInt32() == honor.HonorExp;
+                reader.ReadByte();
+                valid &= reader.ReadUInt16() == characters[0].CharacterId;
+                reader.ReadUInt32();
+                var statLength = reader.ReadInt32();
+                valid &= statLength == 88 && reader.ReadBytes(statLength).Length == statLength;
+                reader.ReadByte();
+                valid &= reader.ReadByte() == 0; // no equipment in this fixture
+                reader.ReadBytes(12);
+                reader.ReadByte();
+                for (var pageIndex = 0; pageIndex < 2; pageIndex++)
+                {
+                    var count = reader.ReadByte();
+                    valid &= count == (populated ? 2 : 0);
+                    for (var index = 0; index < count; index++)
+                    {
+                        reader.ReadUInt16();
+                        reader.ReadByte();
+                    }
+                }
+                reader.ReadByte(); // creature level, immediately followed by counts
+                var dimensionCount = reader.ReadByte();
+                valid &= dimensionCount == 26;
+                reader.ReadBytes(dimensionCount * 6);
+                reader.ReadBytes(3);
+                var accountCount = reader.ReadByte();
+                valid &= accountCount == 0;
+                reader.ReadBytes(accountCount * 8);
+                reader.ReadByte();
+                var questCount = reader.ReadUInt32();
+                valid &= questCount == (populated ? 2u : 0u);
+                for (var index = 0; index < questCount; index++)
+                    reader.ReadUInt32();
+                var manageLevel = reader.ReadByte();
+                var managePoint = reader.ReadInt32();
+                Check(
+                    $"USERINFO1 preserves adventure-group buff level through native dynamic fields (populated={populated})",
+                    valid && group.ManageLevel > 0 && manageLevel == group.ManageLevel
+                    && managePoint == group.TotalPoint && stream.Position == stream.Length,
+                    ref failures);
+            }
         }
 
         private static void CheckPaddedParsers(ref int failures)
@@ -335,6 +419,187 @@ namespace DfoServer.SelfTests
                 && record[offset + 1] == (byte)EquipmentType.GuildMedal
                 && BitConverter.ToInt32(record, offset + 2) == 100380044,
                 ref failures);
+        }
+
+        private static void CheckPartySupportBody(ref int failures)
+        {
+            var tempDbPath = Path.Combine(
+                Path.GetTempPath(),
+                "s4a21-party-support-" + Guid.NewGuid().ToString("N") + ".db");
+            try
+            {
+                var database = new GameDatabase(tempDbPath, ServerPaths.SchemaFilePath);
+                Check(
+                    "party 0x019F rejects null/empty owner list",
+                    !StrikerSupportTagCharacterPacketBuilder.TryBuildPartySupportBody(
+                        null, database, out var nullBody)
+                    && nullBody == null
+                    && !StrikerSupportTagCharacterPacketBuilder.TryBuildPartySupportBody(
+                        Array.Empty<int>(), database, out var emptyBody)
+                    && emptyBody == null,
+                    ref failures);
+                Check(
+                    "party 0x019F skips invalid cids and owners without support state",
+                    !StrikerSupportTagCharacterPacketBuilder.TryBuildPartySupportBody(
+                        new[] { 0, -7, 424240, 424241 }, database, out var missingBody)
+                    && missingBody == null,
+                    ref failures);
+
+                var entry = StrikerSkillDataProvider.GetAll()
+                    .Where(candidate => candidate.RequiredLevel <= 86)
+                    .OrderBy(candidate => candidate.RequiredLevel)
+                    .FirstOrDefault();
+                var minimumLevel = StrikerSkillDataProvider.GetMinimumSupportLevel();
+                Check(
+                    "PVF striker data supports the party 0x019F fixture",
+                    entry != null
+                    && minimumLevel > 0
+                    && minimumLevel <= 86
+                    && StrikerSkillDataProvider.GetMaxActiveSupportCount() == 1,
+                    ref failures);
+                if (entry == null || minimumLevel <= 0 || minimumLevel > 86)
+                    return;
+
+                const int owner1 = 41011;
+                const int owner2 = 41012;
+                const int owner3 = 41013;
+                const int support = 42020;
+                const int crossAccountSupport = 42021;
+                var supportLevel = (byte)Math.Max(minimumLevel, entry.RequiredLevel);
+                var supportGrow = (byte)(0x10 | entry.GrowType);
+                using (var connection = database.OpenConnection())
+                using (var command = connection.CreateCommand())
+                {
+                    command.CommandText = @"
+INSERT INTO accounts (account_id, m_id, password_hash)
+VALUES (4477, 'party-support-fixture', ''), (4488, 'party-support-other', '');
+INSERT INTO characters (character_id, account_id, name, job, grow_type, level)
+VALUES (@owner1, 4477, 'po1', 0, 0, 86),
+       (@owner2, 4477, 'po2', 0, 0, 86),
+       (@owner3, 4477, 'po3', 0, 0, 86),
+       (@support, 4477, 'psup', @job, @grow, @level),
+       (@crossSupport, 4488, 'pxsup', @job, @grow, @level);
+INSERT INTO character_subtype1_fields (character_id) VALUES (@support);";
+                    command.Parameters.AddWithValue("@owner1", owner1);
+                    command.Parameters.AddWithValue("@owner2", owner2);
+                    command.Parameters.AddWithValue("@owner3", owner3);
+                    command.Parameters.AddWithValue("@support", support);
+                    command.Parameters.AddWithValue("@crossSupport", crossAccountSupport);
+                    command.Parameters.AddWithValue("@job", entry.Job);
+                    command.Parameters.AddWithValue("@grow", supportGrow);
+                    command.Parameters.AddWithValue("@level", supportLevel);
+                    command.ExecuteNonQuery();
+                }
+
+                var repository = new SqliteMercenarySupportRepository(database);
+                repository.Save(new MercenarySupportState
+                {
+                    OwnerCharacterId = owner1,
+                    Slot = MercenarySupportState.SingletonStateKey,
+                    SupportCharacterId = support,
+                    SkillId = (ushort)entry.SkillIndex,
+                    StrikerSkillId = (ushort)entry.ComboIndex,
+                });
+                repository.Save(new MercenarySupportState
+                {
+                    OwnerCharacterId = owner2,
+                    Slot = MercenarySupportState.SingletonStateKey,
+                    SupportCharacterId = support,
+                    SkillId = (ushort)entry.SkillIndex,
+                    StrikerSkillId = (ushort)entry.ComboIndex,
+                });
+                // owner3 的支援角色属于另一个账号：状态校验必须失败但只跳过该成员。
+                repository.Save(new MercenarySupportState
+                {
+                    OwnerCharacterId = owner3,
+                    Slot = MercenarySupportState.SingletonStateKey,
+                    SupportCharacterId = crossAccountSupport,
+                    SkillId = (ushort)entry.SkillIndex,
+                    StrikerSkillId = (ushort)entry.ComboIndex,
+                });
+
+                var owner1State = repository.LoadSlot(
+                    owner1,
+                    MercenarySupportState.SingletonStateKey);
+                var owner1Body = StrikerSupportTagCharacterPacketBuilder.BuildOwnerMappedBody(
+                    owner1,
+                    owner1State,
+                    database);
+                var singleBuilt = StrikerSupportTagCharacterPacketBuilder.TryBuildPartySupportBody(
+                    new[] { owner1 },
+                    database,
+                    out var singleBody);
+                Check(
+                    "single-owner party 0x019F body stays byte-identical to BuildOwnerMappedBody",
+                    singleBuilt
+                    && singleBody != null
+                    && owner1Body != null
+                    && owner1Body.Length > 2
+                    && singleBody.SequenceEqual(owner1Body),
+                    ref failures);
+
+                var owner2State = repository.LoadSlot(
+                    owner2,
+                    MercenarySupportState.SingletonStateKey);
+                var owner2Body = StrikerSupportTagCharacterPacketBuilder.BuildOwnerMappedBody(
+                    owner2,
+                    owner2State,
+                    database);
+                var recordLength = owner1Body.Length - 2;
+                var partyBuilt = StrikerSupportTagCharacterPacketBuilder.TryBuildPartySupportBody(
+                    new[] { owner2, owner1 },
+                    database,
+                    out var partyBody);
+                Check(
+                    "party 0x019F aggregates count=N records keyed by owner cid in input order",
+                    partyBuilt
+                    && partyBody != null
+                    && BitConverter.ToUInt16(partyBody, 0) == 2
+                    && BitConverter.ToUInt16(partyBody, 2) == owner2
+                    && partyBody.Length == 2 + (owner2Body.Length - 2) + recordLength
+                    && partyBody.AsSpan(2, owner2Body.Length - 2)
+                        .SequenceEqual(owner2Body.AsSpan(2))
+                    && BitConverter.ToUInt16(partyBody, 2 + (owner2Body.Length - 2)) == owner1
+                    && partyBody.AsSpan(2 + (owner2Body.Length - 2), recordLength)
+                        .SequenceEqual(owner1Body.AsSpan(2)),
+                    ref failures);
+
+                var mixedBuilt = StrikerSupportTagCharacterPacketBuilder.TryBuildPartySupportBody(
+                    new[] { 0, -1, owner1, owner1, owner3, owner2 },
+                    database,
+                    out var mixedBody);
+                var expectedMixed = new byte[2 + recordLength + (owner2Body.Length - 2)];
+                expectedMixed[0] = 2;
+                expectedMixed[1] = 0;
+                Array.Copy(owner1Body, 2, expectedMixed, 2, recordLength);
+                Array.Copy(
+                    owner2Body,
+                    2,
+                    expectedMixed,
+                    2 + recordLength,
+                    owner2Body.Length - 2);
+                Check(
+                    "party 0x019F dedupes owners, skips invalid cids and failed members",
+                    mixedBuilt
+                    && mixedBody != null
+                    && mixedBody.SequenceEqual(expectedMixed),
+                    ref failures);
+            }
+            finally
+            {
+                try
+                {
+                    SqliteConnection.ClearAllPools();
+                    foreach (var path in new[] { tempDbPath, tempDbPath + "-wal", tempDbPath + "-shm" })
+                    {
+                        if (File.Exists(path))
+                            File.Delete(path);
+                    }
+                }
+                catch
+                {
+                }
+            }
         }
 
         private static void CheckCombatStatBlobIsShared(ref int failures)

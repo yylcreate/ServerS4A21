@@ -7,6 +7,10 @@ namespace DfoServer.Game.Currency
 {
     public static class CurrencyService
     {
+        // Current PVF: stackable/cash/chn_Trade_Gold/trade_point.stk.
+        // Mail attachments represent token_cera, not a physical inventory stack.
+        internal const int TokenCeraVoucherItemId = 2681762;
+
         private static readonly Dictionary<int, (string ColumnName, int Slot)> CubeFragmentMap =
             new Dictionary<int, (string, int)>
             {
@@ -197,6 +201,53 @@ namespace DfoServer.Game.Currency
             }
         }
 
+        internal static bool TryLoadCubeFragmentCount(SqliteConnection connection,
+            SqliteTransaction transaction, int accountId, int itemId, out int count)
+        {
+            count = 0;
+            if (!CubeFragmentMap.TryGetValue(itemId, out var entry) || accountId <= 0)
+                return false;
+            using var command = connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = $"SELECT {entry.ColumnName} FROM accounts WHERE account_id=@aid "
+                + $"AND typeof({entry.ColumnName})='integer';";
+            command.Parameters.AddWithValue("@aid", accountId);
+            var value = command.ExecuteScalar();
+            if (value == null || value == DBNull.Value) return false;
+            var balance = Convert.ToInt64(value);
+            if (balance < 0 || balance > int.MaxValue) return false;
+            count = (int)balance;
+            return true;
+        }
+
+        internal static bool TryApplyCubeFragmentDelta(SqliteConnection connection,
+            SqliteTransaction transaction, int accountId, int itemId, long delta,
+            out int beforeCount, out int afterCount)
+        {
+            beforeCount = afterCount = 0;
+            if (!CubeFragmentMap.TryGetValue(itemId, out var entry) || accountId <= 0
+                || delta < -int.MaxValue || delta > int.MaxValue)
+                return false;
+            // Only the fixed six crystal columns may enter this path. A stale
+            // character projection submits its change, never its old absolute balance.
+            using var command = connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = $@"
+UPDATE accounts SET {entry.ColumnName}={entry.ColumnName}+@delta
+WHERE account_id=@aid AND typeof({entry.ColumnName})='integer'
+  AND {entry.ColumnName} BETWEEN 0 AND @maximum
+  AND {entry.ColumnName}+@delta BETWEEN 0 AND @maximum
+RETURNING {entry.ColumnName};";
+            command.Parameters.AddWithValue("@delta", delta);
+            command.Parameters.AddWithValue("@aid", accountId);
+            command.Parameters.AddWithValue("@maximum", int.MaxValue);
+            var value = command.ExecuteScalar();
+            if (value == null || value == DBNull.Value) return false;
+            afterCount = checked((int)Convert.ToInt64(value));
+            beforeCount = checked((int)((long)afterCount - delta));
+            return true;
+        }
+
         public static void SetSoulWarehouseCount(
             SqliteConnection conn,
             SqliteTransaction tx,
@@ -322,6 +373,21 @@ WHERE c.character_id = @cid;";
 
         public static void GrantTokenCera(SqliteConnection connection, SqliteTransaction transaction, int characterId, int amount)
             => GrantAccountCurrency(connection, transaction, characterId, "token_cera", amount);
+
+        internal static bool TryGrantTokenCera(SqliteConnection connection, SqliteTransaction transaction, int characterId, int amount)
+        {
+            if (amount < 0) throw new ArgumentOutOfRangeException(nameof(amount));
+            if (amount == 0) return true;
+            using var command = connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = @"UPDATE accounts SET token_cera=token_cera+@amount
+WHERE account_id=(SELECT account_id FROM characters WHERE character_id=@cid)
+  AND token_cera>=0 AND token_cera<=@limit-@amount;";
+            command.Parameters.AddWithValue("@amount", amount);
+            command.Parameters.AddWithValue("@cid", characterId);
+            command.Parameters.AddWithValue("@limit", int.MaxValue);
+            return command.ExecuteNonQuery() == 1;
+        }
 
         public static bool TrySpendTokenCera(SqliteConnection connection, SqliteTransaction transaction, int characterId, int amount)
             => TrySpendAccountCurrency(connection, transaction, characterId, "token_cera", amount);

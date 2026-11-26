@@ -236,8 +236,9 @@ namespace DfoServer.SelfTests
 
                     using (var command = connection.CreateCommand())
                     {
-                        command.CommandText = @"
+                        command.CommandText = MigrationSelfTestFixture.RemoveGuildContributionColumns + @"
 ALTER TABLE characters DROP COLUMN growup_change_count;
+DROP TABLE guild_dungeon_progress;
 UPDATE schema_metadata SET schema_version = 7 WHERE singleton_id = 1;
 PRAGMA user_version = 7;";
                         command.ExecuteNonQuery();

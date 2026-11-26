@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
+using System.Linq;
 using System.Threading;
 
 namespace DfoServer.Game.Dungeon
@@ -290,6 +291,7 @@ namespace DfoServer.Game.Dungeon
             Maze = maze;
             Seed = seed;
             FirstActorSequenceId = firstActorSequenceId;
+            Elevator = maze.HasElevatorControl ? new ElevatorRoomRuntime() : null;
         }
 
         public long RoomInstanceId { get; }
@@ -318,6 +320,7 @@ namespace DfoServer.Game.Dungeon
         public uint Seed { get; }
         public ushort FirstActorSequenceId { get; }
         public DungeonEffectLedger Effects { get; } = new DungeonEffectLedger();
+        internal ElevatorRoomRuntime Elevator { get; }
         public DungeonRoomState State { get { lock (_syncRoot) return _state; } }
         public DungeonEncounterState EncounterState
         {
@@ -411,6 +414,13 @@ namespace DfoServer.Game.Dungeon
                 _loadingProjectedParticipants.Add(participant);
                 return _loadingGeneration;
             }
+        }
+
+        internal bool IsCurrentLoadingGeneration(long generation)
+        {
+            lock (_syncRoot)
+                return generation > 0 && _state != DungeonRoomState.Closed
+                    && _loadingGeneration == generation;
         }
 
         internal DungeonRoomLoadingReadyResult MarkLoadingReady(
@@ -725,6 +735,7 @@ namespace DfoServer.Game.Dungeon
                         out var completingDeath)
                             ? completingDeath.Source
                             : fallbackSource;
+                    Elevator?.Complete(_clearSource.OccurredTick);
                 }
 
                 return new DungeonRoomClearCommit(
@@ -829,6 +840,7 @@ namespace DfoServer.Game.Dungeon
                 if (_state == DungeonRoomState.Closed)
                     return false;
                 _state = DungeonRoomState.Closed;
+                Elevator?.Close();
                 _loadingReleased = true;
                 _loadingProjectionId = 0;
                 _loadingProjectedParticipants.Clear();
@@ -907,7 +919,10 @@ namespace DfoServer.Game.Dungeon
             ushort SequenceId)> _recordedKillActors =
                 new HashSet<(long, RoomKey, ushort)>();
         private DungeonSelectionSnapshot _selection;
+        private Game.Guilds.GuildDungeonAdmissionSnapshot _guildDungeonAdmission;
+        private Game.Guilds.GuildDungeonClearContribution _guildDungeonContribution;
         private DungeonClearedFact _clearedFact;
+        private SecretShop.SecretShopRoll _secretShopRoll;
         private DungeonInstanceState _state = DungeonInstanceState.Created;
         private int _normalKillCount;
         private int _championKillCount;
@@ -945,6 +960,20 @@ namespace DfoServer.Game.Dungeon
         internal DungeonInstance(
             short dungeonId,
             byte difficulty,
+            GameWorld.SequentialDungeonDefinitionCatalog sequentialCatalog)
+            : this(
+                dungeonId,
+                difficulty,
+                DungeonRewardPolicy.Standard,
+                DungeonDropDefinition.CreateStandard(dungeonId),
+                GameWorld.DungeonExperienceDefinitionCatalog.Resolve(dungeonId),
+                sequentialCatalog)
+        {
+        }
+
+        internal DungeonInstance(
+            short dungeonId,
+            byte difficulty,
             DungeonRewardPolicy rewardPolicy,
             DungeonDropDefinition dropDefinition)
             : this(
@@ -961,7 +990,8 @@ namespace DfoServer.Game.Dungeon
             byte difficulty,
             DungeonRewardPolicy rewardPolicy,
             DungeonDropDefinition dropDefinition,
-            GameWorld.DungeonExperienceDefinition experienceDefinition)
+            GameWorld.DungeonExperienceDefinition experienceDefinition,
+            GameWorld.SequentialDungeonDefinitionCatalog sequentialCatalog = null)
         {
             PartyDungeonInstanceId = DungeonIdentityGenerator.NextInstanceId();
             DungeonId = dungeonId;
@@ -971,6 +1001,13 @@ namespace DfoServer.Game.Dungeon
                 ?? throw new ArgumentNullException(nameof(dropDefinition));
             ExperienceDefinition = experienceDefinition
                 ?? throw new ArgumentNullException(nameof(experienceDefinition));
+            var definitionCatalog = sequentialCatalog
+                ?? GameWorld.SequentialDungeonDefinitionCatalog.Current;
+            SequentialDefinitionResolution = definitionCatalog
+                .ResolvePrimaryByDungeonId(
+                    dungeonId,
+                    out var sequentialDefinition);
+            SequentialDefinition = sequentialDefinition;
             CreatedUtc = DateTime.UtcNow;
         }
 
@@ -985,11 +1022,22 @@ namespace DfoServer.Game.Dungeon
         {
             get;
         }
+        internal GameWorld.SequentialDungeonDefinition SequentialDefinition
+        {
+            get;
+        }
+        internal GameWorld.SequentialDungeonCapabilityResolution
+            SequentialDefinitionResolution
+        {
+            get;
+        }
         public DateTime CreatedUtc { get; }
         public DungeonEffectLedger Effects { get; } = new DungeonEffectLedger();
         internal SemaphoreSlim ParticipantLifeGate { get; } =
             new SemaphoreSlim(1, 1);
         internal SemaphoreSlim CardRewardProjectionGate { get; } =
+            new SemaphoreSlim(1, 1);
+        internal SemaphoreSlim CardRewardSendGate { get; } =
             new SemaphoreSlim(1, 1);
         internal SemaphoreSlim SettlementTransitionGate { get; } =
             new SemaphoreSlim(1, 1);
@@ -1000,6 +1048,46 @@ namespace DfoServer.Game.Dungeon
         internal DungeonDiagnosticJournal Diagnostics { get; } =
             new DungeonDiagnosticJournal();
         public DungeonSelectionSnapshot Selection { get { lock (_syncRoot) return _selection; } }
+        internal Game.Guilds.GuildDungeonAdmissionSnapshot GuildDungeonAdmission
+        { get { lock (_syncRoot) return _guildDungeonAdmission; } }
+
+        internal bool TryFreezeGuildDungeonAdmission(Game.Guilds.GuildDungeonAdmissionSnapshot admission)
+        {
+            lock (_syncRoot)
+            {
+                if (_guildDungeonAdmission != null || admission == null
+                    || admission.DungeonId != DungeonId || admission.Difficulty != Difficulty)
+                    return false;
+                _guildDungeonAdmission = admission;
+                return true;
+            }
+        }
+        internal Game.Guilds.GuildDungeonClearContribution GetOrCreateGuildDungeonContribution(
+            DungeonClearedFact clearFact, int monthId, IReadOnlyList<DungeonParticipantRosterEntry> roster)
+        {
+            lock (_syncRoot)
+            {
+                if (_guildDungeonAdmission == null || clearFact == null || !ReferenceEquals(clearFact, _clearedFact)
+                    || !Game.Guilds.GuildDungeonMonth.IsValid(monthId) || roster == null)
+                    throw new InvalidOperationException("Guild contribution requires the current shared clear and its frozen roster.");
+                if (_guildDungeonContribution != null)
+                    return _guildDungeonContribution;
+                if (roster.Any(row => row == null || row.RunIdentity.PartyDungeonInstanceId != PartyDungeonInstanceId))
+                    throw new InvalidOperationException("Guild clear participants must belong to this physical instance.");
+                var grouped = roster.GroupBy(row => row.CharacterId).ToArray();
+                int memberCount = grouped.Length;
+                if (memberCount < 1 || memberCount > 4)
+                    throw new InvalidOperationException("Guild contribution requires one to four distinct participants.");
+                if (grouped.Any(rows => rows.Any(row => row.AccountId <= 0)
+                    || rows.Select(row => row.AccountId).Distinct().Count() != 1))
+                    throw new InvalidOperationException("Guild clear requires original account identities for every frozen character.");
+                var participants = grouped.OrderBy(rows => rows.Key).Select(rows =>
+                    new Game.Guilds.GuildDungeonContributionParticipant(rows.Key, rows.First().AccountId)).ToArray();
+                _guildDungeonContribution = new Game.Guilds.GuildDungeonClearContribution(clearFact.SourceEventId, monthId, memberCount)
+                { Participants = Array.AsReadOnly(participants) };
+                return _guildDungeonContribution;
+            }
+        }
         public DungeonClearedFact ClearedFact { get { lock (_syncRoot) return _clearedFact; } }
         public DungeonInstanceState State { get { lock (_syncRoot) return _state; } }
         public int VisitedRoomCount { get { lock (_syncRoot) return _rooms.Count; } }
@@ -1382,6 +1470,25 @@ namespace DfoServer.Game.Dungeon
             }
         }
 
+        internal SecretShop.SecretShopRoll GetOrCreateSecretShopRoll(
+            Func<SecretShop.SecretShopRoll> roller)
+        {
+            if (roller == null)
+                throw new ArgumentNullException(nameof(roller));
+
+            lock (_syncRoot)
+            {
+                if (_secretShopRoll != null)
+                    return _secretShopRoll;
+
+                var roll = roller()
+                    ?? throw new InvalidOperationException(
+                        "Secret shop roller returned an invalid roll.");
+                _secretShopRoll = roll;
+                return roll;
+            }
+        }
+
         internal bool TryBeginEnding()
         {
             lock (_syncRoot)
@@ -1395,6 +1502,8 @@ namespace DfoServer.Game.Dungeon
                 _state = DungeonInstanceState.Ending;
                 _partyWipePending = false;
                 _partyWipeDeadlineUtc = DateTime.MinValue;
+                foreach (var room in _rooms.Values)
+                    room.Elevator?.Close();
             }
 
             Mechanisms.OnInstanceEnding();

@@ -30,6 +30,11 @@ namespace DfoServer.Network.Handlers.Dungeon
             _bloodAltarClearedProjection;
         private Func<EnhancedClientSession, GamePacketHeader, byte[], Task<bool>>
             _bloodAltarEplpHandler;
+        private Func<EnhancedClientSession, GamePacketHeader, byte[], Task<bool>> _guardianAltarEplpHandler;
+
+        internal void ConfigureGuardianAltarEplp(
+            Func<EnhancedClientSession, GamePacketHeader, byte[], Task<bool>> handler)
+            => _guardianAltarEplpHandler = handler ?? throw new ArgumentNullException(nameof(handler));
 
         private const int SetPlayResultRankPointOffset = 10;
         // 成长之契约经验加成从 PVF premiumlist_new.etc 读取(PremiumEffectProvider)。
@@ -358,6 +363,8 @@ namespace DfoServer.Network.Handlers.Dungeon
                                 growthContractBonusExp:
                                     settlement.GrowthContractBonusExp,
                                 eliteMonsterKillBonusExp: 0,
+                                fatigueBurnBonusExp:
+                                    GetSettlementNotificationFatigueBurnBonus(settlement),
                                 reloadMissingAccountProgress: true));
                 }
                 FileLogger.Log(
@@ -571,6 +578,8 @@ namespace DfoServer.Network.Handlers.Dungeon
                                 "SET_PLAY_RESULT",
                                 experiencePotionBonusExp:
                                     settlement.ExperiencePotionBonusExp,
+                                fatigueBurnBonusExp:
+                                    GetSettlementNotificationFatigueBurnBonus(settlement),
                                 reloadMissingAccountProgress: true))
                     || !await ExecuteSettlementProjectionEffectAsync(
                         session,
@@ -610,12 +619,16 @@ namespace DfoServer.Network.Handlers.Dungeon
                                         settlement.ChampionTotalExp),
                                     superChampionExp: ToInt32Saturated(
                                         settlement.SuperChampionTotalExp),
-                                    freeCardGold: settlement.FreeGold.GoldAmount,
-                                    freeCardItemId: settlement.FreeItem.ItemId,
-                                    freeCardItemCount: settlement.FreeItem.StackCount,
+                                    freeCardSeats: BuildClearRewardFreeCardSeats(
+                                        run,
+                                        settlement),
                                     paidCardCost: settlement.PaidCardCost,
                                     objectExperienceEntries:
-                                        settlement.ObjectExperienceEntries)))))
+                                        settlement.ObjectExperienceEntries,
+                                    fatigueBurnExp: ToInt32Saturated(
+                                        settlement.FatigueBurnBonusExp),
+                                    monsterFatigueBurnExp: ToInt32Saturated(
+                                        settlement.MonsterFatigueBurnBonusExp))))))
                 {
                     run.Effects.TryFail(presentationReservation);
                     return;
@@ -733,6 +746,9 @@ namespace DfoServer.Network.Handlers.Dungeon
                     $"base={settlement.ClearBaseExp} " +
                     $"scoreBonus={settlement.ScoreBonusExp} " +
                     $"potionBonus={settlement.ExperiencePotionBonusExp} " +
+                    $"fatigueBurnBonus={settlement.FatigueBurnBonusExp} " +
+                    $"monsterFatigueBurnBonus={settlement.MonsterFatigueBurnBonusExp} " +
+                    $"guildKillBonus={settlement.MonsterGuildBonusExp} " +
                     $"equipBonus={settlement.MonsterEquipmentBonusExp} " +
                     $"total={settlement.ClearTotalExp} " +
                     $"charExp={session.Player.Exp}");
@@ -808,6 +824,65 @@ namespace DfoServer.Network.Handlers.Dungeon
                 run.TryAcknowledgePendingSettlementPresentation(
                     presentationRankPoint);
             }
+        }
+
+        // 0x0023 carries the whole party's free cards: each participant's
+        // frozen (gold, item) is projected into the seat matching that
+        // member's entry party slot, so every client renders teammates'
+        // clear cards, not only its own. A participant whose settlement
+        // runtime is not ready yet (clear commit still in flight or the
+        // member disconnected) keeps the empty seat placeholder instead of
+        // blocking the projection.
+        internal static IReadOnlyList<ClearRewardFreeCardSeat>
+            BuildClearRewardFreeCardSeats(
+                DungeonRun run,
+                DungeonSettlementRuntime ownSettlement,
+                IReadOnlyList<DungeonParticipantRosterEntry> roster = null)
+        {
+            var seats = new ClearRewardFreeCardSeat[
+                DungeonNotificationBuilder.CardSeatCount];
+            if (run == null || ownSettlement == null)
+                return seats;
+
+            var ownSlot = run.EntryPartySlotIndex;
+            if (ownSlot >= seats.Length)
+                ownSlot = 0;
+            var ownGuildReward = run.Instance.GuildDungeonAdmission != null;
+            lock (run.SyncRoot)
+            {
+                if (ownGuildReward && ownSettlement.GuildDungeonClear == null)
+                    return seats;
+                seats[ownSlot] = new ClearRewardFreeCardSeat(
+                    ownSettlement.FreeGold.GoldAmount,
+                    ownSettlement.FreeItem.ItemId,
+                    ownSettlement.FreeItem.StackCount);
+            }
+
+            if (roster == null)
+                roster = CardRewardCoordinator.CaptureCardRewardRoster(run);
+            if (roster.Count == 0)
+                return seats;
+            foreach (var participant in roster)
+            {
+                var peerRun = participant?.Run;
+                if (peerRun == null || ReferenceEquals(peerRun, run))
+                    continue;
+                var partySlot = peerRun.EntryPartySlotIndex;
+                if (partySlot >= seats.Length || partySlot == ownSlot)
+                    continue;
+                var peerGuildReward = peerRun.Instance.GuildDungeonAdmission != null;
+                lock (peerRun.SyncRoot)
+                {
+                    var peerSettlement = peerRun.SettlementRuntime;
+                    if (peerSettlement == null || (peerGuildReward && peerSettlement.GuildDungeonClear == null))
+                        continue;
+                    seats[partySlot] = new ClearRewardFreeCardSeat(
+                        peerSettlement.FreeGold.GoldAmount,
+                        peerSettlement.FreeItem.ItemId,
+                        peerSettlement.FreeItem.StackCount);
+                }
+            }
+            return seats;
         }
 
         private async Task<bool> PrepareSettlementFromClearAsync(
@@ -967,6 +1042,29 @@ namespace DfoServer.Network.Handlers.Dungeon
                 }
 
                 _svc.PersistentMechanisms.ConfigureLinkedChallenge(run);
+                var guildAdmission = run.Instance.GuildDungeonAdmission;
+                if (guildAdmission != null)
+                {
+                    if (!session.Player.IsCurrentDungeonRun(identity))
+                    {
+                        run.Effects.TryFail(authoritativeReservation);
+                        return false;
+                    }
+                    var guildEffect = new DungeonEffectId(clearFact.SourceEventId,
+                        DungeonPersistentEffectKinds.GuildDungeonClearCommit, DungeonEffectScope.Persistent, guildAdmission.GuildId);
+                    var guildContribution = run.Instance.GetOrCreateGuildDungeonContribution(clearFact,
+                        _svc.GuildDungeons.CurrentMonthId, run.Instance.ParticipantEffects.GetRoster(
+                            clearFact.SourceEventId, DungeonParticipantEffectAudience.Instance));
+                    if (!_svc.PersistentEffects.TryApplyGuildDungeonClear(guildEffect, guildAdmission, out var guildClearResult, out var guildError,
+                            guildContribution))
+                    {
+                        FileLogger.Log("[GuildDungeon] clear persistence deferred: " + guildError);
+                        run.Effects.TryFail(authoritativeReservation);
+                        return false;
+                    }
+                    settlement.FreezeGuildDungeonReward(run, guildClearResult);
+                    await _svc.GuildDungeonProgress.SendAsync(session, "dungeon-clear", includeContribution: true);
+                }
                 if (!await ExecuteSettlementEffectAsync(
                         session,
                         run,
@@ -1143,9 +1241,17 @@ namespace DfoServer.Network.Handlers.Dungeon
                     > settlement.ExperiencePotionBonusExp
                 ? updatedPotionBonus - settlement.ExperiencePotionBonusExp
                 : 0;
-            var adjustment = CharacterExperienceService.AddSaturating(
-                scoreDelta,
-                potionDelta);
+            var updatedTotal = CharacterExperienceService.AddSaturating(
+                CharacterExperienceService.AddSaturating(
+                    CalculatePrePotionTotal(settlement, scoreBonus),
+                    updatedPotionBonus),
+                settlement.FatigueBurnBonusExp);
+            // The frozen burn component was already admitted to the first
+            // RawGain. A later rank cannot grant beyond the final saturated
+            // total by summing independent score/potion deltas.
+            var adjustment = updatedTotal > settlement.ClearTotalExp
+                ? updatedTotal - settlement.ClearTotalExp
+                : 0;
             var authoritativeEffectId = GetAuthoritativeSettlementEffectId(run);
             var authoritativeCommitted = run.Effects.GetState(
                 authoritativeEffectId) == DungeonEffectState.Committed;
@@ -1232,7 +1338,9 @@ namespace DfoServer.Network.Handlers.Dungeon
                     settlement.BlackDiamondBonusExp),
                 CharacterExperienceService.AddSaturating(
                     settlement.AdventureGroupBonusExp,
-                    settlement.ExperiencePotionBonusExp));
+                    CharacterExperienceService.AddSaturating(
+                        settlement.ExperiencePotionBonusExp,
+                        settlement.FatigueBurnBonusExp)));
             settlement.ClearTotalExp = CharacterExperienceService.AddSaturating(
                 settlement.ClearBaseExp,
                 settlement.ClearBonusExp);
@@ -1272,6 +1380,7 @@ namespace DfoServer.Network.Handlers.Dungeon
             var shouldScheduleCardRewardFlow = standardPresentation
                 && ShouldScheduleCardRewardFlow(run.DungeonId);
             var isDimensionDungeon = DungeonData.IsDimensionDungeon(run.DungeonId);
+            var isGuildDungeon = run.Instance.GuildDungeonAdmission != null;
             var dungeonLevel = DungeonData.GetDungeonBasicLv(run.DungeonId);
             if (dungeonLevel <= 0)
                 throw new InvalidOperationException(
@@ -1307,7 +1416,17 @@ namespace DfoServer.Network.Handlers.Dungeon
                     partyMemberCount,
                     partyEventBonusRate: 0.0);
 
-            var lcg = run.RoomLcg ?? new DnfLcg(run.Seed);
+            // Card rewards roll on a dedicated per-participant stream. The
+            // shared run.RoomLcg is left untouched: party members freeze the
+            // same room seed, so consuming it here would deal identical
+            // cards to the whole party, and advancing it would perturb the
+            // room drop stream it still serves.
+            var lcg = new DnfLcg(
+                DropService.DeriveParticipantCardSeed(
+                    run.Seed,
+                    run.PartyDungeonInstanceId,
+                    run.CurrentRoomInstanceId,
+                    session.Player?.CharacterId ?? 0));
             var characterJob = session.Player != null ? session.Player.Job : -1;
             var characterGrowType = session.Player != null
                 ? session.Player.GrowType
@@ -1331,7 +1450,7 @@ namespace DfoServer.Network.Handlers.Dungeon
                 ? ClearRewardGenerator.GenerateFreeGoldCard(rewardContext, lcg)
                 : default;
             var freeItem = default(ClearRewardGenerator.CardReward);
-            if (shouldScheduleCardRewardFlow)
+            if (shouldScheduleCardRewardFlow && !isGuildDungeon)
             {
                 if (isDimensionDungeon)
                 {
@@ -1459,6 +1578,7 @@ namespace DfoServer.Network.Handlers.Dungeon
                 AdventureGroupBonusExp = clearExp.AdventureGroupBonus,
                 ExperiencePotionBonusRate = clearExp.ExperiencePotionBonusRate,
                 ExperiencePotionBonusExp = clearExp.ExperiencePotionBonus,
+                FatigueBurnBonusExp = clearExp.FatigueBurnBonus,
                 ClearBonusExp = clearExp.Bonus,
                 ClearTotalExp = clearExp.Total,
                 PreviousLevel = session.Player.Level,
@@ -1488,6 +1608,10 @@ namespace DfoServer.Network.Handlers.Dungeon
                     monsterExperience.MonsterGrowthContractBonusExperience,
                 MonsterEquipmentBonusExp =
                     monsterExperience.MonsterEquipmentBonusExperience,
+                MonsterFatigueBurnBonusExp =
+                    monsterExperience.MonsterFatigueBurnBonusExperience,
+                MonsterGuildBonusExp =
+                    monsterExperience.MonsterGuildBonusExperience,
                 ObjectExperienceEntries =
                     monsterExperience.ObjectExperienceEntries,
                 ClearTimeMilliseconds = clearTimeMilliseconds,
@@ -1519,6 +1643,15 @@ namespace DfoServer.Network.Handlers.Dungeon
                 clearTimeMilliseconds,
                 lcg);
         }
+
+        private static uint GetSettlementNotificationFatigueBurnBonus(
+            DungeonSettlementRuntime settlement)
+            => settlement.ExperienceGrant == null
+                || ReferenceEquals(
+                    settlement.ExperienceGrant,
+                    settlement.ScoreAdjustmentExperienceGrant)
+                ? 0
+                : settlement.FatigueBurnBonusExp;
 
         private ExperienceGrantResult GrantSettlementExperienceInTransaction(
             EnhancedClientSession session,
@@ -1961,6 +2094,14 @@ namespace DfoServer.Network.Handlers.Dungeon
                 ExperienceBonusEffectService.CalculateBonus(
                     prePotionTotal,
                     experienceBonusRate);
+            var totalWithoutBurn = CharacterExperienceService.AddSaturating(
+                prePotionTotal,
+                experienceBonus);
+            var fatigueBurnBonus = DungeonParticipantExperienceRuntime
+                .CalculateFatigueBurnBonus(
+                    storyAdjustedBaseExp,
+                    totalWithoutBurn,
+                    experienceBonusSnapshot.FatigueBurnExperienceBonusPercent);
             FileLogger.Log(
                 $"[{DungeonSharedServices.ProtocolLogName}] "
                 + $"CLEAR_EXP: dungeon={run.DungeonId} "
@@ -1969,7 +2110,9 @@ namespace DfoServer.Network.Handlers.Dungeon
                 + $"storyRate={experienceBonusSnapshot.StoryExperienceBonusRatePercent}% "
                 + $"storyWeight={storyWeightMultiplier:R} "
                 + $"storyBonus={storyBonus} base={clearBaseExp} "
-                + $"adjustedBase={storyAdjustedBaseExp}");
+                + $"adjustedBase={storyAdjustedBaseExp} "
+                + $"fatigueBurnRate={experienceBonusSnapshot.FatigueBurnExperienceBonusPercent}% "
+                + $"fatigueBurnBonus={fatigueBurnBonus}");
 
             return new ClearExpParts(
                 storyAdjustedBaseExp,
@@ -1980,7 +2123,8 @@ namespace DfoServer.Network.Handlers.Dungeon
                 blackDiamondBonus,
                 adventureGroupBonus,
                 experienceBonusRate,
-                experienceBonus);
+                experienceBonus,
+                fatigueBurnBonus);
         }
 
         private static uint CalculateNonStandardCompatibilityClearBase(
@@ -2106,7 +2250,8 @@ namespace DfoServer.Network.Handlers.Dungeon
                 uint blackDiamondBonus,
                 uint adventureGroupBonus,
                 int experiencePotionBonusRate,
-                uint experiencePotionBonus)
+                uint experiencePotionBonus,
+                uint fatigueBurnBonus)
             {
                 Base = baseExp;
                 ScoreBonus = scoreBonus;
@@ -2117,6 +2262,7 @@ namespace DfoServer.Network.Handlers.Dungeon
                 AdventureGroupBonus = adventureGroupBonus;
                 ExperiencePotionBonusRate = experiencePotionBonusRate;
                 ExperiencePotionBonus = experiencePotionBonus;
+                FatigueBurnBonus = fatigueBurnBonus;
             }
 
             internal uint Base { get; }
@@ -2128,6 +2274,7 @@ namespace DfoServer.Network.Handlers.Dungeon
             internal uint AdventureGroupBonus { get; }
             internal int ExperiencePotionBonusRate { get; }
             internal uint ExperiencePotionBonus { get; }
+            internal uint FatigueBurnBonus { get; }
             internal uint Bonus
             {
                 get
@@ -2148,7 +2295,9 @@ namespace DfoServer.Network.Handlers.Dungeon
                         value,
                         CharacterExperienceService.AddSaturating(
                             AdventureGroupBonus,
-                            ExperiencePotionBonus));
+                            CharacterExperienceService.AddSaturating(
+                                ExperiencePotionBonus,
+                                FatigueBurnBonus)));
                 }
             }
             internal uint Total => CharacterExperienceService.AddSaturating(Base, Bonus);
@@ -2179,6 +2328,9 @@ namespace DfoServer.Network.Handlers.Dungeon
 
         internal async Task HandleEplpCommand(EnhancedClientSession session, GamePacketHeader header, byte[] body)
         {
+            if (_guardianAltarEplpHandler != null
+                && await _guardianAltarEplpHandler(session, header, body))
+                return;
             if (await _svc.DeathTower.TryHandleEplpCommandAsync(
                     session,
                     header,
@@ -2335,7 +2487,9 @@ namespace DfoServer.Network.Handlers.Dungeon
                 clearFact.Source,
                 DungeonParticipantEffectAudience.Instance,
                 roster,
-                out _);
+                out var frozenClearRoster);
+            if (run.Instance.GuildDungeonAdmission != null)
+                run.Instance.GetOrCreateGuildDungeonContribution(clearFact, _svc.GuildDungeons.CurrentMonthId, frozenClearRoster);
 
             if (factCreated)
                 await CullRemainingBlockingActorsOnClearAsync(session, run, clearFact);
@@ -2639,6 +2793,17 @@ namespace DfoServer.Network.Handlers.Dungeon
                         "Dungeon clear effect reservation was lost before commit.");
                 }
 
+                // Scripted quest NPCs register a client-side mouse action.
+                // Once the authoritative clear commits there is no valid
+                // interaction target left, so explicitly discard that action
+                // before projecting the result UI.  Without this notification
+                // the client can keep replaying the last NPC click even after
+                // the cursor has moved away.
+                await session.SendPacketAsync(
+                    MouseRegistrationDiscardPacketBuilder.BuildPacket());
+                if (!session.Player.IsCurrentDungeonRun(identity))
+                    return false;
+
                 if (run.AnotherAradActive && run.AnotherAradQuest != null)
                 {
                     run.AnotherAradQuest.EvaluateSettlement(
@@ -2759,7 +2924,9 @@ namespace DfoServer.Network.Handlers.Dungeon
                 int characterId,
                 ushort participantUserId,
                 DungeonRun candidateRun,
-                long attachmentGeneration)
+                long attachmentGeneration,
+                byte partySlot,
+                int accountId)
             {
                 if (candidateRun == null
                     || characterId <= 0
@@ -2777,18 +2944,41 @@ namespace DfoServer.Network.Handlers.Dungeon
                     candidateRun,
                     snapshot.RunIdentity,
                     snapshot.RoomIdentity,
-                    attachmentGeneration));
+                    attachmentGeneration,
+                    partySlot,
+                    accountId));
             }
+
+            var sourcePlayer = sourceSession?.Player;
+            var party = sourcePlayer != null
+                ? _svc.PartyManager?.GetPartyByUser(sourcePlayer.UserId)
+                : null;
+            var partySlots = party?.MembersBySlot().ToDictionary(
+                value => value.CharacterId,
+                value => value.SlotIndex)
+                ?? new Dictionary<int, byte>();
 
             foreach (var participant in _svc.InstanceRegistry
                          .CaptureInstanceParticipantRoster(
                              sourceRun.CaptureInstanceIdentity()))
             {
-                if (seen.Add(participant.RunIdentity.ParticipantIdentity))
-                    result.Add(participant);
+                if (!seen.Add(participant.RunIdentity.ParticipantIdentity))
+                    continue;
+                result.Add(new DungeonParticipantRosterEntry(
+                    participant.CharacterId,
+                    participant.ParticipantUserId,
+                    participant.Run,
+                    participant.RunIdentity,
+                    participant.RoomIdentity,
+                    participant.AttachmentGeneration,
+                    partySlots.TryGetValue(
+                        participant.CharacterId,
+                        out var participantSlot)
+                            ? participantSlot
+                            : byte.MaxValue,
+                    participant.AccountId));
             }
 
-            var sourcePlayer = sourceSession?.Player;
             if (sourcePlayer == null)
                 return result;
 
@@ -2796,11 +2986,15 @@ namespace DfoServer.Network.Handlers.Dungeon
                 sourcePlayer.CharacterId,
                 sourcePlayer.UserId,
                 sourceRun,
-                attachmentGeneration: 0);
+                attachmentGeneration: 0,
+                partySlot: partySlots.TryGetValue(
+                    sourcePlayer.CharacterId,
+                    out var sourceSlot)
+                        ? sourceSlot
+                        : (byte)0,
+                accountId: sourceSession.Account?.AccountId ?? 0);
 
-            var partyManager = _svc.PartyManager;
             var sessions = _svc.Sessions;
-            var party = partyManager?.GetPartyByUser(sourcePlayer.UserId);
             if (party == null || sessions == null)
                 return result;
 
@@ -2813,7 +3007,9 @@ namespace DfoServer.Network.Handlers.Dungeon
                     member.CharacterId,
                     player?.UserId ?? 0,
                     player?.CurrentRun,
-                    attachmentGeneration: 0);
+                    attachmentGeneration: 0,
+                    partySlot: member.SlotIndex,
+                    accountId: memberSession.Account?.AccountId ?? 0);
             }
 
             return result;
@@ -2864,6 +3060,18 @@ namespace DfoServer.Network.Handlers.Dungeon
                         $"source={sourceCharacterId} member={participant.CharacterId} " +
                         $"event={clearFact.SourceEventId:N} error={ex.Message}");
                 }
+            }
+
+            try
+            {
+                await _svc.AntonRewards.PrepareClearAsync(sourceRun, clearFact);
+            }
+            catch (Exception ex)
+            {
+                FileLogger.Log(
+                    $"[AntonAwakening] clear reward coordination failed: "
+                    + $"instance={sourceRun.PartyDungeonInstanceId} "
+                    + $"event={clearFact.SourceEventId:N} error={ex.Message}");
             }
         }
 
@@ -3325,12 +3533,12 @@ namespace DfoServer.Network.Handlers.Dungeon
         {
             try
             {
-                var dungeonBasisLevel = DungeonData.GetDungeonBasicLv(run.DungeonId);
-                return SecretShopOfferFactory.Create(
+                var roll = RollSecretShop(run);
+                return SecretShopOfferFactory.CreateForNpc(
                     SecretShopCatalogProvider.Current,
                     run.DungeonId,
-                    dungeonBasisLevel,
-                    partySize: 1,
+                    DungeonData.GetDungeonBasicLv(run.DungeonId),
+                    roll.NpcId,
                     ServerRandom.Next);
             }
             catch (Exception ex)
@@ -3338,6 +3546,19 @@ namespace DfoServer.Network.Handlers.Dungeon
                 FileLogger.Log($"[SecretShop] offer creation failed closed: dungeon={run.DungeonId} error={ex.Message}");
                 return new SecretShopOffer(1000, Array.Empty<SecretShopItemCandidate>());
             }
+        }
+
+        private static SecretShopRoll RollSecretShop(DungeonRun run)
+        {
+            var dungeonBasisLevel = DungeonData.GetDungeonBasicLv(run.DungeonId);
+            var catalog = SecretShopCatalogProvider.Current;
+            return run.Instance.GetOrCreateSecretShopRoll(
+                () => SecretShopOfferFactory.RollNpc(
+                    catalog,
+                    run.DungeonId,
+                    dungeonBasisLevel,
+                    run.EntryPartyMemberCount,
+                    ServerRandom.Next));
         }
 
         private static int ResolveCurrentMapId(DungeonRun run)

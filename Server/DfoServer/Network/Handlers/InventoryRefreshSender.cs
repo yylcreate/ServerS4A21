@@ -45,13 +45,26 @@ namespace DfoServer.Network.Handlers
 
         public async Task SendNoti2AppearanceUpdate(EnhancedClientSession session)
         {
+            var packet = PrepareNoti2AppearanceUpdate(session);
+            await session.SendPacketAsync(packet);
+            await BroadcastNoti2AppearanceUpdateToArea(session, packet);
+        }
+
+        // This remains the appearance owner: preparation updates runtime entries
+        // and persists UpdateAppearance before building the existing NOTI 2 body.
+        internal byte[] PrepareNoti2AppearanceUpdate(EnhancedClientSession session)
+        {
             var noti2Body = AppearanceService.UpdateAndBroadcast(
                 session.Player,
                 _characterRepository,
                 _database);
             var packet = GamePacketEnvelopeBuilder.Build(0x00, 0x0002, noti2Body);
             FileLogger.Log($"[{ProtocolName}] NOTI 2 appearance update: {session.Player.AppearanceEntries.Length} entries, body={noti2Body.Length}B");
-            await session.SendPacketAsync(packet);
+            return packet;
+        }
+
+        internal async Task BroadcastNoti2AppearanceUpdateToArea(EnhancedClientSession session, byte[] packet)
+        {
             if (_sessions == null
                 || session?.Player == null
                 || session.Player.CharacterId <= 0
@@ -254,11 +267,17 @@ namespace DfoServer.Network.Handlers
                 return false;
             }
 
-            await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(
-                0x00,
-                0x000D,
-                body));
-            return true;
+            var prepared = false;
+            var packet = GamePacketEnvelopeBuilder.Build(0x00, (ushort)NotiPacketTypeA21.ITEM_LIST, body);
+            await session.SendPreparedPacketBatchAsync(() =>
+            {
+                if (!InventoryContext.IsCurrentLease(expectedLease, session.SessionId, player.CharacterId)
+                    || !projectionGuard())
+                    return Array.Empty<byte[]>();
+                prepared = true;
+                return new[] { packet };
+            });
+            return prepared;
         }
 
         public Task SendUpdateItemList(EnhancedClientSession session, InventoryListType itemSpace, short slotIndex)
@@ -269,6 +288,20 @@ namespace DfoServer.Network.Handlers
         public Task SendGoldUpdate(EnhancedClientSession session)
         {
             return SendUpdateItemList(session, InventoryListType.Main, InventoryService.MainVirtualCurrencySlotStart);
+        }
+
+        internal async Task SendGoldUpdate(EnhancedClientSession session, Func<bool> canSend)
+        {
+            var (cid, aid) = SessionOwnerResolver.Resolve(session);
+            await SessionDirectory.TrySendBestEffortAsync(async ct =>
+                await session.SendPreparedPacketBatchAsync(() =>
+                {
+                    if (ct.IsCancellationRequested || !canSend()) return Array.Empty<byte[]>();
+                    return new[] { GamePacketEnvelopeBuilder.Build(0, (ushort)NotiPacketTypeA21.UPDATE_ITEM_LIST,
+                        ItemListUpdateBuilder.BuildUpdateBody(cid, aid, InventoryListType.Main,
+                            new[] { InventoryService.MainVirtualCurrencySlotStart })) };
+                }, () => !ct.IsCancellationRequested && canSend()).WaitAsync(ct),
+                $"guild gold update cid={cid}");
         }
 
         public Task SendGoldUpdate(EnhancedClientSession session, int updatedGold)
@@ -307,23 +340,6 @@ namespace DfoServer.Network.Handlers
             await SendUpdateItemList(session, listType, slotIndex);
         }
 
-        public async Task SendSortItemLockRefresh(EnhancedClientSession session, InventoryListType listType)
-        {
-            var (cid, _) = SessionOwnerResolver.Resolve(session);
-            var refreshListType = MapToSortLockListType(listType);
-            var locks = LoadOnlineSortItemLocks(session, cid, refreshListType);
-            foreach (var entry in locks)
-                await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(0x01, 0x02CA, SortItemLockBuilder.BuildLock(entry)));
-        }
-
-        public async Task SendAllSortItemLockRefresh(EnhancedClientSession session)
-        {
-            var (cid, _) = SessionOwnerResolver.Resolve(session);
-            var locks = LoadOnlineSortItemLocks(session, cid, null);
-            foreach (var entry in locks)
-                await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(0x01, 0x02CA, SortItemLockBuilder.BuildLock(entry)));
-        }
-
         public async Task SendEquipmentItemLockListRefresh(EnhancedClientSession session, InventoryListType listType)
         {
             if (!IsEquipmentItemLockListType(listType))
@@ -343,18 +359,6 @@ namespace DfoServer.Network.Handlers
             LogEquipmentItemLockList("ITEM_LOCK_LIST_ALL", locks);
             await session.SendPacketAsync(GamePacketEnvelopeBuilder.Build(0x00, 0x00FB,
                 EquipmentItemLockBuilder.BuildLockList(locks)));
-        }
-
-        private static IReadOnlyList<SortItemLockEntry> LoadOnlineSortItemLocks(
-            EnhancedClientSession session,
-            int characterId,
-            InventoryListType? listType)
-        {
-            if (!InventoryContext.TryGetLease(characterId, out var lease) || !lease.IsOwnedBy(session.SessionId))
-                return Array.Empty<SortItemLockEntry>();
-
-            lock (lease.SyncRoot)
-                return InventoryLockService.LoadSortItemLocks(lease.Inventory, listType);
         }
 
         private static IReadOnlyList<EquipmentItemLockEntry> LoadOnlineEquipmentItemLocks(

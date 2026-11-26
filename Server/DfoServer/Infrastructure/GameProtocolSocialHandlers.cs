@@ -1,4 +1,4 @@
-using DfoServer.Network.Handlers;
+﻿using DfoServer.Network.Handlers;
 using DfoServer.Network.Handlers.Dungeon;
 using System;
 
@@ -16,8 +16,20 @@ namespace DfoServer.Infrastructure
             DungeonLoadingCoordinator dungeonLoading,
             DungeonRejoinCoordinator dungeonRejoin,
             PvpChannelInfoHandler pvpChannelInfo,
-            PvpRoomHandler pvpRoom)
+            PvpRoomHandler pvpRoom,
+            GuildCreationHandler guildCreation,
+            GuildMemberHandler guildMembers,
+            GuildJoinHandler guildJoin,
+            GuildManagementHandler guildManagement,
+            GuildStatePublisher guildPublisher,
+            ItemTradeHandler trade)
         {
+            Trade = trade ?? throw new ArgumentNullException(nameof(trade));
+            GuildJoin = guildJoin ?? throw new ArgumentNullException(nameof(guildJoin));
+            GuildManagement = guildManagement ?? throw new ArgumentNullException(nameof(guildManagement));
+            GuildPublisher = guildPublisher ?? throw new ArgumentNullException(nameof(guildPublisher));
+            GuildMembers = guildMembers ?? throw new ArgumentNullException(nameof(guildMembers));
+            GuildCreation = guildCreation ?? throw new ArgumentNullException(nameof(guildCreation));
             Party = party ?? throw new ArgumentNullException(nameof(party));
             Raid = raid ?? throw new ArgumentNullException(nameof(raid));
             Chat = chat ?? throw new ArgumentNullException(nameof(chat));
@@ -30,6 +42,13 @@ namespace DfoServer.Infrastructure
             PvpRoom = pvpRoom
                 ?? throw new ArgumentNullException(nameof(pvpRoom));
         }
+
+        internal GuildCreationHandler GuildCreation { get; }
+        internal ItemTradeHandler Trade { get; }
+        internal GuildMemberHandler GuildMembers { get; }
+        internal GuildJoinHandler GuildJoin { get; }
+        internal GuildManagementHandler GuildManagement { get; }
+        internal GuildStatePublisher GuildPublisher { get; }
 
         internal PartyHandler Party { get; }
 
@@ -51,6 +70,7 @@ namespace DfoServer.Infrastructure
                 return;
 
             _disposed = true;
+            Trade.Dispose();
             Chat.Dispose();
             PvpRoom.Dispose();
             Party.Dispose();

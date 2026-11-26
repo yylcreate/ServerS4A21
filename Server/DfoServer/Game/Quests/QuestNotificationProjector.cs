@@ -26,6 +26,7 @@ namespace DfoServer.Game.Quests
     {
         private readonly ISessionPacketSender _sender;
         private readonly string _connectionString;
+        private readonly Events.GameEventRepository _events;
         private readonly ICharacterRepository _characterRepository;
         private readonly SqliteCharacterProgressRepository _progressRepository;
         private readonly HonorLevelSyncService _honorLevel;
@@ -54,6 +55,7 @@ namespace DfoServer.Game.Quests
             _connectionString = (database
                 ?? throw new ArgumentNullException(nameof(database)))
                 .ConnectionString;
+            _events = new Events.GameEventRepository(database);
             _characterRepository = characterRepository
                 ?? throw new ArgumentNullException(nameof(characterRepository));
             _progressRepository = progressRepository
@@ -330,7 +332,8 @@ namespace DfoServer.Game.Quests
                     job,
                     growType,
                     clearedFlags,
-                    allowedCreatureKinds));
+                    allowedCreatureKinds,
+                    _events.LoadAdvertisedEventIds()));
         }
 
         internal async Task SendClearQuestListAsync()

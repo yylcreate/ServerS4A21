@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using PvfLib;
+using DfoServer.Game.Guilds;
 
 namespace DfoServer.GameWorld
 {
@@ -21,9 +22,113 @@ namespace DfoServer.GameWorld
 
     public class Town
     {
+        private static readonly Lazy<TownPositionSaveDefinition> PositionSaveDefinition =
+            new Lazy<TownPositionSaveDefinition>(() => TownPositionSaveDefinition.Load(
+                PvfArchiveAccessor.ReadText("etc/serverparameter_chn.etc"),
+                PvfArchiveAccessor.ReadText("town/town.lst"),
+                PvfArchiveAccessor.ReadTextIfPresent,
+                GuildAgitAccessPolicy.TownId));
+
+        internal static bool IsPositionSaveExcluded(int townId, int areaId)
+            => PositionSaveDefinition.Value.IsExcluded(townId, areaId);
+
         private static readonly object DungeonGateReturnCacheSync = new object();
         private static readonly Dictionary<long, CeraRoomInfo?> DungeonGateReturnCache =
             new Dictionary<long, CeraRoomInfo?>();
+        private static readonly object AreaPermissionCacheSync = new object();
+        private static readonly Dictionary<long, TownPermission> AreaPermissionCache =
+            new Dictionary<long, TownPermission>();
+
+        internal static bool TryGetArea(int townId, int areaId, out TownArea area)
+        {
+            area = null;
+            try
+            {
+                var townEntry = LstFile.Parse(PvfArchiveAccessor.ReadText("town/town.lst"))?.GetById(townId);
+                if (townEntry == null || string.IsNullOrWhiteSpace(townEntry.FilePath))
+                    return false;
+                var town = TownFile.Parse(PvfArchiveAccessor.ReadText(Path.Combine("town", townEntry.FilePath)));
+                area = town.Areas.SingleOrDefault(candidate => candidate.Id == areaId);
+                if (area == null || string.IsNullOrWhiteSpace(area.MapPath))
+                    return false;
+                return true;
+            }
+            catch (Exception exception)
+            {
+                FileLogger.Log($"[TownArea] resource lookup failed town={townId}:{areaId}: {exception.Message}");
+                return false;
+            }
+        }
+
+        public static bool TryGetAreaPermission(
+            int townId,
+            int areaId,
+            out TownPermission permission)
+        {
+            var key = ((long)townId << 32) | (uint)areaId;
+            lock (AreaPermissionCacheSync)
+            {
+                if (AreaPermissionCache.TryGetValue(key, out var cached))
+                {
+                    // null 缓存值表示该区域无门槛(或读取失败, 放行由调用方决定)。
+                    permission = cached;
+                    return cached != null;
+                }
+            }
+
+            TownPermission resolved = null;
+            try
+            {
+                var twnlst = LstFile.Parse(PvfArchiveAccessor.ReadText("town/town.lst"));
+                var entry = twnlst?.GetById(townId);
+                if (entry != null && !string.IsNullOrEmpty(entry.FilePath))
+                {
+                    var town = TownFile.Parse(PvfArchiveAccessor.ReadText(
+                        Path.Combine("town", entry.FilePath)));
+                    var area = town?.Areas?.FirstOrDefault(candidate =>
+                        candidate.Id == areaId);
+                    resolved = area?.Permission ?? town?.Permission;
+                }
+            }
+            catch
+            {
+                resolved = null;
+            }
+
+            lock (AreaPermissionCacheSync)
+                AreaPermissionCache[key] = resolved;
+            permission = resolved;
+            return resolved != null;
+        }
+
+        // Reuse the MAP's six-integer town exit layout, also consumed by the
+        // dungeon-gate return resolver below. Negative targets are client
+        // selection/return sentinels, never physical town/area IDs.
+        internal static bool HasDirectAreaConnection(int townId, int sourceAreaId, int targetAreaId)
+        {
+            if (!TryGetArea(townId, sourceAreaId, out var source)
+                || !TryGetArea(townId, targetAreaId, out _))
+                return false;
+            try
+            {
+                var map = MapFile.Parse(PvfArchiveAccessor.ReadText(
+                    Path.Combine("map", source.MapPath)));
+                var exits = map.TownMovableArea;
+                if (exits == null || exits.Length == 0 || exits.Length % 6 != 0)
+                    return false;
+                for (int offset = 0; offset < exits.Length; offset += 6)
+                {
+                    if (exits[offset + 2] > 0 && exits[offset + 3] > 0
+                        && exits[offset + 4] == townId && exits[offset + 5] == targetAreaId)
+                        return true;
+                }
+            }
+            catch (Exception exception) when (exception is IOException or InvalidOperationException or FormatException)
+            {
+                FileLogger.Log($"[TownArea] exit resource unavailable town={townId}:{sourceAreaId}: {exception.Message}");
+            }
+            return false;
+        }
 
         public static CeraRoomInfo GetCeraRoomInfo(int townId)
         {

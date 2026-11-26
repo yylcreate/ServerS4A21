@@ -1,5 +1,6 @@
 using System.Threading.Tasks;
 using DfoServer.Game.Characters;
+using DfoServer.Game.Events.FatigueAcceleration;
 using DfoServer.Game.Quests;
 using DfoServer.Game.SelectCharacter;
 using DfoServer.Infrastructure;
@@ -13,6 +14,7 @@ namespace DfoServer.Game.Session
         private readonly string _connStr;
 
         public QuestManager QuestManager { get; private set; }
+        internal FatigueAccelerationRuntime FatigueAcceleration { get; } = new();
 
         internal string ConnectionString => _connStr;
 

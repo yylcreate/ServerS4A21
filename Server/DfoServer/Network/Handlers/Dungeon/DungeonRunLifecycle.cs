@@ -14,6 +14,60 @@ namespace DfoServer.Network.Handlers.Dungeon
     // 单局字段随对象消失 -- 全仓不再有逐字段重置清单。
     internal static class DungeonRunLifecycle
     {
+        // A resource-authorized special mode may start directly from town,
+        // without fabricating an ordinary dungeon-selection screen. The
+        // caller supplies its configured instance and a pure identity/source
+        // fence; this entry can never replace an existing run or selection.
+        internal static bool BeginRunFromAuthorizedTown(
+            EnhancedClientSession session,
+            DungeonInstance sharedInstance,
+            DungeonTownReturnAnchor returnAnchor,
+            long expectedGeneration,
+            Func<bool> isCurrent,
+            out DungeonRun run)
+        {
+            run = null;
+            ArgumentNullException.ThrowIfNull(isCurrent);
+            var player = session?.Player;
+            if (player == null || sharedInstance == null || !returnAnchor.IsValid)
+                return false;
+
+            lock (player.DungeonRunLifecycleSyncRoot)
+            {
+                if (player.CurrentRun != null
+                    || player.CurrentDungeonSelection != null
+                    || player.CurrentDungeonRunGeneration != expectedGeneration
+                    || sharedInstance.State == DungeonInstanceState.Ending
+                    || sharedInstance.State == DungeonInstanceState.Ended
+                    || !isCurrent())
+                {
+                    return false;
+                }
+
+                var created = new DungeonRun(
+                    sharedInstance,
+                    DungeonIdentityGenerator.NextRunId(),
+                    player.NextDungeonRunGeneration(),
+                    DungeonRunState.Created);
+                if (!created.TryFreezeExperienceBonusSnapshot(
+                        DungeonParticipantExperienceBonusSnapshot.None)
+                    || !created.TryBeginSelecting())
+                {
+                    throw new InvalidOperationException(
+                        "Authorized town run could not initialize its immutable entry state.");
+                }
+                created.QuestSnapshot = QuestRunSnapshot.Empty;
+                created.TownReturnAnchor = returnAnchor;
+                player.CurrentRun = created;
+                run = created;
+            }
+
+            // No FinalizeNormalRunStart here: that binds ordinary mechanisms,
+            // quest overlays and pet combat. Special-mode start owns its own
+            // typed projection; ending still uses the common lifecycle.
+            return true;
+        }
+
         // 进本: 掐掉旧局残留定时器 -> 换新局。
         internal static bool BeginRun(
             EnhancedClientSession session,

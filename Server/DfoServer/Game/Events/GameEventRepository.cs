@@ -14,6 +14,46 @@ namespace DfoServer.Game.Events
             _database = database ?? throw new ArgumentNullException(nameof(database));
         }
 
+        // Catalog metadata belongs to the operator once present. Ensuring a
+        // member must not overwrite notices, details or the saved switch when
+        // an optional startup setting is absent.
+        internal void EnsureCatalogEntry(
+            int eventId,
+            bool? enabled,
+            string startNotice,
+            string endNotice,
+            int sortOrder)
+        {
+            if (eventId <= 0 || eventId > ushort.MaxValue)
+                throw new ArgumentOutOfRangeException(nameof(eventId));
+
+            _database.Write((connection, transaction) =>
+            {
+                using var command = connection.CreateCommand();
+                command.Transaction = transaction;
+                command.CommandText = @"
+INSERT OR IGNORE INTO game_event_state(event_id, state) VALUES(@eventId, 0);
+INSERT OR IGNORE INTO game_event_info_details(
+    event_id, unknown0, start_notice, end_notice, detail_flag, sort_order)
+VALUES(@eventId, 0, @startNotice, @endNotice, 0, @sortOrder);";
+                command.Parameters.AddWithValue("@eventId", eventId);
+                command.Parameters.AddWithValue("@startNotice", startNotice ?? string.Empty);
+                command.Parameters.AddWithValue("@endNotice", endNotice ?? string.Empty);
+                command.Parameters.AddWithValue("@sortOrder", sortOrder);
+                command.ExecuteNonQuery();
+                if (!enabled.HasValue)
+                    return;
+
+                command.Parameters.Clear();
+                command.CommandText = @"
+UPDATE game_event_state SET state=@state WHERE event_id=@eventId;";
+                command.Parameters.AddWithValue("@state", enabled.Value ? 1 : 0);
+                command.Parameters.AddWithValue("@eventId", eventId);
+                if (command.ExecuteNonQuery() != 1)
+                    throw new InvalidOperationException("Event catalog switch update failed.");
+            });
+        }
+
         internal bool IsEnabled(int eventId)
         {
             using (var connection = _database.OpenConnection())
@@ -61,6 +101,50 @@ WHERE event_id=@eventId;";
                     ExtraEntries = LoadEnabledExtraEntries(connection),
                 };
             }
+        }
+
+        internal HashSet<int> LoadAdvertisedEventIds()
+        {
+            using var connection = _database.OpenConnection();
+            return LoadAdvertisedEventIds(connection, null);
+        }
+
+        internal static HashSet<int> LoadAdvertisedEventIds(string connectionString)
+        {
+            using var connection = new SqliteConnection(connectionString);
+            connection.Open();
+            return LoadAdvertisedEventIds(connection, null);
+        }
+
+        internal static HashSet<int> LoadAdvertisedEventIds(
+            SqliteConnection connection, SqliteTransaction transaction)
+        {
+            var result = new HashSet<int>();
+            using var command = connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = @"
+SELECT d.event_id
+FROM game_event_info_details d
+JOIN game_event_state s ON s.event_id = d.event_id
+WHERE s.state != 0;";
+            using var reader = command.ExecuteReader();
+            while (reader.Read())
+                result.Add(reader.GetInt32(0));
+            return result;
+        }
+
+        internal static bool IsAdvertised(
+            SqliteConnection connection, SqliteTransaction transaction, int eventId)
+        {
+            using var command = connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = @"
+SELECT 1
+FROM game_event_info_details d
+JOIN game_event_state s ON s.event_id = d.event_id
+WHERE d.event_id=@eventId AND s.state != 0;";
+            command.Parameters.AddWithValue("@eventId", eventId);
+            return command.ExecuteScalar() != null;
         }
 
         private static IReadOnlyList<GameEventInfoEntry> LoadEnabledDetails(

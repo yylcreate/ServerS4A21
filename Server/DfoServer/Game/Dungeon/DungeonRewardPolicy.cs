@@ -5,6 +5,7 @@ namespace DfoServer.Game.Dungeon
         Standard = 0,
         InteractiveTraining = 1,
         AntonRaid = 2,
+        GuardianAltar = 3,
     }
 
     // Immutable per-instance policy. Configuration is resolved before a run is
@@ -33,6 +34,18 @@ namespace DfoServer.Game.Dungeon
 
         public static DungeonRewardPolicy InteractiveTraining { get; } = new DungeonRewardPolicy(
             DungeonRewardPolicyKind.InteractiveTraining,
+            allowsMonsterExperience: false,
+            allowsMonsterDrops: false,
+            allowsQuestDrops: false,
+            allowsQuestProgress: false,
+            allowsPetExperience: false,
+            allowsClearCommit: false,
+            allowsSettlement: false);
+
+        // Guardian's dedicated start/loading flow must not enter ordinary
+        // kill, quest, clear or card rewards before its own authority exists.
+        public static DungeonRewardPolicy GuardianAltar { get; } = new DungeonRewardPolicy(
+            DungeonRewardPolicyKind.GuardianAltar,
             allowsMonsterExperience: false,
             allowsMonsterDrops: false,
             allowsQuestDrops: false,

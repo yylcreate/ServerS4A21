@@ -13,6 +13,11 @@ namespace DfoServer.Game.Premium
 {
     public static class PremiumService
     {
+        // Current PVF etc/premiumlist_new.etc: auction coupon entitlement.
+        internal const int AuctionCouponPremiumType = 29;
+        internal static bool HasActiveAuctionCoupon(string connectionString, int accountId)
+            => HasActivePremium(connectionString, accountId, AuctionCouponPremiumType);
+
         public const ushort DefaultServiceType = 1;
 
         private const int PremiumServiceEntryExpireBase = 6;

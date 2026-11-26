@@ -250,6 +250,7 @@ namespace DfoServer.Game.Quests
                         connection.Open();
                         using (var transaction = connection.BeginTransaction(deferred: false))
                         {
+                            var utcNow = DateTime.UtcNow;
                             if (!owner.IsCurrentInventoryOwner())
                                 return QuestFinishResult.Fail(22);
 
@@ -336,6 +337,17 @@ namespace DfoServer.Game.Quests
                                     transactionQuest.ActivationId,
                                     transactionQuest.Version,
                                     transactionQuest.TriggerValue))
+                                {
+                                    return QuestFinishResult.Fail(22);
+                                }
+
+                                if (GameWorld.QuestData.IsDailyQuest(questId)
+                                    && !DailyQuestCompletionCycle.TryClaim(
+                                        connection,
+                                        transaction,
+                                        characterId,
+                                        questId,
+                                        utcNow))
                                 {
                                     return QuestFinishResult.Fail(22);
                                 }
@@ -1486,14 +1498,10 @@ namespace DfoServer.Game.Quests
             int answerCount,
             out int flagValue)
         {
-            if (trigger == 0)
+            if (trigger < (uint)answerCount)
             {
-                flagValue = GameWorld.QuestData.GetRequiredQuestAnswerFlagValue(0);
-                return true;
-            }
-            if (trigger <= (uint)answerCount)
-            {
-                flagValue = (int)trigger;
+                flagValue = GameWorld.QuestData.GetRequiredQuestAnswerFlagValue(
+                    (int)trigger);
                 return true;
             }
             flagValue = 1;

@@ -67,6 +67,16 @@ namespace DfoServer.Network.Handlers.Dungeon
             return projectionId;
         }
 
+        internal void RegisterDedicatedLoadingProjection(DungeonRun run, DungeonInstanceRoom room, long projectionId)
+        {
+            var identity = run.CaptureIdentity();
+            var generation = room.RegisterLoadingProjection(identity, projectionId,
+                new[] { identity }, out var started);
+            if (generation <= 0)
+                throw new InvalidOperationException("Dedicated dungeon loading barrier registration failed.");
+            if (started) _loadingProjectionStarted?.Invoke(room.Identity, room, generation);
+        }
+
         private static async Task<bool> TrySendLoadingProjectionPacketAsync(
             EnhancedClientSession session,
             byte[] packet,
@@ -93,6 +103,8 @@ namespace DfoServer.Network.Handlers.Dungeon
         {
             var run = session.Player.CurrentRun;
             if (run == null) return;
+            if (run.Instance?.Mechanisms.GuardianAltar != null)
+                return; // the current Guardian stage is one dedicated MAP, not an ordinary maze
             var leaderRunIdentity = run.CaptureIdentity();
             if (run.Instance.IsParticipantDead(leaderRunIdentity))
             {
@@ -143,6 +155,15 @@ namespace DfoServer.Network.Handlers.Dungeon
             if (IsHellPartyLocked(run))
             {
                 FileLogger.Log($"[DungeonHandler] MOVE_MAP blocked by active hell party: current=({run.RoomKey.X},{run.RoomKey.Y}) next=({req.NextX},{req.NextY})");
+                return;
+            }
+
+            if (run.Instance.TryGetRoom(run.CurrentRoomInstanceId, out var currentRoom)
+                && currentRoom.Elevator != null
+                && !currentRoom.Elevator.AllowsExit(run.RoomKey, req.NextX, req.NextY))
+            {
+                FileLogger.Log($"[Elevator] MOVE_MAP blocked by room outcome: " +
+                    $"room={run.RoomKey.X},{run.RoomKey.Y} next={req.NextX},{req.NextY}");
                 return;
             }
 

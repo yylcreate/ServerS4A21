@@ -24,7 +24,7 @@ namespace DfoServer.Network.Builders.Auction
             writer.WriteByte(OpenState);
             return GamePacketEnvelopeBuilder.Build(
                 0x00,
-                (ushort)NotiPacketType.AUCTION_NOTIFY_AUCTION_SERVICE,
+                (ushort)NotiPacketTypeA21.AUCTION_NOTIFY_AUCTION_SERVICE,
                 writer.ToArray());
         }
     }

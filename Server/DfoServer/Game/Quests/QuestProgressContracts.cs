@@ -11,6 +11,7 @@ namespace DfoServer.Game.Quests
         ClearDungeon = 3,
         SeekingItems = 4,
         HuntEnemy = 5,
+        RaidPhaseClear = 6,
     }
 
     internal sealed class QuestProgressApplicationRequest
@@ -21,12 +22,15 @@ namespace DfoServer.Game.Quests
         internal ushort QuestId { get; set; }
         internal byte TriggerType { get; set; }
         internal bool Increment { get; set; }
+        internal byte? QuestionAnswerIndex { get; set; }
         internal int DungeonId { get; set; }
         internal int Difficulty { get; set; }
         internal int MapId { get; set; }
         internal int MonsterCode { get; set; }
         internal byte MonsterType { get; set; }
         internal int EnemyType { get; set; }
+        internal int RaidPhaseIndex { get; set; }
+        internal bool RepairLegacyRaidPhaseTrigger { get; set; }
         internal IReadOnlyCollection<ushort> EligibleQuestIds { get; set; }
         internal IReadOnlyDictionary<ushort, QuestActivationId>
             EligibleQuestActivations { get; set; }
@@ -50,6 +54,8 @@ namespace DfoServer.Game.Quests
                         return "clear-map";
                     case QuestProgressOperation.SeekingItems:
                         return "seeking-items";
+                    case QuestProgressOperation.RaidPhaseClear:
+                        return "raid-phase-clear";
                     default:
                         return "client-trigger";
                 }
@@ -76,6 +82,23 @@ namespace DfoServer.Game.Quests
             if (changes == null)
                 return;
             _changes.AddRange(changes);
+        }
+    }
+
+    internal sealed class QuestProgressBatchApplicationResult
+    {
+        private readonly List<QuestProgressApplicationResult> _results =
+            new List<QuestProgressApplicationResult>();
+
+        internal bool Success { get; set; }
+        internal string Error { get; set; } = string.Empty;
+        internal IReadOnlyList<QuestProgressApplicationResult> Results =>
+            _results;
+
+        internal void Add(QuestProgressApplicationResult result)
+        {
+            if (result != null)
+                _results.Add(result);
         }
     }
 

@@ -906,6 +906,7 @@ LIMIT 1;";
 
             var requests = new List<InventoryRewardGrantRequest>(attachments.Count);
             long addedMainWeight = 0;
+            long tokenCera = 0;
             var nowUnixSeconds = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
             foreach (var attachment in attachments)
             {
@@ -916,6 +917,15 @@ LIMIT 1;";
                     return MailboxClaimResult.Fail(MailboxSendError.ExpiredItem);
 
                 var count = Math.Max(1, attachment.ItemCount);
+                if (core.ItemId == CurrencyService.TokenCeraVoucherItemId)
+                {
+                    if (attachment.ItemTemplateId != core.ItemId || core.ItemKind != ItemCore.KindMaterial)
+                        return MailboxClaimResult.Fail(MailboxSendError.InvalidAttachment);
+                    tokenCera += count;
+                    if (tokenCera > int.MaxValue)
+                        return MailboxClaimResult.Fail(MailboxSendError.ItemCarryLimitExceeded);
+                    continue;
+                }
                 if (InventoryStackRuleService.IsStackable(core))
                 {
                     var metadata = ItemMetadataResolver.Resolve(core.ItemId);
@@ -988,6 +998,8 @@ LIMIT 1;";
                     return MailboxClaimResult.Fail(MailboxSendError.GoldCarryLimitExceeded);
                 inventoryMutated = true;
             }
+            if (tokenCera > 0 && !CurrencyService.TryGrantTokenCera(connection, transaction, characterId, (int)tokenCera))
+                return MailboxClaimResult.Fail(MailboxSendError.ItemCarryLimitExceeded);
 
             if (!InventoryPersistenceService.SaveDirtyInTransaction(connection, transaction, lease))
                 return MailboxClaimResult.Fail(MailboxSendError.ServerBusy);
@@ -997,8 +1009,9 @@ LIMIT 1;";
             var updatedMainSlots = new List<short>();
             var updatedAvatarSlots = new List<short>();
             var updatedPetSlots = new List<short>();
+            var updatedGuildMedalSlots = new List<short>();
             foreach (var change in grantResult.Changes.Slots)
-                AddUpdatedSlot(change.ListType, change.SlotIndex, updatedMainSlots, updatedAvatarSlots, updatedPetSlots);
+                AddUpdatedSlot(change.ListType, change.SlotIndex, updatedMainSlots, updatedAvatarSlots, updatedPetSlots, updatedGuildMedalSlots);
 
             return new MailboxClaimResult
             {
@@ -1006,11 +1019,13 @@ LIMIT 1;";
                 Error = MailboxSendError.None,
                 MessageId = messageId,
                 ClaimedGold = claimsGold ? mailState.Gold : 0,
+                ClaimedTokenCera = (int)tokenCera,
                 ClaimedAttachmentCount = attachments.Count,
                 RemovedFromInbox = false,
                 UpdatedMainSlots = updatedMainSlots,
                 UpdatedAvatarSlots = updatedAvatarSlots,
                 UpdatedPetSlots = updatedPetSlots,
+                UpdatedGuildMedalSlots = updatedGuildMedalSlots,
                 InventoryMutations = BuildClaimInventoryMutations(inventory, grantResult),
             };
         }
@@ -1137,15 +1152,14 @@ LIMIT 1;";
 
         private static InventoryListType ResolveCoreTargetList(ItemCore core)
         {
-            if (core == null)
-                return InventoryListType.Main;
-            if (core.ItemKind == ItemCore.KindAvatar)
-                return InventoryListType.Avatar;
-            if (core.ItemKind == ItemCore.KindCreature
-                || core.ItemKind == ItemCore.KindCreatureEquipment
-                || core.ItemKind == ItemCore.KindCreatureConsumable)
-                return InventoryListType.Pet;
-            return InventoryListType.Main;
+            return core != null
+                && ItemSlotBoundService.TryGetSlotRange(
+                    core.ItemKind,
+                    ItemSlotBoundService.MainExpandStageNone,
+                    out var listType,
+                    out _)
+                ? listType
+                : InventoryListType.Main;
         }
 
         private static int CountInventoryItem(
@@ -1660,7 +1674,8 @@ WHERE message_id = @messageId
             short slot,
             List<short> updatedMainSlots,
             List<short> updatedAvatarSlots,
-            List<short> updatedPetSlots)
+            List<short> updatedPetSlots,
+            List<short> updatedGuildMedalSlots)
         {
             if (listType == InventoryListType.Avatar)
             {
@@ -1671,6 +1686,12 @@ WHERE message_id = @messageId
             if (listType == InventoryListType.Pet)
             {
                 AddUniqueSlot(updatedPetSlots, slot);
+                return;
+            }
+
+            if (listType == InventoryListType.GuildMedal)
+            {
+                AddUniqueSlot(updatedGuildMedalSlots, slot);
                 return;
             }
 
@@ -1780,6 +1801,10 @@ WHERE message_id = @messageId
             var deferredPolicyError = MailboxSendPolicy.ValidateDeferredPolicies(request);
             if (deferredPolicyError != MailboxSendError.None)
                 return MailboxSendResult.Fail(deferredPolicyError);
+
+            if (Game.Friends.BlacklistRepository.IsBlocked(connection, transaction,
+                    request.ReceiverCharacterId, request.SenderCharacterId))
+                return MailboxSendResult.Fail(MailboxSendError.Blacklisted);
 
             var goldPolicyError = ApplyPlayerGoldSendPolicies(connection, transaction, request);
             if (goldPolicyError != MailboxSendError.None)
@@ -2236,6 +2261,7 @@ LIMIT 1;";
             result = new MailboxSendResult
             {
                 Success = true,
+                AlreadyExists = true,
                 Error = MailboxSendError.None,
                 MessageId = messageId,
                 FeeGold = feeGold,

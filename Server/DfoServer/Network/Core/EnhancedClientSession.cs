@@ -1,4 +1,6 @@
 using System;
+using System.Collections.Generic;
+using System.IO;
 using System.Net.Sockets;
 using System.Text;
 using System.Threading;
@@ -32,6 +34,27 @@ namespace DfoServer.Network
 
         public GameSession GameSession { get; set; }
 
+        // Only a pending client projection. Ordinary skill/item ownership stays
+        // in the existing repositories and the session-owned InventoryLease.
+        private GuardianAltarControlProjectionSource _guardianAltarControls;
+        internal GuardianAltarControlProjectionSource GuardianAltarControls
+        {
+            get => Volatile.Read(ref _guardianAltarControls);
+            set => Volatile.Write(ref _guardianAltarControls, value);
+        }
+
+        internal bool TryCompleteGuardianControlsRestore(GuardianAltarControlProjectionSource source)
+            => ReferenceEquals(Interlocked.CompareExchange(ref _guardianAltarControls, null, source), source);
+
+        internal bool TryReplaceGuardianControlsSource(GuardianAltarControlProjectionSource source,
+            GuardianAltarControlProjectionSource replacement)
+            => source != null && replacement != null && ReferenceEquals(
+                Interlocked.CompareExchange(ref _guardianAltarControls, replacement, source), source);
+
+        internal sealed record GuardianAltarControlProjectionSource(
+            GameSession Generation, AccountRecord Account, int CharacterId, int AccountId, ushort UserId,
+            long RunGeneration, long SelectionGeneration, bool ActivityReleasePending = false);
+
         // 玩家当前打开的收集箱 PVF [Index] 值(0388请求体末尾字节, 见 CollectionBoxHandler)
         public int SelectedCollectionBoxIndex { get; set; }
 
@@ -51,6 +74,18 @@ namespace DfoServer.Network
         public int A21SelectOptionSaveCount { get; set; }
 
         private readonly SemaphoreSlim _sendLock = new SemaphoreSlim(1, 1);
+
+        private volatile bool _supportsRaidMemberColumnV1;
+
+        internal bool SupportsRaidMemberColumnV1 => _supportsRaidMemberColumnV1;
+
+        internal bool TrySetRaidMemberColumnProtocolVersion(uint version)
+        {
+            if (version != 1)
+                return false;
+            _supportsRaidMemberColumnV1 = true;
+            return true;
+        }
 
         public EnhancedClientSession(
             TcpClient client,
@@ -81,6 +116,43 @@ namespace DfoServer.Network
             finally
             {
                 _sendLock.Release();
+            }
+        }
+
+        internal Task SendPreparedPacketBatchAsync(Func<IReadOnlyList<byte[]>> prepare,
+            Func<bool> canWritePacket = null)
+        {
+            return SendPreparedPacketBatchCoreAsync(_sendLock, prepare, packet =>
+            {
+                PacketFileLogger.Log("SEND", packet);
+                return Stream.WriteAsync(packet, 0, packet.Length);
+            }, canWritePacket);
+        }
+
+        internal static async Task SendPreparedPacketBatchCoreAsync(
+            SemaphoreSlim sendLock,
+            Func<IReadOnlyList<byte[]>> prepare,
+            Func<byte[], Task> writePacket,
+            Func<bool> canWritePacket = null)
+        {
+            ArgumentNullException.ThrowIfNull(sendLock);
+            ArgumentNullException.ThrowIfNull(prepare);
+            ArgumentNullException.ThrowIfNull(writePacket);
+            await sendLock.WaitAsync();
+            try
+            {
+                var packets = prepare()
+                    ?? throw new InvalidOperationException("Packet batch preparation returned null");
+                foreach (var packet in packets)
+                {
+                    if (canWritePacket != null && !canWritePacket())
+                        throw new OperationCanceledException("Prepared packet batch source expired before write.");
+                    await writePacket(packet);
+                }
+            }
+            finally
+            {
+                sendLock.Release();
             }
         }
 
@@ -121,6 +193,81 @@ namespace DfoServer.Network
             finally
             {
                 _sendLock.Release();
+            }
+        }
+
+        internal async Task<bool> TrySendPacketBatchAsync(
+            IReadOnlyList<byte[]> logicalPackets,
+            byte[] wireBatch,
+            CancellationToken cancellationToken,
+            Func<bool> canSend)
+        {
+            try
+            {
+                await _sendLock.WaitAsync(cancellationToken);
+            }
+            catch (OperationCanceledException)
+                when (cancellationToken.IsCancellationRequested)
+            {
+                return false;
+            }
+
+            try
+            {
+                if (cancellationToken.IsCancellationRequested
+                    || (canSend != null && !canSend()))
+                {
+                    return false;
+                }
+
+                try
+                {
+                    // This batch has one send-lock linearization point and one
+                    // transport write. Unlike the ordinary small-frame path,
+                    // its bounded best-effort contract also covers an in-flight
+                    // write. A timed-out write may be partial, so retire the old
+                    // transport before the caller can retry on another session.
+                    await Stream.WriteAsync(
+                        wireBatch,
+                        0,
+                        wireBatch.Length,
+                        cancellationToken);
+                    PacketFileLogger.LogBatchBestEffort(
+                        "SEND",
+                        logicalPackets);
+                    return true;
+                }
+                catch (OperationCanceledException)
+                    when (cancellationToken.IsCancellationRequested)
+                {
+                    AbortTransport();
+                    return false;
+                }
+                catch (Exception ex)
+                    when (ex is IOException
+                          || ex is SocketException
+                          || ex is ObjectDisposedException
+                          || ex is InvalidOperationException)
+                {
+                    AbortTransport();
+                    throw;
+                }
+            }
+            finally
+            {
+                _sendLock.Release();
+            }
+        }
+
+        private void AbortTransport()
+        {
+            try
+            {
+                TcpClient?.Close();
+            }
+            catch
+            {
+                // The transport is already unusable; cleanup is best effort.
             }
         }
 

@@ -64,6 +64,70 @@ CREATE TABLE IF NOT EXISTS characters (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_characters_name_unique
     ON characters(name);
 
+CREATE TABLE IF NOT EXISTS character_pvp_records (
+    character_id INTEGER PRIMARY KEY REFERENCES characters(character_id) ON DELETE CASCADE,
+    experience_in_grade INTEGER NOT NULL DEFAULT 0 CHECK(experience_in_grade BETWEEN 0 AND 2147483647),
+    win_count INTEGER NOT NULL DEFAULT 0 CHECK(win_count BETWEEN 0 AND 2147483647),
+    loss_count INTEGER NOT NULL DEFAULT 0 CHECK(loss_count BETWEEN 0 AND 2147483647),
+    rank_point INTEGER NOT NULL DEFAULT 0 CHECK(rank_point BETWEEN 0 AND 2147483647),
+    peak_rank_point INTEGER NOT NULL DEFAULT 0 CHECK(peak_rank_point BETWEEN rank_point AND 2147483647),
+    rank_warmup_games INTEGER NOT NULL DEFAULT 0 CHECK(rank_warmup_games BETWEEN 0 AND 2147483647),
+    total_match_point INTEGER NOT NULL DEFAULT 0 CHECK(total_match_point BETWEEN 0 AND 2147483647),
+    total_match_warmup_games INTEGER NOT NULL DEFAULT 0 CHECK(total_match_warmup_games BETWEEN 0 AND 2147483647)
+);
+
+CREATE TABLE IF NOT EXISTS pvp_matches (
+    room_generation TEXT NOT NULL,
+    match_generation INTEGER NOT NULL CHECK(match_generation > 0),
+    listener_port INTEGER NOT NULL,
+    battle_mode INTEGER NOT NULL CHECK(battle_mode BETWEEN 1 AND 3),
+    winner_seat INTEGER NOT NULL CHECK(winner_seat BETWEEN 0 AND 7 OR winner_seat=255),
+    season INTEGER NOT NULL CHECK(season > 0),
+    game_day INTEGER NOT NULL,
+    completed_at_utc TEXT NOT NULL,
+    PRIMARY KEY(room_generation, match_generation)
+);
+
+CREATE TABLE IF NOT EXISTS pvp_match_results (
+    result_id INTEGER PRIMARY KEY,
+    room_generation TEXT NOT NULL,
+    match_generation INTEGER NOT NULL,
+    character_id INTEGER NOT NULL REFERENCES characters(character_id) ON DELETE CASCADE,
+    seat INTEGER NOT NULL CHECK(seat BETWEEN 0 AND 7),
+    user_id INTEGER NOT NULL CHECK(user_id BETWEEN 1 AND 65534),
+    team INTEGER NOT NULL CHECK(team BETWEEN 0 AND 2),
+    outcome INTEGER NOT NULL CHECK(outcome BETWEEN 0 AND 2),
+    kills INTEGER NOT NULL CHECK(kills >= 0),
+    deaths INTEGER NOT NULL CHECK(deaths >= 0),
+    previous_grade INTEGER NOT NULL CHECK(previous_grade BETWEEN 0 AND 255),
+    grade INTEGER NOT NULL CHECK(grade BETWEEN 0 AND 255),
+    experience_change INTEGER NOT NULL,
+    experience INTEGER NOT NULL CHECK(experience >= 0),
+    win_streak INTEGER NOT NULL CHECK(win_streak >= 0),
+    peak_win_streak INTEGER NOT NULL CHECK(peak_win_streak >= win_streak),
+    opponent_job INTEGER,
+    opponent_grow_type INTEGER,
+    UNIQUE(room_generation, match_generation, character_id),
+    UNIQUE(room_generation, match_generation, seat),
+    FOREIGN KEY(room_generation, match_generation)
+        REFERENCES pvp_matches(room_generation, match_generation) ON DELETE CASCADE,
+    CHECK((opponent_job IS NULL AND opponent_grow_type IS NULL)
+        OR (opponent_job BETWEEN 0 AND 255 AND opponent_grow_type BETWEEN 0 AND 255))
+);
+
+CREATE INDEX IF NOT EXISTS idx_pvp_match_results_character
+    ON pvp_match_results(character_id, result_id DESC);
+
+CREATE TABLE IF NOT EXISTS account_pvp_total_match_teams (
+    account_id INTEGER PRIMARY KEY REFERENCES accounts(account_id) ON DELETE CASCADE,
+    name TEXT NOT NULL COLLATE NOCASE UNIQUE CHECK(length(name) > 0),
+    character_id_0 INTEGER NOT NULL REFERENCES characters(character_id) ON DELETE CASCADE,
+    character_id_1 INTEGER NOT NULL REFERENCES characters(character_id) ON DELETE CASCADE,
+    character_id_2 INTEGER NOT NULL REFERENCES characters(character_id) ON DELETE CASCADE,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CHECK(character_id_0 <> character_id_1 AND character_id_0 <> character_id_2 AND character_id_1 <> character_id_2)
+);
+
 CREATE INDEX IF NOT EXISTS idx_characters_account
     ON characters(account_id, delete_flag);
 
@@ -1108,6 +1172,8 @@ CREATE INDEX IF NOT EXISTS idx_dungeon_effect_outbox_character_state
     ON dungeon_persistent_effect_outbox(character_id, state, updated_at);
 CREATE INDEX IF NOT EXISTS idx_dungeon_effect_outbox_account_state
     ON dungeon_persistent_effect_outbox(account_id, state, updated_at);
+CREATE INDEX IF NOT EXISTS idx_dungeon_effect_outbox_guild_history
+    ON dungeon_persistent_effect_outbox(effect_kind,effect_scope,scope_target,state,committed_at DESC,source_event_id DESC);
 
 CREATE TABLE IF NOT EXISTS account_settings (
     account_id INTEGER PRIMARY KEY,
@@ -1436,3 +1502,310 @@ CREATE TABLE IF NOT EXISTS schema_metadata (
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+-- 公会身份和申请的持久化真源。
+CREATE TABLE IF NOT EXISTS guilds (
+    guild_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+    promotion TEXT NOT NULL DEFAULT '',
+    announcement TEXT NOT NULL DEFAULT '',
+    recommended_server_id INTEGER NOT NULL DEFAULT 0
+        CHECK(typeof(recommended_server_id) = 'integer' AND recommended_server_id BETWEEN 0 AND 255),
+    recommended_channel_id INTEGER NOT NULL DEFAULT 0
+        CHECK(typeof(recommended_channel_id) = 'integer' AND recommended_channel_id BETWEEN 0 AND 255
+              AND (recommended_server_id > 0 OR recommended_channel_id = 0)),
+    leader_character_id INTEGER NOT NULL UNIQUE REFERENCES characters(character_id),
+    contribution_total INTEGER NOT NULL DEFAULT 0
+        CHECK(typeof(contribution_total) = 'integer' AND contribution_total BETWEEN 0 AND 2147483647),
+    contribution_month_id INTEGER NOT NULL DEFAULT 197001
+        CHECK(typeof(contribution_month_id) = 'integer' AND contribution_month_id BETWEEN 197001 AND 999912
+              AND contribution_month_id % 100 BETWEEN 1 AND 12),
+    contribution_month_value INTEGER NOT NULL DEFAULT 0
+        CHECK(typeof(contribution_month_value) = 'integer' AND contribution_month_value BETWEEN 0 AND 2147483647),
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    points INTEGER NOT NULL DEFAULT 0
+        CHECK(typeof(points) = 'integer' AND points BETWEEN 0 AND 4294967295)
+);
+-- 可消费公会积分和购买内容独立于净化贡献，购买与余额在同一事务提交。
+CREATE TABLE IF NOT EXISTS guild_contents (
+    guild_id INTEGER NOT NULL REFERENCES guilds(guild_id) ON DELETE CASCADE,
+    category INTEGER NOT NULL CHECK(typeof(category) = 'integer' AND category BETWEEN 1 AND 255),
+    expires_at INTEGER NOT NULL CHECK(typeof(expires_at) = 'integer' AND expires_at BETWEEN 1 AND 4294967295),
+    remaining_uses INTEGER NOT NULL DEFAULT 0
+        CHECK(typeof(remaining_uses) = 'integer' AND remaining_uses BETWEEN 0 AND 2147483647),
+    PRIMARY KEY(guild_id, category)
+);
+CREATE TABLE IF NOT EXISTS guild_members (
+    character_id INTEGER PRIMARY KEY REFERENCES characters(character_id),
+    guild_id INTEGER NOT NULL REFERENCES guilds(guild_id) ON DELETE CASCADE,
+    rank INTEGER NOT NULL DEFAULT 4 CHECK(rank BETWEEN 2 AND 5),
+    memo TEXT NOT NULL DEFAULT '',
+    contribution_total INTEGER NOT NULL DEFAULT 0
+        CHECK(typeof(contribution_total) = 'integer' AND contribution_total BETWEEN 0 AND 2147483647),
+    contribution_month_id INTEGER NOT NULL DEFAULT 197001
+        CHECK(typeof(contribution_month_id) = 'integer' AND contribution_month_id BETWEEN 197001 AND 999912
+              AND contribution_month_id % 100 BETWEEN 1 AND 12),
+    contribution_month_value INTEGER NOT NULL DEFAULT 0
+        CHECK(typeof(contribution_month_value) = 'integer' AND contribution_month_value BETWEEN 0 AND 2147483647),
+    joined_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_guild_members_guild ON guild_members(guild_id);
+-- 公会地下城净化进度。共享clear的持久去重仍使用dungeon_persistent_effect_outbox。
+CREATE TABLE IF NOT EXISTS guild_dungeon_progress (
+    guild_id INTEGER NOT NULL REFERENCES guilds(guild_id) ON DELETE CASCADE,
+    dungeon_id INTEGER NOT NULL CHECK(dungeon_id > 0),
+    clear_count INTEGER NOT NULL DEFAULT 0 CHECK(clear_count >= 0),
+    month_id INTEGER NOT NULL CHECK(typeof(month_id) = 'integer'
+        AND month_id BETWEEN 197001 AND 999912 AND month_id % 100 BETWEEN 1 AND 12),
+    PRIMARY KEY(guild_id, dungeon_id)
+);
+CREATE TABLE IF NOT EXISTS guild_applications (
+    guild_id INTEGER NOT NULL REFERENCES guilds(guild_id) ON DELETE CASCADE,
+    character_id INTEGER NOT NULL REFERENCES characters(character_id) ON DELETE CASCADE,
+    applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    message TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY(guild_id, character_id)
+);
+CREATE TABLE IF NOT EXISTS character_blacklist (
+    owner_character_id INTEGER NOT NULL REFERENCES characters(character_id) ON DELETE CASCADE,
+    target_character_id INTEGER NOT NULL REFERENCES characters(character_id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY(owner_character_id, target_character_id),
+    CHECK(owner_character_id <> target_character_id)
+);
+
+-- NPC 好感度。好感点跨日保留；每日赠礼次数和物品数由 gift_day_id 惰性换日。
+-- 单角色跨 NPC 的每日总赠礼物品数通过 (character_id, gift_day_id) 索引求和。
+CREATE TABLE IF NOT EXISTS character_npc_favor (
+    character_id INTEGER NOT NULL REFERENCES characters(character_id) ON DELETE CASCADE,
+    npc_id INTEGER NOT NULL CHECK(npc_id >= 0),
+    favor_point INTEGER NOT NULL DEFAULT 0 CHECK(favor_point >= 0),
+    gift_day_id INTEGER NOT NULL DEFAULT 0,
+    gift_action_count INTEGER NOT NULL DEFAULT 0 CHECK(gift_action_count >= 0),
+    gift_item_count INTEGER NOT NULL DEFAULT 0 CHECK(gift_item_count >= 0),
+    last_gift_at TEXT,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY(character_id, npc_id)
+);
+CREATE INDEX IF NOT EXISTS idx_character_npc_favor_daily
+    ON character_npc_favor(character_id, gift_day_id);
+
+-- 守护者祭坛角色进度。首次角色初始化与每日免费票据替换由领域 Service
+-- 在同一事务提交；这些持久事实不属于入口排期或普通副本 runtime。
+CREATE TABLE IF NOT EXISTS character_guardian_altar (
+    character_id INTEGER NOT NULL REFERENCES characters(character_id) ON DELETE CASCADE,
+    ridable_id INTEGER NOT NULL CHECK(ridable_id BETWEEN 1 AND 2147483647),
+    free_tickets INTEGER NOT NULL CHECK(free_tickets BETWEEN 0 AND 2147483647),
+    secondary_tickets INTEGER NOT NULL CHECK(secondary_tickets BETWEEN 0 AND 2147483647),
+    stage_stars INTEGER NOT NULL CHECK(stage_stars BETWEEN 0 AND 2147483647),
+    other_stars INTEGER NOT NULL CHECK(other_stars BETWEEN 0 AND 2147483647),
+    available_stars INTEGER NOT NULL CHECK(available_stars BETWEEN 0 AND 2147483647),
+    survival_best_phase INTEGER NOT NULL CHECK(survival_best_phase BETWEEN 0 AND 32767),
+    star_reset_count INTEGER NOT NULL CHECK(star_reset_count BETWEEN 0 AND 32767),
+    reserved28 INTEGER NOT NULL CHECK(reserved28 BETWEEN 0 AND 4294967295),
+    menu_hint_flag INTEGER NOT NULL CHECK(menu_hint_flag IN (0, 1)),
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY(character_id, ridable_id),
+    CHECK(free_tickets + secondary_tickets <= 2147483647),
+    CHECK(stage_stars + other_stars <= 2147483647),
+    CHECK(available_stars <= stage_stars + other_stars)
+);
+CREATE TABLE IF NOT EXISTS character_guardian_altar_stages (
+    character_id INTEGER NOT NULL,
+    ridable_id INTEGER NOT NULL,
+    dungeon_id INTEGER NOT NULL CHECK(dungeon_id BETWEEN 1 AND 2147483647),
+    progress INTEGER NOT NULL CHECK(progress BETWEEN -1 AND 2147483647),
+    PRIMARY KEY(character_id, ridable_id, dungeon_id),
+    FOREIGN KEY(character_id, ridable_id) REFERENCES character_guardian_altar(character_id, ridable_id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS character_guardian_altar_purchases (
+    character_id INTEGER NOT NULL,
+    ridable_id INTEGER NOT NULL,
+    shop_type INTEGER NOT NULL CHECK(shop_type BETWEEN 0 AND 2),
+    resource_id INTEGER NOT NULL CHECK(resource_id BETWEEN 1 AND 2147483647),
+    level INTEGER NOT NULL CHECK(level BETWEEN 0 AND 32767),
+    price INTEGER NOT NULL CHECK(price BETWEEN 0 AND 32767),
+    PRIMARY KEY(character_id, ridable_id, shop_type, resource_id),
+    FOREIGN KEY(character_id, ridable_id) REFERENCES character_guardian_altar(character_id, ridable_id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS character_guardian_altar_slots (
+    character_id INTEGER NOT NULL,
+    ridable_id INTEGER NOT NULL,
+    slot_type INTEGER NOT NULL CHECK(slot_type BETWEEN 1 AND 2),
+    slot_index INTEGER NOT NULL CHECK(slot_index BETWEEN 0 AND 5),
+    locked INTEGER NOT NULL CHECK(locked IN (0, 1)),
+    resource_id INTEGER NOT NULL CHECK(resource_id BETWEEN 0 AND 2147483647),
+    PRIMARY KEY(character_id, ridable_id, slot_type, slot_index),
+    FOREIGN KEY(character_id, ridable_id) REFERENCES character_guardian_altar(character_id, ridable_id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS character_guardian_altar_achievements (
+    character_id INTEGER NOT NULL,
+    ridable_id INTEGER NOT NULL,
+    achievement_id INTEGER NOT NULL CHECK(achievement_id BETWEEN 1 AND 2147483647),
+    claimed INTEGER NOT NULL CHECK(claimed IN (0, 1)),
+    PRIMARY KEY(character_id, ridable_id, achievement_id),
+    FOREIGN KEY(character_id, ridable_id) REFERENCES character_guardian_altar(character_id, ridable_id) ON DELETE CASCADE
+);
+-- Auction escrow owns its item snapshot and frozen actual deal price.
+-- Mail progress 0/1/2 remains durable until every required leg is committed;
+-- bid refunds have their own durable flag. Physical deletion must not erase
+-- an owner's escrow or bidding history.
+CREATE TABLE IF NOT EXISTS auction_listings (
+    listing_id INTEGER PRIMARY KEY AUTOINCREMENT CHECK(listing_id BETWEEN 1 AND 2147483647),
+    seller_character_id INTEGER NOT NULL
+        CHECK(typeof(seller_character_id) = 'integer' AND seller_character_id BETWEEN 1 AND 2147483647),
+    seller_name TEXT NOT NULL DEFAULT '' CHECK(typeof(seller_name) = 'text'),
+    item_type INTEGER NOT NULL DEFAULT 0
+        CHECK(typeof(item_type) = 'integer' AND item_type BETWEEN 0 AND 255),
+    source_list_type INTEGER NOT NULL DEFAULT 0
+        CHECK(typeof(source_list_type) = 'integer' AND source_list_type BETWEEN 0 AND 255),
+    source_slot_index INTEGER NOT NULL DEFAULT 0
+        CHECK(typeof(source_slot_index) = 'integer' AND source_slot_index BETWEEN 0 AND 32767),
+    item_template_id INTEGER NOT NULL
+        CHECK(typeof(item_template_id) = 'integer' AND item_template_id BETWEEN 1 AND 2147483647),
+    item_kind TEXT NOT NULL DEFAULT 'unknown' CHECK(typeof(item_kind) = 'text'),
+    item_count INTEGER NOT NULL DEFAULT 1
+        CHECK(typeof(item_count) = 'integer' AND item_count BETWEEN 1 AND 2147483647),
+    instance_value INTEGER NOT NULL DEFAULT 0
+        CHECK(typeof(instance_value) = 'integer' AND instance_value BETWEEN -2147483648 AND 2147483647),
+    durability INTEGER NOT NULL DEFAULT 0
+        CHECK(typeof(durability) = 'integer' AND durability BETWEEN 0 AND 65535),
+    seal_flag INTEGER NOT NULL DEFAULT 0
+        CHECK(typeof(seal_flag) = 'integer' AND seal_flag BETWEEN 0 AND 255),
+    option_value INTEGER NOT NULL DEFAULT 0
+        CHECK(typeof(option_value) = 'integer' AND option_value BETWEEN -2147483648 AND 2147483647),
+    expire_time INTEGER NOT NULL DEFAULT 0
+        CHECK(typeof(expire_time) = 'integer' AND expire_time BETWEEN -2147483648 AND 2147483647),
+    marker16 INTEGER NOT NULL DEFAULT 0
+        CHECK(typeof(marker16) = 'integer' AND marker16 BETWEEN -2147483648 AND 2147483647),
+    pet_serial_or_handle INTEGER NOT NULL DEFAULT 0
+        CHECK(typeof(pet_serial_or_handle) = 'integer' AND pet_serial_or_handle BETWEEN -2147483648 AND 2147483647),
+    extra_json TEXT NOT NULL DEFAULT '{}' CHECK(typeof(extra_json) = 'text'),
+    item_core_data BLOB NOT NULL CHECK(typeof(item_core_data) = 'blob' AND length(item_core_data) = 99),
+    detail_json TEXT NOT NULL DEFAULT '' CHECK(typeof(detail_json) = 'text'),
+    buyout_price INTEGER NOT NULL DEFAULT 0
+        CHECK(typeof(buyout_price) = 'integer' AND buyout_price BETWEEN 0 AND 2147483647),
+    starting_price INTEGER NOT NULL DEFAULT 0
+        CHECK(typeof(starting_price) = 'integer' AND starting_price BETWEEN 0 AND 2147483647),
+    status INTEGER NOT NULL DEFAULT 0
+        CHECK(typeof(status) = 'integer' AND status BETWEEN 0 AND 4),
+    buyer_character_id INTEGER NOT NULL DEFAULT 0
+        CHECK(typeof(buyer_character_id) = 'integer' AND buyer_character_id BETWEEN 0 AND 2147483647),
+    buyer_name TEXT NOT NULL DEFAULT '' CHECK(typeof(buyer_name) = 'text'),
+    listed_at_unix INTEGER NOT NULL
+        CHECK(typeof(listed_at_unix) = 'integer' AND listed_at_unix BETWEEN 0 AND 2147483647),
+    expires_at_unix INTEGER NOT NULL
+        CHECK(typeof(expires_at_unix) = 'integer' AND expires_at_unix BETWEEN 1 AND 2147483647),
+    sold_at_unix INTEGER
+        CHECK(sold_at_unix IS NULL OR (typeof(sold_at_unix) = 'integer' AND sold_at_unix BETWEEN 0 AND 2147483647)),
+    settle_mail_count INTEGER NOT NULL DEFAULT 0
+        CHECK(typeof(settle_mail_count) = 'integer' AND settle_mail_count BETWEEN 0 AND 2),
+    current_bid INTEGER NOT NULL DEFAULT 0
+        CHECK(typeof(current_bid) = 'integer' AND current_bid BETWEEN 0 AND 2147483647),
+    current_bidder_id INTEGER NOT NULL DEFAULT 0
+        CHECK(typeof(current_bidder_id) = 'integer' AND current_bidder_id BETWEEN 0 AND 2147483647),
+    current_bidder_name TEXT NOT NULL DEFAULT '' CHECK(typeof(current_bidder_name) = 'text'),
+    bid_count INTEGER NOT NULL DEFAULT 0
+        CHECK(typeof(bid_count) = 'integer' AND bid_count BETWEEN 0 AND 2147483647),
+    actual_deal_price INTEGER NOT NULL DEFAULT 0
+        CHECK(typeof(actual_deal_price) = 'integer' AND actual_deal_price BETWEEN 0 AND 2147483647),
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP CHECK(typeof(created_at) = 'text'),
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP CHECK(typeof(updated_at) = 'text'),
+    CHECK(buyout_price > 0 OR starting_price > 0),
+    CHECK(expires_at_unix > listed_at_unix),
+    FOREIGN KEY(seller_character_id) REFERENCES characters(character_id) ON DELETE RESTRICT
+);
+CREATE INDEX IF NOT EXISTS idx_auction_listings_search
+    ON auction_listings(status, item_template_id, buyout_price);
+CREATE INDEX IF NOT EXISTS idx_auction_listings_seller
+    ON auction_listings(seller_character_id, status);
+CREATE INDEX IF NOT EXISTS idx_auction_listings_settle
+    ON auction_listings(status, settle_mail_count, listed_at_unix);
+CREATE INDEX IF NOT EXISTS idx_auction_listings_expiry
+    ON auction_listings(status, expires_at_unix);
+
+CREATE TABLE IF NOT EXISTS auction_bids (
+    bid_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    listing_id INTEGER NOT NULL
+        CHECK(typeof(listing_id) = 'integer' AND listing_id BETWEEN 1 AND 2147483647),
+    bidder_character_id INTEGER NOT NULL
+        CHECK(typeof(bidder_character_id) = 'integer' AND bidder_character_id BETWEEN 1 AND 2147483647),
+    bidder_name TEXT NOT NULL DEFAULT '' CHECK(typeof(bidder_name) = 'text'),
+    bid_amount INTEGER NOT NULL
+        CHECK(typeof(bid_amount) = 'integer' AND bid_amount BETWEEN 1 AND 2147483647),
+    status INTEGER NOT NULL DEFAULT 0
+        CHECK(typeof(status) = 'integer' AND status BETWEEN 0 AND 3),
+    refund_mail_sent INTEGER NOT NULL DEFAULT 0
+        CHECK(typeof(refund_mail_sent) = 'integer' AND refund_mail_sent BETWEEN 0 AND 1),
+    bid_at_unix INTEGER NOT NULL
+        CHECK(typeof(bid_at_unix) = 'integer' AND bid_at_unix BETWEEN 0 AND 2147483647),
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP CHECK(typeof(created_at) = 'text'),
+    FOREIGN KEY(listing_id) REFERENCES auction_listings(listing_id) ON DELETE RESTRICT,
+    FOREIGN KEY(bidder_character_id) REFERENCES characters(character_id) ON DELETE RESTRICT
+);
+CREATE INDEX IF NOT EXISTS idx_auction_bids_listing ON auction_bids(listing_id, status);
+CREATE INDEX IF NOT EXISTS idx_auction_bids_bidder ON auction_bids(bidder_character_id, status);
+CREATE INDEX IF NOT EXISTS idx_auction_bids_refund ON auction_bids(status, refund_mail_sent, bid_id);
+
+CREATE TRIGGER IF NOT EXISTS guild_member_prevent_soft_delete
+BEFORE UPDATE OF delete_flag ON characters
+WHEN NEW.delete_flag <> 0 AND EXISTS (
+    SELECT 1 FROM guild_members WHERE character_id = OLD.character_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'leave guild before deleting character');
+END;
+
+-- 公会仓库、支援兵租赁和公会契约的独立持久 owner。
+CREATE TABLE IF NOT EXISTS guild_storage_state (
+    guild_id INTEGER PRIMARY KEY REFERENCES guilds(guild_id) ON DELETE CASCADE,
+    capacity INTEGER NOT NULL CHECK(typeof(capacity) = 'integer' AND capacity BETWEEN 0 AND 200),
+    revision INTEGER NOT NULL DEFAULT 0 CHECK(typeof(revision) = 'integer' AND revision >= 0),
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS guild_storage_items (
+    guild_id INTEGER NOT NULL REFERENCES guild_storage_state(guild_id) ON DELETE CASCADE,
+    slot_index INTEGER NOT NULL CHECK(typeof(slot_index) = 'integer' AND slot_index BETWEEN 0 AND 199),
+    item_core BLOB NOT NULL CHECK(typeof(item_core) = 'blob' AND length(item_core) = 99),
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY(guild_id, slot_index)
+);
+CREATE TABLE IF NOT EXISTS guild_storage_history (
+    history_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id INTEGER NOT NULL REFERENCES guilds(guild_id) ON DELETE CASCADE,
+    actor_character_id INTEGER NOT NULL REFERENCES characters(character_id) ON DELETE RESTRICT,
+    action TEXT NOT NULL CHECK(typeof(action) = 'text' AND length(action) BETWEEN 1 AND 32),
+    source_slot INTEGER NOT NULL CHECK(typeof(source_slot) = 'integer' AND source_slot BETWEEN -1 AND 351),
+    destination_slot INTEGER NOT NULL CHECK(typeof(destination_slot) = 'integer' AND destination_slot BETWEEN -1 AND 351),
+    item_core BLOB NOT NULL CHECK(typeof(item_core) = 'blob' AND length(item_core) = 99),
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_guild_storage_history_guild
+    ON guild_storage_history(guild_id, history_id DESC);
+CREATE TABLE IF NOT EXISTS guild_support_rentals (
+    guild_id INTEGER NOT NULL REFERENCES guilds(guild_id) ON DELETE CASCADE,
+    character_id INTEGER NOT NULL REFERENCES characters(character_id) ON DELETE CASCADE,
+    support_character_id INTEGER NOT NULL CHECK(typeof(support_character_id) = 'integer' AND support_character_id > 0),
+    rental_end_unix INTEGER NOT NULL CHECK(typeof(rental_end_unix) = 'integer' AND rental_end_unix >= 0),
+    remaining_uses INTEGER NOT NULL CHECK(typeof(remaining_uses) = 'integer' AND remaining_uses >= 0),
+    registered INTEGER NOT NULL DEFAULT 1 CHECK(registered IN (0,1)),
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY(guild_id, character_id)
+);
+CREATE TABLE IF NOT EXISTS guild_contract_states (
+    guild_id INTEGER NOT NULL REFERENCES guilds(guild_id) ON DELETE CASCADE,
+    character_id INTEGER NOT NULL REFERENCES characters(character_id) ON DELETE CASCADE,
+    contract_item_id INTEGER NOT NULL CHECK(typeof(contract_item_id) = 'integer' AND contract_item_id > 0),
+    expire_unix INTEGER NOT NULL CHECK(typeof(expire_unix) = 'integer' AND expire_unix >= 0),
+    state INTEGER NOT NULL DEFAULT 1 CHECK(typeof(state) = 'integer' AND state BETWEEN 0 AND 2),
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY(guild_id, character_id)
+);
+CREATE INDEX IF NOT EXISTS idx_guild_support_rentals_character
+    ON guild_support_rentals(character_id, rental_end_unix);
+CREATE INDEX IF NOT EXISTS idx_guild_contract_states_character
+    ON guild_contract_states(character_id, expire_unix);

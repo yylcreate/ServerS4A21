@@ -55,26 +55,43 @@ namespace DfoServer.Network
     public static class GameChannelSpawnPolicy
     {
         public const byte Channel100TownId = 17;
-        public const byte Channel100SpawnAreaId = 4;
         public const byte RaidTownId = 19;
+        public const byte PvpTownId = 10;
         public const byte NormalTownFallbackId = 20;
 
         public static GameChannelSpawn Resolve(
             int listenerGamePort,
             int persistedTownId)
+            => Resolve(listenerGamePort, persistedTownId, Town.IsPositionSaveExcluded);
+
+        internal static GameChannelSpawn Resolve(
+            int listenerGamePort,
+            int persistedTownId,
+            Func<int, int, bool> isPositionSaveExcluded)
         {
+            ArgumentNullException.ThrowIfNull(isPositionSaveExcluded);
             if (TryResolveTransientSpawn(listenerGamePort, out var transientSpawn))
                 return transientSpawn;
 
             var townId = persistedTownId > 0
                 ? persistedTownId
                 : 1;
-            if (townId == RaidTownId)
+            if (townId == RaidTownId || townId == PvpTownId)
                 townId = NormalTownFallbackId;
             var gate = Town.GetCeraRoomInfo(townId);
             if (gate.Town <= 0)
                 throw new InvalidOperationException(
                     $"Town {townId} has no Seria-room gate.");
+
+            // Selection already resolves a Seria-room gate, rather than loading
+            // the persisted area's coordinates. Check that actual destination
+            // without excluding other normal areas in the same town.
+            if (isPositionSaveExcluded(gate.Town, gate.Area))
+            {
+                gate = Town.GetCeraRoomInfo(NormalTownFallbackId);
+                if (gate.Town <= 0 || isPositionSaveExcluded(gate.Town, gate.Area))
+                    throw new InvalidOperationException("The normal fallback has no persistable Seria-room gate.");
+            }
 
             return new GameChannelSpawn(
                 gate.Town,
@@ -91,6 +108,24 @@ namespace DfoServer.Network
             out GameChannelSpawn spawn)
         {
             spawn = null;
+            if (GameNetworkConfig.IsPvpListener(listenerGamePort))
+            {
+                // town/town.lst -> Fair_PVP.twn: gate area 0 and its anchor.
+                var pvpGate = Town.GetCeraRoomInfo(PvpTownId);
+                if (pvpGate.Town != PvpTownId)
+                    throw new InvalidOperationException("PvP town has no entry gate.");
+
+                spawn = new GameChannelSpawn(
+                    pvpGate.Town,
+                    pvpGate.Area,
+                    pvpGate.X,
+                    pvpGate.Y,
+                    direction: 5,
+                    areaState: 3,
+                    isTransient: true);
+                return true;
+            }
+
             if (GameNetworkConfig.IsRaidListener(listenerGamePort))
             {
                 var raidGate = Town.GetCeraRoomInfo(RaidTownId);
@@ -112,21 +147,16 @@ namespace DfoServer.Network
             if (!GameNetworkConfig.IsChannel100Listener(listenerGamePort))
                 return false;
 
-            if (!Town.TryGetDungeonGateReturnInfo(
-                    Channel100TownId,
-                    Channel100SpawnAreaId,
-                    out var gate))
-            {
+            var channel100Gate = Town.GetCeraRoomInfo(Channel100TownId);
+            if (channel100Gate.Town <= 0)
                 throw new InvalidOperationException(
-                    $"Town {Channel100TownId} area " +
-                    $"{Channel100SpawnAreaId} has no dungeon-gate anchor.");
-            }
+                    $"Town {Channel100TownId} has no Seria-room gate.");
 
             spawn = new GameChannelSpawn(
-                gate.Town,
-                gate.Area,
-                gate.X,
-                gate.Y,
+                channel100Gate.Town,
+                channel100Gate.Area,
+                channel100Gate.X,
+                channel100Gate.Y,
                 direction: 5,
                 areaState: 3,
                 isTransient: true);
@@ -137,16 +167,22 @@ namespace DfoServer.Network
             int listenerGamePort,
             int targetTownId)
         {
+            if (GameNetworkConfig.IsPvpListener(listenerGamePort))
+                return targetTownId == PvpTownId;
             if (GameNetworkConfig.IsRaidListener(listenerGamePort))
                 return targetTownId == RaidTownId;
-            return !GameNetworkConfig.IsChannel100Listener(listenerGamePort)
-                   || targetTownId == Channel100TownId;
+            if (GameNetworkConfig.IsChannel100Listener(listenerGamePort))
+                return targetTownId == Channel100TownId;
+            // 圣者之鸣号(17)是 CH100 专属特殊城镇，普通频道不能通过传送/切区进入。
+            return targetTownId != Channel100TownId && targetTownId != PvpTownId;
         }
 
-        public static bool ShouldPersistPosition(int listenerGamePort)
+        public static bool ShouldPersistPosition(int listenerGamePort, int townId, int areaId)
         {
-            return !GameNetworkConfig.IsChannel100Listener(listenerGamePort)
-                   && !GameNetworkConfig.IsRaidListener(listenerGamePort);
+            return !GameNetworkConfig.IsPvpListener(listenerGamePort)
+                   && !GameNetworkConfig.IsChannel100Listener(listenerGamePort)
+                   && !GameNetworkConfig.IsRaidListener(listenerGamePort)
+                   && !Town.IsPositionSaveExcluded(townId, areaId);
         }
     }
 }

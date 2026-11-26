@@ -802,9 +802,11 @@ namespace DfoServer.Game.Inventory
             if (item == null || item.SortLockFlag == 0)
                 return true;
 
+            // 位置锁采用槽位语义：穿戴栏不展示位置锁，穿/脱一律不携带锁，
+            // 同时清掉历史遗留的穿戴栏锁脏数据。
             if (sourceListType == InventoryListType.Equipment
                 || destinationListType == InventoryListType.Equipment)
-                return true;
+                return false;
 
             if (sourceListType != destinationListType)
                 return false;
@@ -964,8 +966,8 @@ namespace DfoServer.Game.Inventory
 
             cloneAvatarResolver = cloneAvatarResolver ?? ItemMetadataResolver.IsCloneAvatarItem;
             var isCloneAvatar = cloneAvatarResolver(item.ItemId);
-            var borrowCloneAppearance = isCloneAvatar
-                && !ItemMetadataResolver.IsAuroraLookReplaceAvatar(item.ItemId);
+            var isAuroraLookReplace = ItemMetadataResolver.IsAuroraLookReplaceAvatar(item.ItemId);
+            var borrowCloneAppearance = isCloneAvatar && !isAuroraLookReplace;
             var clearAvatarId = 0;
             var color1 = detail.Color1;
             var color2 = detail.Color2;
@@ -992,9 +994,27 @@ namespace DfoServer.Game.Inventory
                     color2 = previousDetail?.Color2 ?? 0;
                 }
             }
+            byte[] lookReplaceJewels = null;
+            if (isAuroraLookReplace)
+            {
+                if (IsEquippedAvatarSlot(listType, slotIndex)
+                    && previousItemAtSlot != null
+                    && previousItemAtSlot.ItemKind == ItemCore.KindAvatar
+                    && previousItemAtSlot.AvatarUid > 0
+                    && ItemMetadataResolver.IsAuroraStatSourceAvatar(previousItemAtSlot.ItemId))
+                {
+                    clearAvatarId = previousItemAtSlot.AvatarUid;
+                }
+                else if (!IsEquippedAvatarSlot(listType, slotIndex))
+                {
+                    // Drop sockets copied onto the cover by older builds.
+                    lookReplaceJewels = new byte[JewelSocket.Size];
+                }
+            }
 
             if (detail.ClearAvatarId == clearAvatarId
-                && (!isCloneAvatar || (detail.Color1 == color1 && detail.Color2 == color2)))
+                && (!isCloneAvatar || (detail.Color1 == color1 && detail.Color2 == color2))
+                && lookReplaceJewels == null)
                 return;
 
             detail.ClearAvatarId = clearAvatarId;
@@ -1003,6 +1023,8 @@ namespace DfoServer.Game.Inventory
                 detail.Color1 = color1;
                 detail.Color2 = color2;
             }
+            if (lookReplaceJewels != null)
+                detail.JewelSocket = lookReplaceJewels;
             inventory.AvatarDetails.MarkDirty(detail.AvatarUid);
         }
 

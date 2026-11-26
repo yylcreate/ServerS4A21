@@ -153,6 +153,20 @@ namespace DfoServer.Game.Progression
             result.GrowthCapsule = summary.GrowthCapsule;
         }
 
+        // A projection retry retains the original grant amounts. Only its
+        // detached display summaries are refreshed from the account owner.
+        internal void RefreshAccountProgressForProjection(
+            ExperienceGrantResult result,
+            int accountId)
+        {
+            if (result == null || result.HonorExpGain == 0 || accountId <= 0)
+                return;
+
+            var summary = _accountExperience.LoadCurrentSummary(accountId);
+            result.Honor = summary.Honor;
+            result.GrowthCapsule = summary.GrowthCapsule;
+        }
+
         // 绝对设值: 教程一键升到目标等级。不是"加经验"—无荣誉拆分,
         // 经验直接钉在目标等级的门槛值。
         internal ExperienceGrantResult GrantToLevel(PlayerContext player, byte targetLevel, string logTag)

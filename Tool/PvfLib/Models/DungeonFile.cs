@@ -230,6 +230,8 @@ namespace PvfLib
         public bool RiskDungeon { get; set; }
         public bool AncientDungeon { get; set; }
         public bool EventDungeon { get; set; }
+        public bool? GuildDungeon { get; private set; }
+        public bool GuildDungeonDefinitionValid { get; private set; } = true;
         public bool CrackOfDimensionDungeon { get; set; }
         public bool DisableExit { get; set; }
         public bool IndividualMapMovement { get; set; }
@@ -600,6 +602,9 @@ namespace PvfLib
                     case "risk dungeon": dgn.RiskDungeon = true; break;
                     case "ancient dungeon": dgn.AncientDungeon = true; break;
                     case "event dungeon": dgn.EventDungeon = true; break;
+                    case "guild dungeon":
+                        ParseGuildDungeon(node, text, dgn);
+                        break;
                     case "crack of dimension dungeon": dgn.CrackOfDimensionDungeon = true; break;
                     case "disable exit": dgn.DisableExit = true; break;
                     case "individual map movement": dgn.IndividualMapMovement = true; break;
@@ -831,6 +836,28 @@ namespace PvfLib
                         break;
                     case "minimap icon": dgn.MinimapIcon = data; break;
                 }
+            }
+        }
+
+        private static void ParseGuildDungeon(ScriptNode node, string text, DungeonFile dgn)
+        {
+            if (dgn.GuildDungeon.HasValue || !dgn.GuildDungeonDefinitionValid)
+            {
+                dgn.GuildDungeon = null;
+                dgn.GuildDungeonDefinitionValid = false;
+                return;
+            }
+            try
+            {
+                var value = ActivityConfigScriptReader.SingleInteger(node, text);
+                if (value != 0 && value != 1)
+                    throw new InvalidOperationException("Dungeon [guild dungeon] requires 0 or 1.");
+                dgn.GuildDungeon = value == 1;
+            }
+            catch (InvalidOperationException)
+            {
+                dgn.GuildDungeon = null;
+                dgn.GuildDungeonDefinitionValid = false;
             }
         }
 
